@@ -88,9 +88,23 @@ The standard Ollama build is quantized and uses roughly 9 GB for the model, so i
 ollama run qwen3:14b
 ```
 
-Then point the config at it:
+This opens a chat prompt. Type anything to confirm the model answers, then type `/bye` to leave it — Vibe Sentinel talks to Ollama in the background and does not need this window open.
 
-```toml
+#### 4. Tell Vibe Sentinel where the model is
+
+Ollama is now running, but Vibe Sentinel does not know that yet. Out of the box it looks for a model on port 5001, which is where the vLLM setup above listens. Ollama listens on port **11434**, so you have to say so.
+
+You do that in a file named `.vibe-sentinel.toml`, which lives in the project you want to check — not in Vibe Sentinel's own directory. Change into that project first:
+
+```bash
+cd ~/path/to/your-project
+```
+
+Then run this. It adds the settings to `.vibe-sentinel.toml`, creating the file if it is not there yet:
+
+```bash
+cat >> .vibe-sentinel.toml <<'EOF'
+
 [llm]
 endpoint = "http://localhost:11434/v1"
 model = "qwen3:14b"
@@ -100,9 +114,35 @@ model = "qwen3:14b"
 # on a laptop the tokens it spends thinking are the ones you wait for.
 [llm.extra_body]
 reasoning_effort = "none"
+EOF
 ```
 
-If a scan reports that the backend rejected the request, drop `[llm] structured_output` to `"json_object"`, then to `"none"` — the strongest mode a backend accepts is a property of that backend, not of the model.
+Copy the whole thing, `EOF` lines included, and paste it into your terminal in one go.
+
+The `model` value has to be the exact name Ollama knows the model by. Run `ollama list` and copy the name from the first column. If you pulled `qwen3:14b` above, it is `qwen3:14b` — the `:14b` part matters.
+
+#### 5. Check that it worked
+
+```bash
+vibe-sentinel backend status
+```
+
+You want to see your endpoint and `Status: ready`:
+
+```
+Endpoint: http://localhost:11434/v1
+Model:    qwen3:14b
+Status:   ready — ...
+```
+
+Two things that commonly go wrong:
+
+- **It still says `http://localhost:5001/v1`.** Then it did not read your settings. The usual cause is running the command from a different directory than the one holding `.vibe-sentinel.toml`. Check the file has an active block with `grep -n -A6 '^\[llm\]' .vibe-sentinel.toml` — if that prints nothing, the settings are not there, so run the `cat >>` command above from inside the project.
+- **It says `unreachable`.** Ollama is not running. Start it with `ollama serve` and try again.
+
+The line `No [llm] start_command configured` is not an error and needs no fixing. It only means you start Ollama yourself, which is what the Ollama app does for you.
+
+One more, only if a later scan complains that the backend rejected the request: add `structured_output = "json_object"` inside the `[llm]` block, and `"none"` if that still fails. How strictly a backend can be held to a JSON shape is a property of the backend, not the model.
 
 No backend is required: `--no-model` skips the two steps that need one and says so in the report. See [use-of-local-model.md](use-of-local-model.md).
 
@@ -124,6 +164,8 @@ Each exits `0` clean, `1` with findings, `2` if the run itself failed. Whatever 
 vibe-sentinel scan --print-example > .vibe-sentinel.toml
 vibe-sentinel scan
 ```
+
+**If you already made a `.vibe-sentinel.toml` while setting up the backend, skip the first line** — `>` overwrites the file, and your `[llm]` settings would go with it. To see the example without losing anything, run `vibe-sentinel scan --print-example` on its own and read it on screen. Every line it prints starts with a `#`, which means the setting is switched off and shown only as documentation; a setting takes effect once the `#` in front of it is gone.
 
 The config declares which probes run and where they point; the defaults measure the current directory and are usually right to start with. This first scan tells you nothing about drift — that is the point of a baseline — but it runs the three gates above, so it is still useful.
 
