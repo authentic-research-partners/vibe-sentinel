@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# uv-managed virtualenv
+.venv/
+
+# Rotating logs (created by loguru at runtime)
+logs/
+
+# The structural history database and its migration backups.
+#
+# Ignored by default because a history is per-checkout: yours records the
+# shape of your tree, not anyone else's. Un-ignore it if you want the team
+# to share one history and review structural change in the diff — that is a
+# deliberate choice, and a good one on a repo with more than one author.
+.vibe-sentinel/
+
+# Local agent settings, including the PreToolUse hook if you install one.
+.claude/
+
+# direnv
+.envrc

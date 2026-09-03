@@ -1,0 +1,166 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vibe-sentinel"
+version = "0.1.0"
+description = "Guards structural expectations about how a codebase is organized, and reports drift."
+requires-python = ">=3.13,<3.14"
+license = "MIT"
+authors = [{ name = "Sergey Samsonau" }]
+maintainers = [{ name = "Authentic Research Partners LLC", email = "info@arpconnect.com" }]
+readme = "README.md"
+keywords = [
+    "code-organization",
+    "architecture",
+    "structural-drift",
+    "codebase-inventory",
+    "guardrails",
+    "ai-agents",
+    "coding-agent",
+    "llm",
+    "local-llm",
+    "vllm",
+    "qwen",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Quality Assurance",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+]
+dependencies = [
+    "httpx>=0.28",
+    "loguru>=0.7",
+    "pydantic>=2.10",
+]
+
+[project.urls]
+Homepage = "https://arpconnect.com"
+Repository = "https://github.com/authentic-research-partners/vibe-sentinel"
+Documentation = "https://github.com/authentic-research-partners/vibe-sentinel#readme"
+Issues = "https://github.com/authentic-research-partners/vibe-sentinel/issues"
+
+[project.optional-dependencies]
+# `uv pip install -e ".[dev]"` brings in every tool used by the mandatory
+# checks and the release pipeline.
+dev = [
+    # Mandatory checks — run after every code change
+    "pytest>=9.0.3",
+    "pytest-xdist>=3.0",
+    "ruff>=0.15",
+    "mypy>=1.18",
+    "ast-grep-cli>=0.35",
+    # Release pipeline
+    "deptry>=0.25",
+    "bandit>=1.9",
+    "pip-audit>=2.10",
+    "build>=1.0",
+    "twine>=6.0",
+]
+
+[project.scripts]
+vibe-sentinel = "vibe_sentinel.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["vibe_sentinel*"]
+
+[tool.setuptools.package-data]
+"vibe_sentinel" = ["example.vibe-sentinel.toml", "probes.default.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+# No `markers` table: nothing is marked. Every test here runs without a
+# GPU and without a model, which is the whole point of `--no-model` being
+# a first-class path — so a declared `integration` marker that no test
+# carried was describing a suite this project does not have. Declare one
+# again in the same commit that marks a test with it.
+addopts = "-n auto -p no:cacheprovider"
+
+[tool.bandit]
+skips = [
+    "B101",  # assert — used for type narrowing and internal invariants
+    "B104",  # bind 0.0.0.0 — container start command for vLLM
+    "B404",  # subprocess import — CLI tool, subprocess is core functionality
+    "B603",  # subprocess call — the CLI invokes docker/podman by design
+    "B607",  # partial path — container runtimes resolved via PATH
+    "B615",  # HF from_pretrained without revision pin — trusted publisher
+]
+
+[tool.deptry]
+# Everything in [dev] is a command-line tool — ruff, mypy, pytest,
+# ast-grep, the release gates. They are invoked as commands, never
+# imported, so deptry must not expect an import for them.
+optional_dependencies_dev_groups = ["dev"]
+
+[tool.mypy]
+plugins = ["pydantic.mypy"]
+
+# === Ruff =====================================================================
+# Enforces the subset of the project's antipatterns that ruff can express.
+# The rest — the semantic ones — are what vibe-sentinel itself is for.
+[tool.ruff.lint]
+# `select`, not `extend-select`: extend-select adds to whatever ruff's
+# DEFAULT set happens to be, and that set changes between ruff releases
+# — 0.16 widened it enough to raise hundreds of new findings on
+# unchanged code. A lint gate that shifts under a routine tool upgrade
+# can't be trusted to gate anything, so the rule set is stated in full
+# here. E4/E7/E9/F are ruff's classic default; the rest are the codes
+# mapped to this project's documented antipatterns.
+#
+# To adopt a new rule, add its code here deliberately. Whole-category
+# selects (e.g. "B", "ASYNC") would pull in unrelated rules and
+# reintroduce the same drift.
+select = [
+    "E4",       # pycodestyle — imports
+    "E7",       # pycodestyle — statements
+    "E9",       # pycodestyle — runtime errors
+    "F",        # pyflakes
+    "S110",     # try-except-pass (silent swallow)
+    "S112",     # try-except-continue (silent swallow)
+    "T201",     # print() in library code
+    "B006",     # mutable default args
+    "B008",     # function call in default arg
+    "B023",     # late-binding closure
+    "B904",     # raise-without-from in except
+    "ASYNC210", # sync HTTP (httpx.Client) in async
+    "ASYNC251", # time.sleep in async
+    "TID251",   # flake8-tidy-imports banned-api (configured below)
+]
+
+[tool.ruff.lint.per-file-ignores]
+# User-facing output surfaces. print() IS the output channel here.
+"vibe_sentinel/cli.py" = ["T201"]
+"vibe_sentinel/__main__.py" = ["T201"]
+"vibe_sentinel/report.py" = ["T201"]
+"vibe_sentinel/backend.py" = ["T201"]
+# Probes speak a stdout protocol; print() is how they emit it.
+"vibe_sentinel/probes/*.py" = ["T201"]
+# Release gates run from the terminal; their report IS stdout. They are
+# also deliberately stdlib-only — a gate that audits the environment
+# should not import from it, so TID251's pydantic-over-dataclasses rule
+# (which exists for package models that cross boundaries) is waived for
+# their local frozen records.
+"scripts/*.py" = ["T201", "TID251"]
+# The one module in the package that may use dataclasses: the hook
+# payload's models. Same shape of reason as above — the PreToolUse hook
+# runs once per tool call, and pydantic alone cost ~55 ms of it — for
+# validation this boundary never wants. It wants the opposite: a payload
+# field of an unexpected type must cost that field, not the whole event.
+# Full justification in vibe_sentinel/journal.py's docstring.
+"vibe_sentinel/journal.py" = ["TID251"]
+# Same reason again: `safety.py` decides whether to escalate in front of
+# every tool call, so the danger set has to load without building a
+# pydantic model. Its docstring carries the justification.
+"vibe_sentinel/safety.py" = ["TID251"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"logging".msg = "Use loguru — 'from loguru import logger'."
+"dataclasses".msg = "Use pydantic BaseModel + Field for data models."
+"dataclasses.dataclass".msg = "Use pydantic BaseModel for data models."
+"dataclasses.field".msg = "Use pydantic Field(default_factory=...)."
+"dataclasses.asdict".msg = "Use BaseModel.model_dump()."

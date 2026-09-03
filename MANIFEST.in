@@ -1,0 +1,14 @@
+# What the source distribution carries. The wheel is decided by
+# [tool.setuptools.packages.find] in pyproject.toml; this file is the sdist's
+# half of the same question, and without it setuptools falls back to a legacy
+# default that sweeps up `tests/test*.py` on its own.
+#
+# That default shipped 22 of the 24 files under tests/: every test_*.py, and
+# neither conftest.py nor __init__.py. `pytest` inside an unpacked sdist then
+# fails at collection. Half a suite that cannot run is worse than none, and
+# tests are deliberately visible in the repository rather than installed with
+# the package — clone it to run them.
+prune tests
+
+# Build and cache output, if a build ran in the tree before this one.
+global-exclude __pycache__ *.py[cod]

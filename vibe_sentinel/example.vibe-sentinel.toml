@@ -1,0 +1,581 @@
+# .vibe-sentinel.toml
+#
+# Only the [licenses] block below is required. Everything else has a working
+# default, and the built-in probes run without being declared here — so
+# a two-line file is a complete config. Delete any section you are not
+# changing; do not keep it just to restate a default.
+#
+# Required, and the report says so rather than guessing: without [licenses]
+# a scan reports that gate as "no policy declared" — not as clean. Nobody
+# gets a pass for a policy they never wrote.
+#
+#   vibe-sentinel scan                    record structure and state
+#   vibe-sentinel licenses                check dependency + source licences
+#   vibe-sentinel scan --print-probes     the built-in probe set
+#   vibe-sentinel licenses --list-categories
+#
+# Reference: README.md and docs/
+#
+#
+# --- Where the probes look ---------------------------------------------------
+# Probe parameters are declared, never inferred. The built-in default for the
+# source root is `.`, which is right for a flat project and wrong wherever the
+# package sits one directory down — and nothing corrects it for you, on
+# purpose: a value a model picks per run is a value that changes between runs,
+# and every change re-keys every observation and reads as drift.
+#
+# This changes a value without restating the probe, so the built-in command
+# keeps improving underneath. `vibe-sentinel scan --list-probes` names the
+# placeholders each probe takes.
+#
+# [probes.parameters]
+# commentary-ratio = { SOURCE_ROOT = "src" }
+# module-organization = { PACKAGE_ROOT = "src/myapp" }
+# silent-exceptions = { SOURCE_ROOT = "src" }
+# pattern-census = { SOURCE_ROOT = "src", PATTERN = "requests.get($$$ARGS)" }
+# file-length = { CATEGORIES = "agent=CLAUDE.md; docs=*.md; code=src/**/*.py; tests=tests/*.py" }
+#
+# CATEGORIES is the one to edit. It decides what `file-length` measures at
+# all, and its entries are tried in order — the first that matches a file
+# claims it, so name specific files before the globs that would swallow
+# them. With `docs=*.md` first, CLAUDE.md is documentation and the category
+# meant to watch it is empty.
+#
+# Virtualenvs, node_modules, build and dist are never measured whatever the
+# root says, so `.` is safe — just usually not what you meant.
+
+
+# --- Over what stretch of time -----------------------------------------------
+# The baseline is one point in time, and one point shows drift at one scale. A
+# directory gaining two modules a week is under every tolerance between
+# consecutive scans and a reorganization by Christmas — and which scale yours
+# shows up at is not something you know in advance.
+#
+# Each horizon here is compared as well as the baseline, against the newest run
+# at least that old. Units: h, d, w, m (30 days), y. Minutes do not exist,
+# which is what lets `m` mean month.
+#
+# [drift]
+# horizons = ["1w", "1m"]     # the default; [] turns them off
+#
+# It costs no measurement and no model call — both ends are already in the
+# history, so a horizon is a query. `--since 1w,3m` overrides this for one run.
+#
+# And a horizon still compares two points. A *direction* is a property of all of
+# them, so the fits below are what catch a series that has gone one way for
+# months without any single step being interesting:
+#
+# [drift]
+# trend_runs = 50             # runs to fit over; 0 turns the fits off
+#
+# Theil-Sen slope, Mann-Kendall significance, and anomalies against each
+# series' own trend — closed-form, standard library, no model and no
+# dependency. `--fit N` overrides this for one scan the way `--since` does for
+# the horizons, and `--fit 0` skips the fits. `vibe-sentinel trend` prints the
+# whole listing; a scan prints what is significant and whatever left its trend
+# this run.
+#
+# A direction needs 10 runs of the same observation and an anomaly needs 20 —
+# the scale one is measured in is what a short series cannot estimate. Under
+# either floor a series is absent from the report rather than reported as flat.
+
+
+# --- What to ask about the report ---------------------------------------------
+# A probe says what is measured. A lens says what to make of it: one question
+# about the whole report — the changes since the baseline, what the same
+# measurements did over each horizon, and what the fitted series are doing —
+# asked in your words, the way a [[danger]] or a [[secret]] is. A shipped list
+# of signals cannot know which of your directories is meant to stay thin.
+#
+# Layered the same way everything else here is:
+#   new [[lens]] id         adds one
+#   built-in [[lens]] id    overrides it (there is one built-in: organization)
+#   [drift] use             keeps ONLY the ones you name
+#   [drift] disable         switches one off, without restating the rest
+#   [drift] use_builtins    false to ask only what you declare
+#
+# Each lens is one request and the report is the shared prefix, so a server
+# that batches (vLLM) prefills it once and three questions cost close to what
+# one does. Ollama serialises: set concurrency = 1 there and expect the latency
+# to add up.
+#
+# [drift]
+# concurrency = 4
+# A standing note in front of EVERY question, rather than repeated in each:
+# guidance = """
+# vibe_sentinel/probes/ is meant to grow — one file per probe is the design.
+# Growth in vibe_sentinel/ itself is the thing to look at.
+# """
+#
+# `watch` is the cheap stage. Name the probes a lens is about and it is asked
+# only when one of them moved, moved over a horizon, or has a fitted trend;
+# leave it out and it is asked whenever anything did. A watch naming a probe
+# that does not exist fails the scan rather than going quiet — a lens that is
+# never asked reads exactly like a lens that found nothing.
+#
+# A question about a direction is as answerable as one about today, because the
+# fitted series are in front of the model too:
+#
+# [[lens]]
+# id = "handler-bloat"
+# title = "Handlers becoming the place anything unclaimed goes"
+# watch = ["file-length", "module-organization"]
+# question = """
+# Is the growth in api/handlers/ ordinary feature work, or is that directory
+# becoming where anything without an obvious home gets put? A handler should
+# stay thin: route, validate, one call into a service. Line count climbing
+# without module count climbing with it is the shape I care about — one long
+# handler is worse here than four short ones.
+# """
+#
+# [[lens]]
+# id = "tests-falling-behind"
+# title = "Test code growing more slowly than the code it covers"
+# watch = ["file-length", "commentary-ratio"]
+# question = """
+# Compare the direction of the tests category against the code category. Are
+# they growing together? A month where code rises and tests are flat is what I
+# want to hear about, even if neither moved enough to be a change today.
+# """
+#
+# [[lens]]
+# id = "vendored-code"
+# title = "Code arriving from outside rather than being written"
+# watch = ["pattern-census", "silent-exceptions"]
+# question = """
+# Does anything here look like code that arrived whole rather than being
+# written in place — a pattern appearing in a directory that never used it, a
+# jump in one file rather than a spread across several? Vendoring is allowed
+# here and copying without saying so is not.
+# """
+#
+# A horizon is a reading, not a verdict: it never moves the baseline, is never
+# written to the database, and never changes the exit code. It reaches back to
+# a fixed point, so a finding there would fail every scan until it aged out,
+# with nothing anyone could do to clear it — and a gate people turn off
+# protects nothing. A horizon nothing reaches back to says so rather than
+# reporting as clean.
+
+
+# =============================================================================
+# Licences  (required — there is deliberately no allow-everything default)
+# =============================================================================
+
+# --- The safety gate -------------------------------------------------------
+#
+# Judges commands the coding agent is about to run, using that agent's own
+# recent history to resolve variables: `rm -rf "$DIR"` is safe if the history
+# set DIR=build, and dangerous if nothing set it at all.
+#
+# Off by default. A gate nobody asked for that adds seconds to a tool call is a
+# gate that gets uninstalled. Work up to it:
+#
+#   observe   review flagged commands, record the verdict, block nothing. Run
+#             it for a week and read `vibe-sentinel safety` — that is your
+#             false-positive rate, measured on your own traffic.
+#   enforce   an `unsafe` verdict refuses the tool call. `unclear` does not: it
+#             falls through to the permission prompt you already have.
+#
+# Only commands a stdlib pattern match flags ever reach the model, so ordinary
+# work costs nothing. Try one without waiting for an agent to run it:
+#   vibe-sentinel safety --check 'rm -rf $TARGET' --show-prompt
+#
+# What counts as dangerous is yours to declare. It layers exactly like probes:
+#
+#   new [[danger]] id       adds one
+#   built-in [[danger]] id  overrides that built-in
+#   [safety] use            keeps ONLY the ones you name
+#   [safety] disable        switches one off, without restating the rest
+#   [safety] use_builtins   false to check only for what you declare
+#
+#     vibe-sentinel safety --print-dangers    see the active set
+[safety]
+mode = "off"
+# How many of the actor's own previous commands the review sees. Long enough to
+# find where a variable was set, short enough for a local model to read fast.
+history = 100
+# Hard ceiling on one verdict, retries included. Keep it under the timeout the
+# installed hook carries (20 s): the tool call is blocked while this runs. Running out
+# means the command proceeds, recorded as unreviewed — never blocked on a slow
+# model.
+timeout = 8.0
+# use_builtins = true
+# `disable` is "everything except these", so a danger added in a later release
+# arrives switched on. `use` is "only these", so it cannot. Pick by which
+# surprise you would rather have.
+# disable = ["changing-permissions"]
+# use = ["deleting-files", "running-as-root", "writing-outside-the-project"]
+# Questions are asked one request each, in parallel, sharing a cached prefix —
+# free against a server that batches (vLLM). Ollama serialises: set this to 1
+# there and expect the latency to add up.
+# concurrency = 4
+# Rules can live in their own files, so a team can share one set across repos.
+# Globs are relative to the project root; a pattern matching nothing is an error.
+# rule_files = ["safety-rules/*.toml"]
+
+# --- What counts as dangerous, in your words -------------------------------
+#
+# `pattern` is a regex over the command text and decides only whether the
+# command is worth a model call. Keep it generous: a false match costs one
+# call, a missed one is the whole failure.
+#
+# `question` is what the model is then asked. It is literally the prompt, the
+# same way a probe placeholder's description is — so write it as the question
+# you would ask a colleague looking over the agent's shoulder, and put in it
+# the things only you know. A shipped list of verbs cannot know which of your
+# hosts is production.
+#
+# Match everything you have an opinion about, not just the frightening half.
+# If staging is disposable and production is not, one danger whose pattern
+# catches BOTH hosts answers better than one catching only production: the
+# built-in that picks up the rest asks a generic question, and a generic
+# question about your database can only come back `unclear`.
+#
+# `verdict` settles it without asking the model at all: no call, no latency,
+# and it still holds with the backend down. Use it where you already know the
+# answer — asking nicely does not work. A danger whose *question* said "answer
+# unsafe" came back `safe`, because the model trusted its own read of the
+# command over the instruction. A question informs a judgement; only `verdict`
+# decides one.
+#
+# [[danger]]
+# id = "our-production-database"
+# title = "Anything pointed at production"
+# pattern = 'db-prod-1|PROD_DATABASE_URL'
+# verdict = "unsafe"      # optional: decide it here, never ask
+# question = """
+# Does this touch db-prod-1? Staging hosts are db-stg-* and are disposable —
+# restoring one takes five minutes, so acting on staging is safe. Production
+# holds customer data and the last restore took a day.
+# """
+#
+# [[danger]]
+# id = "our-infrastructure"
+# title = "Anything that could tear down infrastructure"
+# pattern = 'terraform\s+(destroy|apply)|tofu\s+destroy'
+# question = """
+# What does this create or tear down, and which workspace is selected? Only
+# sandbox-* workspaces are safe to destroy; everything else is shared.
+# """
+#
+# A git operation this project simply does not allow. `verdict` is what makes
+# it a rule rather than a question — no model call, and it holds with the
+# backend down. The built-ins already ask about reverts (`reverting-changes`),
+# amends and rebases (`rewriting-history`) and force pushes
+# (`discarding-work`); this is for the ones you have already decided.
+#
+# [[danger]]
+# id = "no-bypassing-our-hooks"
+# title = "Committing or pushing past the pre-commit hooks"
+# pattern = 'git\s+(?:commit|push)\b[^|;&]*(?:--no-verify|\s-n\b)'
+# verdict = "unsafe"
+# question = """
+# The hooks run the tests and the formatter. Skipping them is not something an
+# agent decides on its own here.
+# """
+#
+# `escalates = false` makes it a context signal instead of a check: it never
+# sends anything to the model on its own, and rides along once something else
+# has. That is what unexpanded-variable and home-directory are — `echo $HOME`
+# is not an incident, but `rm -rf $HOME` should arrive with the fact attached.
+# Needs no question, since it is never the thing being asked about.
+#
+# [[danger]]
+# id = "our-production-mount"
+# title = "The production data mount"
+# pattern = '/mnt/live'
+# escalates = false
+#
+# [[danger]]
+# id = "customer-data-exports"
+# title = "Writing anything to the exports directory"
+# applies_to = "target"
+# pattern = '/exports/'
+# question = "Does this write customer data anywhere it could be committed?"
+
+# --- The history database ---------------------------------------------------
+#
+# `.vibe-sentinel/history.db` is the one artifact here that cannot be
+# regenerated: probes can be re-run, but only against the code as it is now.
+# Everything below is upkeep on it — see `vibe-sentinel db --help`.
+#
+# A health check runs by itself before any command that is not about the
+# database, at most once a day, and writes what it finds to stderr. It never
+# changes what the command does or what it exits with.
+[database]
+# check_interval_hours = 24     # 0 checks on every command
+# auto_check = true             # false runs it only via `vibe-sentinel db check`
+
+# Ceilings you declare. Each is off at 0, because a number shipped in a package
+# cannot know whether 200 MB is a healthy history or a runaway journal. The
+# checks with a real answer — is it corrupt, are the indexes there — always run.
+# max_size_mb = 512
+# max_journal_commands = 200000
+
+# How long the agent command journal is worth keeping. Also the default cutoff
+# for `vibe-sentinel db prune`, which counts what it would delete unless you
+# add --apply, and backs the database up first when you do.
+# journal_retention_days = 90
+
+# Report when the newest backup is older than this — but only once there is
+# history that old to lose. Take one with `vibe-sentinel db backup`.
+# backup_max_age_days = 30
+
+[licenses]
+# Categories name the OBLIGATION rather than listing identifiers, so this stays
+# correct when a dependency arrives under a permissive licence nobody listed.
+# Full list: vibe-sentinel licenses --list-categories
+allowed_categories = ["permissive", "public-domain"]
+
+# Individual SPDX ids beyond those categories. Additive.
+# allowed_spdx = ["MPL-2.0"]
+
+# Exceptions in `<licence> WITH <exception>`. Not automatically harmless:
+# "Apache-2.0 WITH Commons-Clause" forbids selling the software. Read first.
+# allowed_exceptions = []
+
+# Pins: packages accepted on a reason you recorded. Deliberately none here —
+# a pin asserts "we checked this", and shipping you pre-made ones would put
+# that in your mouth for packages you never read. Add them as the gate
+# reports failures; it names exactly what to verify, from the LICENSE file
+# the package ships (not PyPI metadata, which is often absent or wrong).
+#
+# A pin is not an ignore: if upstream relicenses, it fails loudly. All four
+# keys are REQUIRED — without a reason and a date it IS an ignore, which is
+# the mechanism this gate was written to replace.
+#
+# [[licenses.pin]]
+# packages = ["certifi"]            # exact names, or globs like "nvidia-*"
+# accept   = ["MPL-2.0"]            # what you verified it to be
+# reason   = """CA bundle via httpx. Per-file weak copyleft, used unmodified.
+# https://github.com/certifi/python-certifi/blob/master/LICENSE"""
+# verified = "2026-01-15"
+
+# --- Rules of your own -------------------------------------------------------
+# Everything above is WHICH licences you accept. The three below are what your
+# organisation's licences ARE — worth splitting into security/license-policy.toml
+# (same keys, no [licenses] header) so the people who review licences own that
+# file and every repo layers its own pins on top of it.
+#
+# NOTE: TOML puts any key written after a [table] header inside that table, so
+# declare plain values like `guidance` BEFORE the sub-tables below. Getting this
+# wrong is an error rather than a silently ignored line.
+
+# Prose for `licenses --explain`, and for nothing else. It reaches the model
+# that drafts a pin note; the resolver never sees it, so it cannot move a
+# verdict. Say which boundaries you care about and how you want them worded.
+# guidance = """
+# Weak copyleft is acceptable for dev-only dependencies. Always state whether
+# the package is imported at runtime or only used as a tool.
+# """
+
+# Your own categories. A new name adds one; reusing a built-in name EXTENDS it
+# rather than replacing it. A licence may be in only one category — two would
+# make the reported obligation depend on table order.
+# [licenses.categories]
+# internal = ["LicenseRef-Acme-Internal"]
+
+# Teach the resolver a licence the built-in table has never seen — a house
+# licence that ships as LICENSE text with no metadata. `required` phrases must
+# all appear, `forbidden` must not, matched on word boundaries. At least one
+# phrase must be a real fingerprint, not a single word.
+#
+# This can only ever ADD a term: every fingerprint that matches is reported and
+# the results AND-join, so a mistaken rule can make a package need a pin — it
+# cannot make a copyleft package pass.
+# [[licenses.identify]]
+# spdx     = "LicenseRef-Acme-Internal"
+# required = ["acme corporation internal source licence"]
+# forbidden = ["evaluation copy only"]
+
+
+# =============================================================================
+# Everything below is OPTIONAL — the values shown are the defaults
+# =============================================================================
+
+# --- The judge model: any OpenAI-compatible backend --------------------------
+# vLLM, Ollama, llama.cpp, LM Studio. Pick a model family DIFFERENT from the
+# agent that writes your code — that separation is the whole point.
+# The README has a known-good vLLM command to start from.
+#
+# [llm]
+# endpoint = "http://localhost:5001/v1"
+# model = "qwen3"                    # the name YOUR backend serves
+# structured_output = "json_schema"  # json_schema | json_object | none
+#                                    # step down if your backend 4xxs
+# timeout = 300.0
+# temperature = 0.2
+# max_tokens = 2048
+# api_key = ""
+#
+# Backend-specific knobs, passed through untouched:
+# [llm.extra_body.chat_template_kwargs]
+# enable_thinking = true
+#
+# Optional: `vibe-sentinel backend start|stop` runs these verbatim (no shell).
+# start_command = [
+#     "podman", "run", "-d", "--name", "vibe-sentinel-llm",
+#     "--device", "nvidia.com/gpu=all", "-p", "5001:8000",
+#     "docker.io/vllm/vllm-openai:v0.18.0", "RedHatAI/Qwen3-8B-FP8-dynamic",
+#     "--served-model-name", "qwen3-8b-fp8", "--max-model-len", "40960",
+# ]
+# stop_command  = ["podman", "rm", "-f", "vibe-sentinel-llm"]
+
+# --- Output ------------------------------------------------------------------
+# [output]
+# format = "terminal"                # terminal | json | agent
+
+# --- Dependency provenance ----------------------------------------------------
+# Does the package exist, and did anyone decide to add it. Every check is
+# offline; --online adds the registry answers.
+#
+#     vibe-sentinel packages            # 0 clean, 1 findings, 2 error
+#     vibe-sentinel packages --online   # also ask PyPI: does the name exist,
+#                                       # and how old is it
+#
+# Every check here is a fact bar one. Two installed names an edit apart is a
+# typosquat and a rewrite shipped under a new name in exactly the same shape,
+# so that pair — and nothing else here — is put to the local model, which sees
+# what each package says it does and whether anything actually asked for it.
+# `--no-model` skips it and every near-miss then stands, which is the CI path:
+# this gate never gets weaker because the GPU is off.
+#
+# [packages]
+# ignore = []                       # names allowed to sit undeclared. pip,
+#                                   # setuptools, wheel and uv are always ignored
+# new_package_days = 90             # younger than this, a package is "newborn"
+# concurrency = 4                   # near-miss pairs asked about at once, one
+#                                   # request each over a shared prefix. 1 on a
+#                                   # backend that serialises
+#
+# A pin records a decision you actually made, scoped to the finding kinds it
+# names — accepting "orphan" for a package does not accept "squatted" later.
+#
+# [[packages.pin]]
+# packages = ["some-tool"]
+# accept   = ["orphan"]
+# reason   = """Installed deliberately for local profiling; never imported."""
+# verified = "2026-01-15"
+
+# --- Credentials at rest ------------------------------------------------------
+# Passwords and keys sitting on disk: the files whose whole purpose is holding
+# them (.env, ~/.aws/credentials, terraform state) and the ones hardcoded into
+# ordinary source. Patterns find candidates; the LOCAL model decides which are
+# real, because no regex can tell a live key from the one in the vendor's own
+# documentation.
+#
+#     vibe-sentinel credentials              # 0 clean, 1 findings, 2 error
+#     vibe-sentinel credentials --no-model   # candidates only, adjudicated by
+#                                            # nobody, and it says so. CI path.
+#     vibe-sentinel credentials --home       # also the credential stores in
+#                                            # your home directory
+#     vibe-sentinel credentials --print-rules
+#
+# This is the one check that reads secrets, so it refuses to send an excerpt
+# anywhere but loopback. Point [llm] endpoint at another host and it stops
+# rather than posting your keys to it. Values reach the local model as a short
+# prefix plus their shape (length, entropy) — never in full, and never at all
+# to the terminal, the log, or the history database.
+#
+# [credentials]
+#
+# The separate, optional rule: a credential in a file git ignores.
+#   allow   not a finding. Your .env is the sanctioned way to hold a local
+#           development key and you do not want to hear about it.
+#   warn    reported, does not fail the gate. The default.
+#   deny    fails like any other.
+# We recommend deny, and the reason is about agents rather than about git:
+# .gitignore keeps a file out of a commit and does nothing about the file. An
+# agent with a shell reads .env with `cat` regardless. The only version of
+# this an agent cannot read by accident is the one where the secret is in the
+# OS keychain and never on disk.
+# gitignored = "warn"
+#
+# exclude = ["docs/examples/*"]     # globs, relative to the project root
+# max_file_kb = 512                 # bigger files are flagged by name, not read
+# max_files = 20000
+# reveal_chars = 8                  # leading chars shown to the LOCAL model, so
+#                                   # `sk-ant-` can be told from a placeholder.
+#                                   # Never more than half the value. 0 sends
+#                                   # only the shape.
+# concurrency = 4                   # as with [safety]: 1 on Ollama
+# allow_remote_model = false        # true only if you own that endpoint and
+#                                   # meant to send credentials to it
+#
+# Layering is the same as probes and dangers:
+#   new [[secret]] id       adds a rule
+#   built-in [[secret]] id  overrides that built-in
+#   [credentials] use       keeps ONLY the ones you name
+#   [credentials] disable   switches one off, without restating the rest
+#   [credentials] use_builtins  false to check only for what you declare
+#   [credentials] rule_files = ["credential-rules/*.toml"]
+#
+# [[secret]]
+# id = "our-service-keys"
+# title = "A key minted by our own auth service"
+# pattern = 'acme_(live|test)_[A-Za-z0-9]{24,}'
+# verdict = "real"            # optional: decide it here, never ask. A live-
+#                             # prefixed key of ours is real by construction.
+# question = """
+# Is this one of our service keys? acme_live_ keys reach production; acme_test_
+# keys reach the sandbox, which holds no customer data.
+# """
+#
+# [[secret]]
+# id = "ansible-vault"
+# title = "An Ansible vault file"
+# applies_to = "path"         # match the file's name instead of its lines
+# pattern = '(^|/)group_vars/.*/vault\.ya?ml$'
+# question = "Is this encrypted, or was it committed before the encrypt step?"
+#
+# Pins: findings accepted on a reason you recorded, scoped to the rules they
+# name — accepting "private-key-file" for a fixtures path does not accept
+# "assigned-secret" there later. A pin is not an ignore.
+#
+# [[credentials.pin]]
+# paths    = ["tests/fixtures/*.pem"]
+# accept   = ["private-key-file"]
+# reason   = """Generated by tests/make_certs.sh for the TLS handshake tests.
+# Never deployed, never trusted by anything outside the test suite."""
+# verified = "2026-01-15"
+
+
+# --- Accepted vulnerabilities ------------------------------------------------
+# Allowlist only what a version bump cannot fix — a stale entry is review debt
+# that hides the next real finding. Record the reason and a review date.
+#
+# [security]
+# ignore_vulnerabilities = [
+#     "PYSEC-2026-1234",             # no fix upstream; review 2026-12
+# ]
+
+# --- Probes ------------------------------------------------------------------
+# The built-in probes are the base layer. Your entries merge on top:
+#
+#   new [[probe]] id       adds a probe
+#   built-in [[probe]] id  overrides that built-in
+#   [probes] disable       switches one off, without restating the rest
+#   [probes] use_builtins  false to start from nothing and run only yours
+#
+#     vibe-sentinel scan --print-probes     see what the built-ins are
+#     vibe-sentinel scan --probes id,id     run a subset, this run only
+#
+# [probes]
+# disable = ["pattern-census"]
+# use_builtins = true
+#
+# A probe is any command that prints:
+#     {"observations": [{"key": "...", "value": 1.0, "label": "..."}],
+#      "summary": "..."}
+#
+# `key` must be stable between runs — it is what makes a value comparable,
+# and what makes a key you have never seen before a finding on its own.
+#
+# `tolerance` is how far a value may move before that counts as drift. A bare
+# number is absolute, in the value's own units — 0.05 on a ratio is five
+# points, 0 means any change surfaces. A percentage string, "15%", is
+# relative to the value it is compared against, which is the form a magnitude
+# needs: no single absolute number is right at both ends of a range.
+#
+# Ask what your codebase should still look like in a year, then measure the
+# thing that would have to change for that to stop being true.

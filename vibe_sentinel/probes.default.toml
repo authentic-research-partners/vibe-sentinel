@@ -1,0 +1,334 @@
+# probes.default.toml — the probe set vibe-sentinel ships with.
+#
+# These are the base layer: they run unless you switch them off, and your own
+# [[probe]] entries merge on top rather than replacing them. So you never need
+# to copy this file anywhere.
+#
+#   add        declare a [[probe]] with a new id
+#   override   declare one reusing an id below
+#   switch off [probes] disable = ["id"]
+#   opt out    [probes] use_builtins = false
+#
+# A probe is a command with {PLACEHOLDER} parameters, each declared with the
+# value it takes. Nothing infers them: a placeholder with no `default` is
+# refused when this file loads, and `[probes.parameters]` in your own config
+# changes one without restating the probe.
+#
+# The source roots below default to `.` because there is no constant that is
+# right everywhere. If your package sits one directory down, say so —
+# otherwise these measure your tests and docs alongside it. (They never
+# measure a virtualenv, node_modules, build or dist, whatever the root says.)
+#
+# It must print one JSON object to stdout:
+#
+#     {"observations": [{"key": "...", "value": 1.0, "label": "..."}],
+#      "summary": "..."}
+#
+# `key` must be stable between runs: it is what makes a value comparable, and
+# what makes a key you have never seen before a finding on its own.
+# `tolerance` is how far a value may move before it counts as drift, and it
+# takes two forms: a bare number is absolute, in the value's own units, and
+# a percentage string ("15%") is relative to the value it is compared
+# against. Absolute suits a value that is already normalised — five points
+# of a ratio mean the same thing wherever the ratio sits. Relative is the
+# only form that works for a magnitude, where no single number is right at
+# both ends of the range.
+
+# =============================================================================
+# Probe 1 — commentary vs code
+# =============================================================================
+# The signature of a model that has started narrating: no single comment
+# is wrong, so no per-line rule fires, but the proportion of the package
+# that is prose climbs. Tracked per package so one over-commented corner
+# is visible instead of averaged away.
+#
+# tolerance = 0.05 — a ratio wandering by a couple of points is normal
+# editing; five points is a change in habit.
+
+[[probe]]
+id = "commentary-ratio"
+title = "Comment lines vs code lines, per package"
+description = """
+Measures how much of each package is commentary rather than code.
+Rising commentary that is concentrated in newly written packages
+usually means generated narration rather than earned explanation.
+"""
+command = [
+    "python", "-m", "vibe_sentinel.probes.comments",
+    "--root", "{SOURCE_ROOT}",
+    "--glob", "{FILE_GLOB}",
+]
+timeout_s = 120.0
+tolerance = 0.05
+
+[[probe.placeholders]]
+name = "SOURCE_ROOT"
+description = "The directory holding this project's own source code — not tests, vendor, build, or tooling directories."
+default = "."
+
+[[probe.placeholders]]
+name = "FILE_GLOB"
+description = "Glob for the source files to measure, e.g. *.py"
+default = "*.py"
+
+
+# =============================================================================
+# Probe 2 — where code lives and how modules load
+# =============================================================================
+# The drift this catches is the one nobody notices happening: a directory
+# meant to hold three helpers now holds nineteen, or a module that
+# imported two siblings now imports eleven and has quietly become a hub.
+#
+# Coupling is measured both ways, under separate keys. Fan-out
+# (`imports:<path>`) is what this file reaches; fan-in
+# (`imported-by:<path>`) is what reaches it. The second is the one that
+# moves without the file being touched — a module gains importers because
+# OTHER files changed, so nothing in its own diff shows it becoming the
+# thing everything depends on. Neither number is a verdict: a dispatch
+# layer with a fan-out of twenty is doing its job, and a schema module
+# everything imports is what a schema module is for.
+#
+# tolerance = 0 — a directory gaining a module is exactly the event worth
+# seeing. Noise is filtered by the analysis pass, not by hiding it here.
+
+[[probe]]
+id = "module-organization"
+title = "Directory shape and internal import coupling"
+description = """
+Inventories which directories hold code, how many modules and lines each
+holds, how many internal modules each module imports, and how many import
+it. Detects directories growing past their intended size, code appearing
+in places it did not live before, and modules turning into coupling hubs
+in either direction.
+"""
+command = [
+    "python", "-m", "vibe_sentinel.probes.modules",
+    "--root", "{PACKAGE_ROOT}",
+    "--glob", "{FILE_GLOB}",
+]
+timeout_s = 120.0
+tolerance = 0.0
+
+[[probe.placeholders]]
+name = "PACKAGE_ROOT"
+description = "The importable package directory to inventory — the one containing __init__.py that holds this project's modules."
+default = "."
+
+[[probe.placeholders]]
+name = "FILE_GLOB"
+description = "Glob for source files, e.g. *.py"
+default = "*.py"
+
+
+# =============================================================================
+# Probe 3 — what error handlers do with the error
+# =============================================================================
+# The handler that catches something and does nothing with it. Any one of
+# them is a judgement call and is often the right call; how many there
+# are is a fact about the codebase, and it is the fact that moves while
+# an agent is making a test pass — the fastest way to stop a traceback is
+# to catch it.
+#
+# Not a lint. Whether a given swallow is wrong is a question about that
+# line, and ruff answers it (S110, S112) for the ones that catch
+# everything, which is the restriction that makes a per-line rule
+# tolerable at all. This counts every discarding handler, typed ones
+# included, records how many of them are blanket, and says where they
+# are. A `# noqa` does not move the number, because the number is not a
+# verdict — and neither does rewriting `except X: pass` into
+# `with suppress(X):`, which is counted as the same fact.
+#
+# A probe and not a gate, by the test at the bottom of this file: a
+# handler that was there on the first scan is not news, and forty of them
+# is a codebase's inheritance rather than a policy failure somebody has
+# to pin. The forty-first is news, and so is the layer it landed in.
+#
+# tolerance = 0 — one more swallowed error is one more, and a directory
+# that starts discarding errors gets a key it did not have before.
+
+[[probe]]
+id = "silent-exceptions"
+title = "Exception handlers that discard the error, per directory"
+description = """
+Counts the handlers whose body does nothing with the exception — pass,
+`...`, continue, a bare or constant return, or a contextlib.suppress
+block — against how many handlers each directory has at all. Detects
+error handling quietly becoming error hiding, and which layer it started
+in.
+"""
+command = [
+    "python", "-m", "vibe_sentinel.probes.handlers",
+    "--root", "{SOURCE_ROOT}",
+    "--glob", "{FILE_GLOB}",
+]
+timeout_s = 120.0
+tolerance = 0.0
+
+[[probe.placeholders]]
+name = "SOURCE_ROOT"
+description = "The directory holding this project's own source code — not tests, vendor, build, or tooling directories."
+default = "."
+
+[[probe.placeholders]]
+name = "FILE_GLOB"
+description = "Glob for the source files to measure, e.g. *.py"
+default = "*.py"
+
+
+# =============================================================================
+# Probe 4 — where a structural pattern occurs
+# =============================================================================
+# The general-purpose one. Any shape ast-grep can express becomes a
+# tracked structural fact, counted per directory. What matters is less
+# the count than the spread: a pattern that lived only in one package
+# turning up in three is a reorganization nobody announced.
+#
+# Requires ast-grep on PATH (pip install ast-grep-cli).
+#
+# PATTERN is the one worth setting yourself. The shipped default watches
+# `subprocess.run($$$ARGS)`, which is a reasonable thing to keep an eye on
+# in most codebases and is certainly not the most interesting thing in
+# yours. Redeclare this probe with the construct you actually care about
+# staying in one layer.
+
+[[probe]]
+id = "pattern-census"
+title = "Where a structural pattern occurs"
+description = """
+Counts occurrences of one code-organization pattern and reports them per
+directory. Choose a pattern whose LOCATION is meaningful — direct
+database access, subprocess launches, global state mutation, direct
+config reads — so that the same pattern appearing in a new layer shows up
+as drift.
+"""
+command = [
+    "python", "-m", "vibe_sentinel.probes.patterns",
+    "--root", "{SOURCE_ROOT}",
+    "--lang", "{LANGUAGE}",
+    "--pattern", "{PATTERN}",
+]
+timeout_s = 120.0
+tolerance = 0.0
+
+[[probe.placeholders]]
+name = "SOURCE_ROOT"
+description = "The directory holding this project's own source code."
+default = "."
+
+[[probe.placeholders]]
+name = "LANGUAGE"
+description = "Source language for ast-grep: python, typescript, rust, go, java."
+pattern = "^[a-z]+$"
+default = "python"
+
+[[probe.placeholders]]
+name = "PATTERN"
+description = """
+An ast-grep pattern for a construct whose location matters
+architecturally — one that should be confined to a specific layer.
+Use $NAME for a single-node wildcard and $$$ARGS for a variadic one.
+Example: subprocess.run($$$ARGS)
+"""
+pattern = "^[\\w$. ()\\[\\]{},*='\"-]{1,200}$"
+default = "subprocess.run($$$ARGS)"
+
+
+# =============================================================================
+# Probe 5 — how long files are, by category
+# =============================================================================
+# The drift everyone feels and nobody measures. CLAUDE.md was eighty
+# lines when someone wrote it and is six hundred now, a section at a
+# time, none of them wrong. The README grew an entry per session. One
+# module became the place things get appended to. No per-line rule fires
+# on any of that, because length is the entire finding.
+#
+# Reported per category because a repository's total answers nothing:
+# which grew — the package, the tests, the documentation, or the file the
+# agent reads before it starts? Those are four different problems.
+# CATEGORIES is `name=glob,glob; name=glob`, tried in order, and the
+# first match claims the file, so specific filenames go before the globs
+# that would swallow them. The shipped set knows the agent-instruction
+# filenames that have become conventions and cannot know that your ADRs
+# are the thing you actually want watched — it is the parameter worth
+# setting.
+#
+# One unit per probe, and it is part of the observation key: switching it
+# ends the old series rather than redefining every point already recorded
+# under it. `lines` is right for code and wrong for prose, where
+# rewrapping a paragraph halves the count of a file whose content did not
+# change; `words` and `bytes` survive a rewrap. Whichever you pick, the
+# other two are recorded in each observation's attributes.
+#
+# tolerance = "15%" — relative, and it has to be. Length is a magnitude,
+# not a ratio: twenty-five lines is a rewrite of a forty-line module and
+# rounding error in a seventeen-hundred-line one, so an absolute threshold
+# is either blind to the small files or noisy about the large ones. What a
+# proportion costs is at the small end — a six-line file gaining one line
+# is a 17% move and will be reported. It also decouples the threshold from
+# UNIT: 15% is 15% whether the number counts lines, words or bytes.
+
+[[probe]]
+id = "file-length"
+title = "File length, per file, by category"
+description = """
+Measures how long each file is, in categories the project names — agent
+instruction files, documentation, source, tests, whatever it declares.
+Catches the file that grows a section per session, the module everything
+gets appended to, and documentation accumulating faster than the code it
+describes.
+"""
+command = [
+    "python", "-m", "vibe_sentinel.probes.length",
+    "--root", "{SOURCE_ROOT}",
+    "--categories", "{CATEGORIES}",
+    "--unit", "{UNIT}",
+]
+timeout_s = 120.0
+tolerance = "15%"
+
+[[probe.placeholders]]
+name = "SOURCE_ROOT"
+description = "The directory to measure. Usually the project root rather than the package directory — documentation and agent instruction files live above it."
+default = "."
+
+[[probe.placeholders]]
+name = "CATEGORIES"
+description = """
+What to measure and what to call it, as `name=glob,glob; name=glob`.
+Entries are tried in order and the first match claims the file, so name
+specific files before the globs that would swallow them. A glob matches
+at any depth (`CLAUDE.md` finds nested copies too); one containing a
+slash anchors that much of the path (`docs/*.md`, `src/**/*.py`).
+"""
+pattern = "^[\\w./*,;= -]{1,400}$"
+default = "agent=CLAUDE.md,AGENTS.md,.cursorrules; docs=*.md; code=*.py"
+
+[[probe.placeholders]]
+name = "UNIT"
+description = "What length means here: lines, words or bytes. Part of the observation key, so changing it starts a new series instead of redefining the recorded one. The tolerance is a proportion, so it carries over unchanged."
+pattern = "^(lines|words|bytes)$"
+default = "lines"
+
+# =============================================================================
+# Licences, provenance and credentials are NOT here, and that is the rule
+# =============================================================================
+# They used to be. They are gates now — `vibe-sentinel licenses`,
+# `packages`, `credentials` — and the scan runs them beside these probes
+# rather than as three more of them.
+#
+# The test is what the finding IS. A probe's finding is a *transition*:
+# this directory gained four modules, this pattern spread into a third
+# layer. Reporting it once, when it happens, is exactly right, and that
+# is what compare() does — it reports a key when it appears and says
+# nothing while it stays.
+#
+# A licence or a key in the tree is not a transition. It is a *state*,
+# and it is as true on the two-hundredth scan as the first. Running those
+# three as probes therefore lost them: a `.env` already committed on the
+# first scan went into the baseline — the first run makes the baseline
+# unconditionally — and was never reported again. Accepting it took
+# `--update`, which records no reason, no date and nobody's name, where
+# a pin refuses to be written without all three.
+#
+# So: if the finding is something that moved, it is a probe. If it is
+# something that is true, it is a gate.

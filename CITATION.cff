@@ -1,0 +1,35 @@
+cff-version: 1.2.0
+message: "If you use vibe-sentinel in your work, please cite it as below."
+type: software
+title: vibe-sentinel
+version: 0.1.0
+date-released: "2026-09-03"
+abstract: >
+  Guards structural expectations about how a codebase is organized, and
+  reports drift. Probes measure the shape of a tree — modules per package,
+  commentary against code, where a pattern occurs, dependency licences and
+  provenance, credentials at rest — and every run is recorded to an
+  append-only history that later runs compare against. Three gates turn a
+  measurement into a decision that must be pinned rather than suppressed.
+  An optional PreToolUse hook journals a coding agent's commands and, when
+  asked, reviews a dangerous one against what that agent already ran. Runs
+  entirely on the user's machine via a local OpenAI-compatible model, and
+  works without a model at all.
+authors:
+  - family-names: Samsonau
+    given-names: Sergey V.
+url: "https://github.com/authentic-research-partners/vibe-sentinel"
+repository-code: "https://github.com/authentic-research-partners/vibe-sentinel"
+license: MIT
+keywords:
+  - code-organization
+  - architecture
+  - structural-drift
+  - codebase-inventory
+  - guardrails
+  - ai-agents
+  - coding-agent
+  - llm
+  - local-llm
+  - vllm
+  - qwen
