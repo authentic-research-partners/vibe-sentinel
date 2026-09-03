@@ -38,7 +38,15 @@ if TYPE_CHECKING:  # pragma: no cover - annotations only, never imported
     from vibe_sentinel.db.maintenance import DatabaseSize, HealthReport, PruneResult
 
 _SEVERITY_RANK = {"high": 0, "medium": 1, "low": 2, "info": 3}
-_KIND_MARK = {"appeared": "+", "disappeared": "-", "grew": "^", "shrank": "v"}
+_KIND_MARK = {
+    "appeared": "+",
+    "disappeared": "-",
+    "grew": "^",
+    "shrank": "v",
+    # Not an arrow. `changed` has no direction — one identity replaced
+    # another, and 2.28.0 is not below 2.32.5 in the way 3 is below 9.
+    "changed": "~",
+}
 
 
 def _ordered(report: DriftReport):
@@ -343,10 +351,24 @@ def render_agent(report: DriftReport, gates: GateState | None = None) -> str:
     # standing finding is *in* that baseline, the second because "nothing
     # changed" is the sentence an agent stops reading after.
     standing = (
-        _agent_gate_block(gates)
+        _agent_unmeasured_block(report)
+        + _agent_gate_block(gates)
         + _agent_horizon_block(report)
         + _agent_trend_block(report)
     )
+
+    # Before every other verdict, because every other verdict is a
+    # statement about measurements. A scan whose probes all failed has
+    # not found the codebase unchanged and has not recorded its
+    # structure; it has found nothing, and both of the headings below
+    # would be read as the opposite.
+    if report.probes_run and len(report.unmeasured) == report.probes_run:
+        return (
+            "VIBE SENTINEL: NOTHING WAS MEASURED\n"
+            "No probe produced a measurement this run. This is not a clean "
+            "result, it is an absent one: nothing here says the organization "
+            "of this codebase is unchanged." + standing
+        )
 
     if report.first_run:
         return (
@@ -361,6 +383,14 @@ def render_agent(report: DriftReport, gates: GateState | None = None) -> str:
         # fitted series, so "nothing drifted against the baseline" is the
         # verdict it is most likely to have something to add to.
         read = f"\n\n{report.assessment}" if report.assessment else ""
+        if report.unmeasured:
+            # The heading is the sentence an agent stops reading after,
+            # so the qualification goes in it rather than under it.
+            return (
+                "VIBE SENTINEL: NO DRIFT IN WHAT WAS MEASURED\n"
+                f"Nothing moved among the probes that ran, against "
+                f"{report.baseline_at}. The rest did not report.{read}" + standing
+            )
         return (
             "VIBE SENTINEL: NO STRUCTURAL DRIFT\n"
             f"The organization of this codebase is unchanged since "
@@ -400,6 +430,29 @@ def render_agent(report: DriftReport, gates: GateState | None = None) -> str:
         "`vibe-sentinel scan --update`."
     )
     return "\n".join(lines) + standing
+
+
+def _agent_unmeasured_block(report: DriftReport) -> str:
+    """The probes that ran and reported nothing, on every verdict.
+
+    Appended for the same reason the gate findings are, and ahead of
+    them: an agent told "nothing drifted" by a scan whose probes did not
+    run has been told the truth about the wrong question. A failed probe
+    is recorded rather than raised precisely so the other measurements
+    survive it — which means the scan exits, renders, and reads as a
+    check that passed unless something says otherwise here.
+
+    Empty when every probe measured, so the ordinary run says nothing
+    extra.
+    """
+    if not report.unmeasured:
+        return ""
+    return (
+        f"\n\nNOT MEASURED THIS RUN: {len(report.unmeasured)} of "
+        f"{report.probes_run} probe(s) — {', '.join(report.unmeasured)}. "
+        f"Whatever those measure is unknown for this run, not unchanged. "
+        f"The terminal report (`vibe-sentinel scan`) names the error for each."
+    )
 
 
 def _agent_horizon_block(report: DriftReport) -> str:

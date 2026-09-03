@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,7 @@ import pytest
 from vibe_sentinel.templates import (
     Placeholder,
     Probe,
+    default_probes,
     default_probes_path,
     load_probe_settings,
     load_probes,
@@ -20,17 +22,22 @@ from vibe_sentinel.templates import (
 #: The built-in probe set. Pinned deliberately: a probe silently vanishing
 #: from the defaults is worth a failing test.
 #:
-#: Five, not eight. Licences, provenance and credentials are gates rather
+#: Six, not nine. Licences, provenance and credentials are gates rather
 #: than probes — their placeholders were a {PROJECT_ROOT} that was always
 #: ".", which is a config table's answer and not a question for a model,
 #: and what they report is a state rather than drift. See
 #: :mod:`vibe_sentinel.gates`.
+#:
+#: ``dependency-versions`` is a probe under the same test and passes it
+#: the other way: an installed version is not a state anybody pins, it is
+#: a thing that moves, and the movement is the whole finding.
 SHIPPED_PROBES = {
     "commentary-ratio",
     "module-organization",
     "silent-exceptions",
     "pattern-census",
     "file-length",
+    "dependency-versions",
 }
 
 
@@ -47,6 +54,19 @@ def _probe(**kw) -> Probe:
 def test_default_probes_load() -> None:
     probes = load_probes_from_toml(default_probes_path())
     assert {p.id for p in probes} == SHIPPED_PROBES
+
+
+def test_shipped_probes_run_under_the_interpreter_that_has_the_package() -> None:
+    """Every shipped probe is a module of this package, so argv[0] must be
+    the interpreter running vibe-sentinel and never the bare name.
+
+    Nothing else fails if this regresses. Installed beside a project — the
+    documented install — a bare `python` resolves against that project's
+    PATH, cannot import vibe_sentinel, and every shipped probe is recorded
+    as failed while the scan itself succeeds.
+    """
+    for probe in default_probes():
+        assert probe.command[0] == sys.executable, probe.id
 
 
 def test_scaffold_declares_no_probes() -> None:
@@ -299,9 +319,7 @@ def test_parameters_change_a_value_without_restating_the_probe(
     assert probes["commentary-ratio"].defaults()["SOURCE_ROOT"] == "src"
     # Everything else is still the built-in's.
     assert probes["commentary-ratio"].defaults()["FILE_GLOB"] == "*.py"
-    assert probes["commentary-ratio"].command == (
-        load_probes_from_toml(default_probes_path())[0].command
-    )
+    assert probes["commentary-ratio"].command == default_probes()[0].command
 
 
 def test_a_parameter_for_an_unknown_probe_is_an_error(tmp_path: Path) -> None:

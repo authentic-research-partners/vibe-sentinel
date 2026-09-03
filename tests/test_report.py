@@ -524,3 +524,54 @@ def test_the_trend_report_names_the_floor_it_fitted_above(
     not: an observation measured four times is absent, not flat."""
     render_trend_report([_fit()], runs=50, min_runs=10)
     assert "at least 10 run(s)" in capfd.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# A scan that measured nothing is not a scan that found nothing
+# ---------------------------------------------------------------------------
+
+
+def test_agent_render_never_calls_an_unmeasured_run_clean() -> None:
+    """The failure this exists for: installed beside a project, every
+    shipped probe ran under an interpreter that could not import the
+    package, all five were recorded as failed, and the agent renderer —
+    which cannot see a probe result — printed NO STRUCTURAL DRIFT. A
+    failed probe is recorded rather than raised precisely so the scan
+    completes, which is what makes the renderer the place this has to be
+    caught."""
+    report = _report(changes=[], probes_run=5, unmeasured=["a", "b", "c", "d", "e"])
+    text = render_agent(report)
+    assert "NOTHING WAS MEASURED" in text
+    assert "NO STRUCTURAL DRIFT" not in text
+
+
+def test_agent_render_says_a_baseline_of_nothing_is_not_a_baseline() -> None:
+    """Worse than the no-drift case, because the empty baseline is what
+    every later scan compares against."""
+    report = DriftReport(first_run=True, probes_run=2, unmeasured=["a", "b"])
+    text = render_agent(report)
+    assert "NOTHING WAS MEASURED" in text
+    assert "BASELINE RECORDED" not in text
+
+
+def test_agent_render_qualifies_the_heading_when_only_some_probes_ran() -> None:
+    """The qualification goes in the heading, not under it: the renderer's
+    own comment says the heading is the sentence an agent stops reading
+    after."""
+    report = _report(changes=[], probes_run=5, unmeasured=["silent-exceptions"])
+    text = render_agent(report)
+    assert "NO DRIFT IN WHAT WAS MEASURED" in text
+    assert "NO STRUCTURAL DRIFT" not in text
+    assert "silent-exceptions" in text
+
+
+def test_agent_render_names_the_missing_probes_even_when_drift_was_found() -> None:
+    """Drift found by three probes says nothing about the two that did not
+    report, and the block is appended to every verdict for that reason."""
+    text = render_agent(_report(probes_run=5, unmeasured=["file-length"]))
+    assert "STRUCTURAL DRIFT DETECTED" in text
+    assert "NOT MEASURED THIS RUN: 1 of 5 probe(s) — file-length" in text
+
+
+def test_agent_render_stays_quiet_when_every_probe_measured() -> None:
+    assert "NOT MEASURED" not in render_agent(_report(probes_run=5))

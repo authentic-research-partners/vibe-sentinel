@@ -14,6 +14,13 @@
 # refused when this file loads, and `[probes.parameters]` in your own config
 # changes one without restating the probe.
 #
+# argv[0] below is `python`, and the loader replaces it with the interpreter
+# running vibe-sentinel: these probes are modules of the package, so that is
+# the only interpreter that can import them. Installed beside your project —
+# the documented install — the `python` on PATH is your project's, and it
+# cannot. A [[probe]] of your own runs exactly as written, including one that
+# overrides a probe below by reusing its id.
+#
 # The source roots below default to `.` because there is no constant that is
 # right everywhere. If your package sits one directory down, say so —
 # otherwise these measure your tests and docs alongside it. (They never
@@ -308,6 +315,76 @@ name = "UNIT"
 description = "What length means here: lines, words or bytes. Part of the observation key, so changing it starts a new series instead of redefining the recorded one. The tolerance is a proportion, so it carries over unchanged."
 pattern = "^(lines|words|bytes)$"
 default = "lines"
+
+# =============================================================================
+# Probe 6 — which versions are installed, and where they came from
+# =============================================================================
+# The only probe here that measures the environment rather than the
+# source, and it exists because the environment is the part of a project
+# that nothing records.
+#
+# A declared constraint is in pyproject.toml and shows up in `git diff`.
+# A lock file is in the repository too — a diff nobody reads, but a diff.
+# The installed version is in neither. An agent that runs
+# `uv pip install requests==2.28` to make a test stop failing leaves no
+# artifact in the tree at all: the manifest still says what it said, the
+# lock file is untouched, and the next person sees a repository that has
+# not changed. The version they run is not the version anyone chose.
+#
+# Two series per distribution. `version:` is the obvious one. `origin:`
+# is the one worth reading twice: it says `index` for a package that came
+# from PyPI and names the URL for one that did not, so a dependency
+# quietly becoming a git checkout — invisible in every manifest — is a
+# reported change.
+#
+# Neither carries a number. A version is an identity, not a magnitude,
+# and 1.10 does not sort after 1.9 in any reading that makes it one; they
+# carry a `state`, and compare() reports a state that moves as `changed`.
+# So `tolerance` below applies only to `count:installed`, the one number
+# this probe emits — 0, because a dependency arriving is the event.
+#
+# A probe and not a gate, by the test at the bottom of this file:
+# `requests` being at 2.32.5 is not news and will not be news on the
+# two-hundredth scan. `requests` going 2.32.5 -> 2.28.0 overnight is the
+# whole finding, and it is worth reporting once, when it happens.
+
+[[probe]]
+id = "dependency-versions"
+title = "Installed versions and package origins"
+description = """
+Records the version of every installed distribution and whether it came
+from an index or from a path, URL or VCS checkout. Detects a dependency
+downgraded to make an error go away, a transitive version that moved
+with nothing in the project asking for it, and a package that stopped
+coming from an index.
+"""
+command = [
+    "python", "-m", "vibe_sentinel.probes.dependencies",
+    "--root", "{PROJECT_ROOT}",
+    "--scope", "{SCOPE}",
+]
+timeout_s = 60.0
+tolerance = 0.0
+
+[[probe.placeholders]]
+name = "PROJECT_ROOT"
+description = "The directory holding the manifest, read only when SCOPE is `declared`."
+default = "."
+
+[[probe.placeholders]]
+name = "SCOPE"
+description = """
+Which distributions to record. `all` is every one on the interpreter's
+path and is the honest answer — a version that moved is worth seeing
+whoever pulled it in. `declared` narrows to what the manifest names plus
+everything those transitively require, which is the same supply chain
+minus whatever else happens to be installed; a project with a very large
+environment may prefer it, since every distribution in scope costs two
+rows per scan for the life of the history.
+"""
+pattern = "^(all|declared)$"
+default = "all"
+
 
 # =============================================================================
 # Licences, provenance and credentials are NOT here, and that is the rule

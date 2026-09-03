@@ -1,6 +1,6 @@
 # Use of the Local Model
 
-## Measurement is mechanical; judgement is not one rule but three
+## Measurement is mechanical; judgement follows three different rules
 
 Probes are subprocesses, `compare()` is a diff, the provenance audit is
 arithmetic, the credential scan is a rule set, and the safety gate's triage is a
@@ -17,19 +17,18 @@ What the model is then allowed to *do* differs by which question it answers:
 | `licenses` | the SPDX resolver decides | drafts the note for a pin, after the gate has decided | nothing; it never sees the verdict |
 | `safety` | triage flags a command | is this command safe, given the agent's own history | in `enforce` mode, refuse the call |
 
-The last row is the one that does not fit a tidy sentence about measurement. Its
+The last row does not fit a tidy sentence about measurement. Its
 subject is what an agent is about to do rather than the codebase, and its answer
 acts before anyone reads a report. That is why it is opt-in and off by default.
 
-The invariant across all five: **the model never picks what to look at, and never
-adds an entry to the list it was handed.** What "the list" is differs, and reading
+The invariant across all five: **the model never picks what to look at and never adds an entry to the list it was given.** What "the list" is differs, and reading
 past that is how "it cannot hide a finding" gets misquoted — `compare()` owns the
 change list outright, while the credentials and near-miss rules own a list of
 *candidates* that settling is the model's whole job.
 
 ## The safety gate, because it can act
 
-- **Off by default.** `[safety] mode` is `off`, `observe` or `enforce`. Only
+- **Off by default.** `[safety] mode` is `off`, `observe`, or `enforce`. Only
   `enforce` can refuse, and only on `unsafe` — an `unclear` verdict is recorded
   and the command proceeds.
 - **It is the only call that gets history**: the command, its target, the cwd,
@@ -44,7 +43,7 @@ change list outright, while the credentials and near-miss rules own a list of
 ## Without a model
 
 Every command that uses one takes `--no-model`, and every report says so.
-Measuring never needed one, so what you lose is commentary, not detection.
+Measuring never needed one, so what you lose is commentary rather than detection.
 
 | Command | With `--no-model` |
 |---|---|
@@ -58,8 +57,7 @@ This is the CI path.
 
 ## Which model
 
-Any OpenAI-compatible `/v1/chat/completions` endpoint; nothing in the package is
-backend-specific, and anything one backend needs goes in `[llm] extra_body`.
+Any OpenAI-compatible `/v1/chat/completions` endpoint works; nothing in the package is backend-specific, and anything a backend needs goes in `[llm] extra_body`.
 
 ```toml
 [llm]
@@ -68,7 +66,7 @@ model = "qwen3-8b-fp8"
 structured_output = "json_schema"   # json_schema | json_object | none
 ```
 
-Pick a family **different from whatever agent writes your code** — one from the
+Pick a family **different from the one that writes your code** — one from the
 same family shares its blind spots about what normal structure looks like. An 8B
 model is enough. On a backend that serialises, set `concurrency = 1` under
 `[safety]`, `[credentials]`, `[packages]` and `[drift]`.

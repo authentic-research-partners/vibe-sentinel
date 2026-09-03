@@ -844,3 +844,144 @@ def test_a_path_as_a_check_costs_far_more_than_as_a_signal(project: Path) -> Non
     # As a signal, only what was already destructive escalates.
     assert as_signal == ["rm -rf /mnt/live/cache"]
     assert len(as_signal) < len(as_check)
+
+
+# --- installing a name nobody wrote down -----------------------------------
+#
+# The distinction the built-in exists for, and the reason it is a
+# structural `applies_to` rather than a pattern: `uv pip install -e ".[dev]"`
+# and `uv pip install requests` are the same shape of command, and only the
+# manifest tells them apart.
+
+
+def declare(project: Path, dependencies: str = '"httpx>=0.27"') -> None:
+    (project / "pyproject.toml").write_text(
+        f'[project]\nname = "mine"\ndependencies = [{dependencies}]\n'
+        '[project.optional-dependencies]\ndev = ["pytest"]\n',
+        encoding="utf-8",
+    )
+
+
+def test_an_undeclared_install_escalates(project: Path) -> None:
+    declare(project)
+    signals = safety.triage("Bash", "uv pip install requests", "", project)
+    assert "installing-undeclared-dependency" in signals
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'uv pip install -e ".[dev]"',  # the setup command in docs/development.md
+        "uv pip install httpx",
+        "uv pip install pytest",
+        "uv pip install mine",
+        "uv add requests",
+        "pip install -r requirements.txt",
+    ],
+)
+def test_re_syncing_what_the_manifest_declares_does_not(
+    project: Path, command: str
+) -> None:
+    """The false positive that would get this switched off within a week."""
+    declare(project)
+    assert safety.triage("Bash", command, "", project) == ()
+
+
+def test_a_tree_with_no_manifest_never_escalates_an_install(project: Path) -> None:
+    """Nowhere to read a declaration is not the same as a declaration of
+    nothing, and the second reading flags every install in every plain
+    directory."""
+    assert not (project / "pyproject.toml").exists()
+    assert safety.triage("Bash", "uv pip install requests", "", project) == ()
+
+
+def test_the_prompt_names_the_packages_nobody_declared(project: Path) -> None:
+    """The one fact a model reading the command line cannot work out for
+    itself. It is mechanical, so it is stated rather than asked about."""
+    declare(project)
+    command = "uv pip install httpx requests colorama"
+    dangers = safety.load_dangers(project)
+    signals = safety.triage("Bash", command, "", project, dangers)
+
+    prompt = safety.build_prompt(
+        "Bash", command, "", str(project), project, signals, [], dangers
+    )
+    assert "no manifest in the project declares: requests, colorama" in prompt
+    assert "httpx" not in prompt.split("declares:")[1]
+
+
+def test_the_rule_can_be_made_mechanical(project: Path) -> None:
+    """Overriding the built-in by id turns a question into a decision: no
+    model call, no latency, and it still holds with the backend down."""
+    declare(project)
+    write_config(
+        project,
+        '[safety]\nmode = "enforce"\n\n'
+        '[[danger]]\nid = "installing-undeclared-dependency"\n'
+        'title = "Installing a package that nothing in the project declares"\n'
+        'applies_to = "undeclared-install"\nverdict = "unsafe"\n',
+    )
+    dangers = safety.load_dangers(project)
+    signals = safety.triage("Bash", "uv pip install requests", "", project, dangers)
+
+    settled = safety.declared_verdict(signals, dangers)
+    assert settled is not None
+    assert settled[0] == "unsafe"
+
+
+def test_a_declared_verdict_needs_no_question(project: Path) -> None:
+    """The question is what the model is asked, and a verdict means it is
+    never asked. Requiring one anyway asks for text nothing reads."""
+    write_config(
+        project,
+        '[[danger]]\nid = "x"\npattern = "y"\nverdict = "unsafe"\n',
+    )
+    (danger,) = [d for d in safety.load_dangers(project) if d.id == "x"]
+    assert (danger.verdict, danger.question) == ("unsafe", "")
+
+
+def test_a_structural_danger_needs_no_pattern(project: Path) -> None:
+    write_config(
+        project,
+        '[[danger]]\nid = "x"\napplies_to = "undeclared-install"\nquestion = "q"\n',
+    )
+    (danger,) = [d for d in safety.load_dangers(project) if d.id == "x"]
+    assert danger.pattern == ""
+
+
+def test_an_unknown_applies_to_names_the_ones_that_exist(project: Path) -> None:
+    write_config(
+        project,
+        '[[danger]]\nid = "x"\napplies_to = "nowhere"\nquestion = "q"\n',
+    )
+    with pytest.raises(ValueError, match="undeclared-install"):
+        safety.load_dangers(project)
+
+
+def test_a_danger_with_neither_a_question_nor_a_verdict_is_an_error(
+    project: Path,
+) -> None:
+    write_config(project, '[[danger]]\nid = "x"\npattern = "y"\n')
+    with pytest.raises(ValueError, match="sets a verdict"):
+        safety.load_dangers(project)
+
+
+def test_the_question_names_the_field_the_schema_demands() -> None:
+    """A constrained decoder cannot make a model emit a field it has
+    nothing to say about.
+
+    Every property is required, so the grammar will not accept the closing
+    brace early — but it accepts whitespace between any two tokens, for as
+    long as there is room. Asked about a command with nothing to resolve,
+    an 8B model wrote `verdict` and `reason`, declined to start
+    `resolves_to`, and emitted newlines to the ceiling; raising the ceiling
+    only bought more newlines. Naming the field is what fixed it, so the
+    question has to carry it.
+    """
+    from vibe_sentinel.schemas import SafetyOpinion
+
+    question = safety.build_question(safety.BUILTIN_DANGERS[0])
+    for field in SafetyOpinion.model_fields:
+        if field == "verdict":
+            continue  # the whole question is what to put here
+        assert field in question, f"the question never mentions {field}"

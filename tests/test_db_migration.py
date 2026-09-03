@@ -488,3 +488,82 @@ def test_head_indexes_is_what_a_fresh_database_actually_has(project: Path) -> No
     finally:
         conn.close()
     assert present == schema.head_indexes()
+
+
+def _database_at(root: Path, version: int) -> Path:
+    """A database at ``version``, with one run and one observation on it."""
+    path = db_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    try:
+        for v in range(1, version + 1):
+            for statement in migration._split_sql(schema.MIGRATIONS[v]):
+                conn.execute(statement)
+            conn.execute("INSERT INTO schema_version (version) VALUES (?)", (v,))
+        conn.execute(
+            "INSERT INTO runs (started_at, root, model, used_model)"
+            " VALUES ('2026-01-01T00:00:00+00:00', 'src', 'qwen3', 1)"
+        )
+        conn.execute(
+            "INSERT INTO probe_runs (run_id, probe_id, title, command_json,"
+            " parameters_json, ok) VALUES (1, 'module-organization', 'Shape',"
+            " '[\"echo\"]', '{}', 1)"
+        )
+        conn.execute(
+            "INSERT INTO observations (run_id, probe_id, key, value, label)"
+            " VALUES (1, 'module-organization', 'dir:src', 9.0, 'nine modules')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return path
+
+
+def test_v7_adds_state_and_leaves_every_recorded_measurement_alone(
+    tmp_path: Path,
+) -> None:
+    """The column arrives empty on history that predates it, and that is
+    the correct value: every probe that ran before this migration
+    measured a magnitude and nothing else."""
+    _database_at(tmp_path, 6)
+    assert read_schema_version(db_path(tmp_path)) == 6
+
+    assert run_migration(tmp_path).success
+    assert read_schema_version(db_path(tmp_path)) == schema.SCHEMA_VERSION
+
+    with get_db(tmp_path) as conn:
+        row = conn.execute("SELECT key, value, state FROM observations").fetchone()
+        assert (row["key"], row["value"], row["state"]) == ("dir:src", 9.0, "")
+
+
+def test_a_migrated_database_reports_no_change_for_the_state_it_gained(
+    tmp_path: Path,
+) -> None:
+    """The run after this migration must not announce every key in the
+    history as having changed from nothing into its first state. That is
+    a definition change, and reporting it as drift would put a wall of
+    changes in front of whatever real drift that scan found."""
+    from vibe_sentinel.db import store
+    from vibe_sentinel.inventory import compare
+    from vibe_sentinel.schemas import Observation, ProbeResult, Snapshot
+    from vibe_sentinel.templates import Probe
+
+    _database_at(tmp_path, 6)
+    assert run_migration(tmp_path).success
+
+    with get_db(tmp_path) as conn:
+        baseline = store.load_snapshot(conn, 1)
+    assert baseline is not None
+
+    # The same measurement again, from a probe that now also records a
+    # state — exactly what the first scan after an upgrade looks like.
+    current = Snapshot(
+        probes={
+            "module-organization": ProbeResult(
+                probe_id="module-organization",
+                observations=[Observation(key="dir:src", value=9.0, state="whatever")],
+            )
+        }
+    )
+    probe = Probe(id="module-organization", title="t", command=["echo"])
+    assert compare(baseline, current, [probe]).changes == []

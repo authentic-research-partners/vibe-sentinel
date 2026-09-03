@@ -3,8 +3,19 @@
 The comparison itself is mechanical and needs no model. An observation
 key absent from the baseline *appeared*; one no longer present
 *disappeared*; one whose value moved past the probe's tolerance *grew* or
-*shrank*. The model's later analysis rates these, but cannot invent or
-suppress one — which is what keeps the drift set reproducible.
+*shrank*; one whose *state* moved at all *changed*. The model's later
+analysis rates these, but cannot invent or suppress one — which is what
+keeps the drift set reproducible.
+
+The fourth kind is why a version can be tracked here at all. A key is
+stable or it is nothing — it is the entire drift mechanism — so the
+version cannot go in it, and ``value`` is a float, so the version cannot
+go there either. Keying an installed package ``requests==2.32.5`` would
+make an upgrade read as one thing vanishing and an unrelated thing
+arriving, end that key's series at one point, and break the stability
+``Observation.key`` promises. So the identity stays in the key, the
+version goes in ``state``, and the transition between two states is its
+own kind.
 
 The same diff answers a horizon comparison — a scan reports what moved
 since the baseline *and* what moved since the newest run a week or a
@@ -21,6 +32,25 @@ from __future__ import annotations
 
 from vibe_sentinel.schemas import Change, DriftReport, Snapshot
 from vibe_sentinel.templates import Probe
+
+
+def _restated(before: str, after: str) -> bool:
+    """Whether an observation's state moved from one thing to another.
+
+    Both ends must be non-empty. A state *arriving* where a baseline has
+    none is not a transition of the thing measured — it is the probe
+    beginning to measure something it did not measure before, and the
+    whole recorded history of that key predates the field. Reporting it
+    as a change would announce a definition change as drift in the
+    codebase, on every key the probe emits, on the one run after somebody
+    edited the probe.
+
+    No tolerance, because a string has no distance: ``2.32.5`` is not
+    nearer to ``2.32.4`` than to ``1.0.0`` in any sense a probe could
+    declare. A probe that does not want every move reported keeps the
+    field out of its state.
+    """
+    return bool(before) and bool(after) and before != after
 
 
 def _moved(probe: Probe | None, before: float, after: float) -> bool:
@@ -41,16 +71,21 @@ def compare(
 ) -> DriftReport:
     """Diff ``current`` against ``baseline``.
 
-    Severity here is deliberately coarse — ``appeared`` and
-    ``disappeared`` are ``medium`` because a structural element arriving
-    or vanishing is a real organizational event, while a value moving
+    Severity here is deliberately coarse — ``appeared``,
+    ``disappeared`` and ``changed`` are ``medium`` because a structural
+    element arriving, vanishing, or turning into a different thing under
+    the same name is a real organizational event, while a value moving
     past tolerance is ``low``. The analysis pass refines these; this
     function only decides what counts as a change at all.
     """
+    unmeasured = sorted(pid for pid, r in current.probes.items() if not r.ok)
+
     if baseline is None:
         return DriftReport(
             current_at=current.generated_at,
             first_run=True,
+            probes_run=len(current.probes),
+            unmeasured=unmeasured,
             assessment=(
                 "No previous run — this scan establishes the baseline. The "
                 "next scan reports drift against it."
@@ -108,7 +143,29 @@ def compare(
                 )
             )
         for key in sorted(set(before) & set(after)):
-            old, new = before[key].value, after[key].value
+            was, now = before[key], after[key]
+            if _restated(was.state, now.state):
+                # A state move outranks a value move on the same key, and
+                # only one change may carry a given (probe_id, key): that
+                # pair is the identity `ChangeAssessment` rates against and
+                # the `changes` table indexes, so a second row under it
+                # lands the model's severity on whichever was seen last.
+                # The numbers ride along rather than being dropped.
+                changes.append(
+                    Change(
+                        probe_id=probe_id,
+                        key=key,
+                        kind="changed",
+                        before=was.value,
+                        after=now.value,
+                        before_state=was.state,
+                        after_state=now.state,
+                        label=now.label or key,
+                        severity="medium",
+                    )
+                )
+                continue
+            old, new = was.value, now.value
             if old is None or new is None or not _moved(probe, old, new):
                 continue
             changes.append(
@@ -118,7 +175,7 @@ def compare(
                     kind="grew" if new > old else "shrank",
                     before=old,
                     after=new,
-                    label=after[key].label or key,
+                    label=now.label or key,
                     severity="low",
                 )
             )
@@ -138,4 +195,6 @@ def compare(
         baseline_at=baseline.generated_at,
         current_at=current.generated_at,
         changes=changes,
+        probes_run=len(current.probes),
+        unmeasured=unmeasured,
     )

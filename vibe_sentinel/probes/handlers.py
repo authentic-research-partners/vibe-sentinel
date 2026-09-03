@@ -51,7 +51,13 @@ import ast
 import sys
 from pathlib import Path
 
-from vibe_sentinel.probes import emit, iter_source_files, nothing_measured
+from vibe_sentinel.probes import (
+    emit,
+    iter_source_files,
+    not_measured,
+    nothing_measured,
+    unreadable_dirs,
+)
 
 #: How many locations one directory's observation names. The rest are
 #: counted, never dropped — the count is the measurement and the list is
@@ -223,11 +229,18 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     per_dir: dict[str, Tally] = {}
+    skipped: list[str] = []
     matched = parsed = 0
     for path in iter_source_files(root, args.glob):
         matched += 1
         tally = per_dir.setdefault(path.parent.as_posix(), Tally())
-        parsed += int(measure_file(path, tally))
+        if measure_file(path, tally):
+            parsed += 1
+        else:
+            # `silent-total` is a sum over the files that parsed. A file
+            # that did not is a hole in it, and a total that shrank
+            # because of one otherwise reads as handlers being fixed.
+            skipped.append(path.as_posix())
 
     problem = nothing_measured("handlers", root, args.glob, matched, parsed)
     if problem:
@@ -289,12 +302,18 @@ def main(argv: list[str] | None = None) -> int:
         }
     )
 
+    # Counted before the gap observation is appended: this is how many
+    # directories carry a `silent-in:` key, not how long the list is.
+    reporting_dirs = len(observations) - 1
+    gaps = not_measured(skipped, unreadable_dirs(root))
+    observations.append(gaps)
+
     emit(
         observations,
         summary=(
             f"{total_silent} of {total_handlers} handler(s) discard the error, "
-            f"across {len(observations) - 1} of {len(per_dir)} director"
-            f"{'y' if len(per_dir) == 1 else 'ies'}"
+            f"across {reporting_dirs} of {len(per_dir)} director"
+            f"{'y' if len(per_dir) == 1 else 'ies'}; {gaps['label']}"
         ),
     )
     return 0

@@ -38,7 +38,13 @@ import ast
 import sys
 from pathlib import Path
 
-from vibe_sentinel.probes import emit, iter_source_files, nothing_measured
+from vibe_sentinel.probes import (
+    emit,
+    iter_source_files,
+    not_measured,
+    nothing_measured,
+    unreadable_dirs,
+)
 
 
 def module_name(path: Path, root: Path) -> str:
@@ -150,6 +156,7 @@ def main(argv: list[str] | None = None) -> int:
     dir_lines: dict[str, int] = {}
     parsed: list[tuple[Path, str, int, list[tuple[str, tuple[str, ...]]]]] = []
     by_module: dict[str, Path] = {}
+    skipped: list[str] = []
     matched = 0
 
     # Pass one: parse, measure, and collect each file's import targets.
@@ -161,7 +168,12 @@ def main(argv: list[str] | None = None) -> int:
             text = path.read_text(encoding="utf-8")
             tree = ast.parse(text, filename=str(path))
         except (OSError, UnicodeDecodeError, SyntaxError) as e:
+            # Counted, not just logged. A file whose imports cannot be
+            # read lowers the fan-in of every module it imports, and that
+            # drop is otherwise reported as a structural change in files
+            # nobody touched.
             print(f"skipped {path}: {e}", file=sys.stderr)
+            skipped.append(path.as_posix())
             continue
 
         name = module_name(path, root)
@@ -252,12 +264,15 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     edge_count = sum(len(e) for e in resolved.values())
+    gaps = not_measured(skipped, unreadable_dirs(root))
+    observations.append(gaps)
+
     emit(
         observations,
         summary=(
             f"{len(parsed)} module(s) across {len(dir_counts)} director"
             f"{'y' if len(dir_counts) == 1 else 'ies'} under {root.as_posix()}, "
-            f"{edge_count} internal import edge(s)"
+            f"{edge_count} internal import edge(s); {gaps['label']}"
         ),
     )
     return 0

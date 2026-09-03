@@ -2,7 +2,7 @@ cff-version: 1.2.0
 message: "If you use vibe-sentinel in your work, please cite it as below."
 type: software
 title: vibe-sentinel
-version: 0.1.0
+version: 0.2.0
 date-released: "2026-09-03"
 abstract: >
   Guards structural expectations about how a codebase is organized, and

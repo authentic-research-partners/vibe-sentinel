@@ -42,6 +42,7 @@ is a load-time error, not a shell metacharacter.
 from __future__ import annotations
 
 import re
+import sys
 import tomllib
 from collections.abc import Sequence
 from pathlib import Path
@@ -293,6 +294,40 @@ def load_probes_from_toml(path: Path) -> list[Probe]:
     return probes
 
 
+#: argv[0] as ``probes.default.toml`` writes it. The file has to spell the
+#: interpreter somehow, and ``python`` is what reads correctly there.
+_BUILTIN_INTERPRETER = "python"
+
+
+def default_probes() -> list[Probe]:
+    """The built-in set, with argv[0] resolved to the running interpreter.
+
+    Every shipped probe is a module of this package, so the only
+    interpreter that can run one is the interpreter that has the package
+    importable — which is this one. That is a fact about the process
+    rather than a value anyone declares, which is why it is resolved here
+    and not carried as a placeholder with a ``default``.
+
+    Left as the literal ``python``, the argv reaching ``subprocess.run``
+    resolves against the scanned project's ``PATH``. Installed *beside*
+    the project — the documented install — that is the project's
+    interpreter, which does not have ``vibe_sentinel`` importable, so all
+    five shipped probes exit non-zero and are recorded as failed. Nothing
+    else fails: the scan completes and reports that the measurements are
+    missing, which reads as a broken config rather than a broken install.
+
+    A probe of your own is left exactly as written, including one that
+    overrides a built-in by reusing its id. Its argv[0] is its author's to
+    choose, and a probe that imports the *project's* package needs the
+    *project's* interpreter.
+    """
+    probes = load_probes_from_toml(default_probes_path())
+    for probe in probes:
+        if probe.command[:1] == [_BUILTIN_INTERPRETER]:
+            probe.command[0] = sys.executable
+    return probes
+
+
 class ProbeSettings(BaseModel):
     """The ``[probes]`` table: which of the built-ins are in play."""
 
@@ -402,7 +437,7 @@ def load_probes(
 
     merged: dict[str, Probe] = {}
     if settings.use_builtins:
-        for probe in load_probes_from_toml(default_probes_path()):
+        for probe in default_probes():
             merged[probe.id] = probe
     for path in paths:
         for probe in load_probes_from_toml(path):

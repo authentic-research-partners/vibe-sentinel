@@ -399,3 +399,63 @@ def test_earliest_run_is_what_bounds_every_horizon(project: Path) -> None:
 def test_no_history_has_no_earliest_run(project: Path) -> None:
     with get_db(project) as conn:
         assert store.earliest_run(conn) is None
+
+
+# --- state, and the changes it produces ------------------------------------
+
+
+def test_an_observation_s_state_survives_the_round_trip(project: Path) -> None:
+    """Load-bearing, and silently so. The snapshot rebuilt from here is
+    the baseline end of every `changed` comparison, so a state dropped on
+    the way back reports that no version ever moved — which reads exactly
+    like an environment nobody has touched."""
+    snapshot = Snapshot(
+        probes={
+            "p": ProbeResult(
+                probe_id="p",
+                observations=[
+                    Observation(key="version:requests", state="2.32.5"),
+                ],
+            )
+        }
+    )
+    run_id = _save(project, snapshot, DriftReport(first_run=True))
+    with get_db(project) as conn:
+        loaded = store.load_snapshot(conn, run_id)
+    assert loaded is not None
+    assert loaded.probes["p"].by_key()["version:requests"].state == "2.32.5"
+
+
+def test_a_changed_records_both_ends_of_the_transition(project: Path) -> None:
+    report = DriftReport(
+        changes=[
+            Change(
+                probe_id="dependency-versions",
+                key="version:requests",
+                kind="changed",
+                before_state="2.32.5",
+                after_state="2.28.0",
+                label="requests 2.28.0",
+                severity="high",
+                note="downgraded with nothing in the manifest asking for it",
+            )
+        ]
+    )
+    run_id = _save(project, _snapshot([("a", 1.0)]), report)
+    with get_db(project) as conn:
+        (change,) = store.load_changes(conn, run_id)
+    assert change.kind == "changed"
+    assert change.before_state == "2.32.5"
+    assert change.after_state == "2.28.0"
+    assert change.describe() == "version:requests: 2.32.5 -> 2.28.0"
+
+
+def test_a_state_free_observation_round_trips_as_empty(project: Path) -> None:
+    """Every row written before this column existed is correct at '', and
+    `compare` requires both ends non-empty, so the run after the
+    migration must not announce the whole history as having changed."""
+    run_id = _save(project, _snapshot([("a", 1.0)]), DriftReport(first_run=True))
+    with get_db(project) as conn:
+        loaded = store.load_snapshot(conn, run_id)
+    assert loaded is not None
+    assert loaded.probes["p"].by_key()["a"].state == ""

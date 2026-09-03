@@ -167,6 +167,8 @@ Signals that a change is meaningful:
 - A module's internal coupling rising sharply — it has become a hub.
 - Commentary rising well out of line with the rest of the codebase.
 - A structural pattern showing up somewhere it never appeared before.
+- A dependency whose version or origin moved with nothing in the project
+  asking for it — kind=changed carries the two ends.
 
 Signals that a change is ordinary:
 - Small movements consistent with normal feature work.
@@ -313,6 +315,19 @@ def unknown_watches(lenses: tuple[Lens, ...], probe_ids: set[str]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def _ends(change: Change) -> str:
+    """The two ends of one change, in the type it was measured at.
+
+    A ``changed`` carries its transition as strings, and its numeric pair
+    is usually empty — rendering ``before=None after=None`` for a package
+    that went 2.32.5 to 2.28.0 hands the model the one field that says
+    nothing and hides the one that says everything.
+    """
+    if change.kind == "changed":
+        return f"before={change.before_state!r} after={change.after_state!r}"
+    return f"before={change.before} after={change.after}"
+
+
 def build_context(report: DriftReport, current: Snapshot, guidance: str = "") -> str:
     """The shared half of the prompt: the whole report, once.
 
@@ -327,8 +342,7 @@ def build_context(report: DriftReport, current: Snapshot, guidance: str = "") ->
         if r.summary
     )
     changes = "\n".join(
-        f"- key={c.key!r} probe={c.probe_id} kind={c.kind} "
-        f"before={c.before} after={c.after} :: {c.label}"
+        f"- key={c.key!r} probe={c.probe_id} kind={c.kind} {_ends(c)} :: {c.label}"
         for c in report.changes
     )
 
@@ -377,8 +391,7 @@ def _horizon_block(report: DriftReport) -> str:
             continue
         lines.append(f"{head}: {len(moved)} change(s)")
         lines += [
-            f"    key={c.key!r} probe={c.probe_id} kind={c.kind} "
-            f"before={c.before} after={c.after}"
+            f"    key={c.key!r} probe={c.probe_id} kind={c.kind} {_ends(c)}"
             for c in moved
         ]
     return "<OVER_LONGER_HORIZONS>\n" + "\n".join(lines) + "\n</OVER_LONGER_HORIZONS>"

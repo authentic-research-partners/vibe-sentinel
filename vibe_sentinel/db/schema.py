@@ -26,7 +26,7 @@ Adding a migration:
 from __future__ import annotations
 
 # Schema version — increment when adding a migration below.
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 SCHEMA_V1 = """
@@ -452,6 +452,41 @@ CREATE INDEX IF NOT EXISTS idx_gate_findings_key
 """
 
 
+SCHEMA_V7 = """
+-- The measured string beside the measured number, and the transition
+-- between two of them.
+--
+-- `value` is a REAL because most structural facts are magnitudes: a
+-- directory holds nine modules, a file runs to 400 lines. Some are not.
+-- An installed package is at 2.32.5; a vendored file carries Apache-2.0.
+-- Those are identities, and the drift question about an identity is not
+-- "how far did it move" but "is it still the same one".
+--
+-- It could not be squeezed into either column already here. The key is
+-- the drift mechanism and has to be stable across runs, so keying a
+-- package `requests==2.32.5` would end its series at one point and make
+-- every upgrade read as one thing vanishing and another arriving. And a
+-- version does not fit a REAL: 2.32.5 is not a number, and 1.10 does not
+-- sort after 1.9 in any reading that does.
+--
+-- So: a column, on both tables, defaulting to ''. Existing rows are
+-- correct at that default -- every probe that ran before this migration
+-- measured a magnitude and nothing else -- and `compare` reports a
+-- `changed` only when BOTH ends are non-empty, so the run after this
+-- lands does not announce every key in the history as having changed
+-- from nothing into its first state.
+--
+-- Not indexed. `risk` earned an index because it is the field you query
+-- the history BY -- "which runs carried an unregistered import". This one
+-- is read as part of a snapshot that is already being loaded whole by
+-- run_id, so `idx_observations_trend` is the index it uses.
+ALTER TABLE observations ADD COLUMN state TEXT NOT NULL DEFAULT '';
+
+ALTER TABLE changes ADD COLUMN before_state TEXT NOT NULL DEFAULT '';
+ALTER TABLE changes ADD COLUMN after_state TEXT NOT NULL DEFAULT '';
+"""
+
+
 MIGRATIONS: dict[int, str] = {
     1: SCHEMA_V1,
     2: SCHEMA_V2,
@@ -459,6 +494,7 @@ MIGRATIONS: dict[int, str] = {
     4: SCHEMA_V4,
     5: SCHEMA_V5,
     6: SCHEMA_V6,
+    7: SCHEMA_V7,
 }
 
 
@@ -540,6 +576,11 @@ VERIFY: dict[int, list[str]] = {
         "SELECT id, gate_run_id, gate, key, kind, subject, label, detail, risk,"
         " verdict, failing, pinned, adjudicated, reason, attrs_json"
         " FROM gate_findings LIMIT 0",
+    ],
+    # This migration creates no index, so it names none in EXPECT_INDEXES.
+    7: [
+        "SELECT state FROM observations LIMIT 0",
+        "SELECT before_state, after_state FROM changes LIMIT 0",
     ],
 }
 

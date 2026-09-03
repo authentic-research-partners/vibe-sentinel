@@ -32,7 +32,7 @@ from pydantic import BaseModel, Field
 from vibe_sentinel.json_schema import unbounded_schema
 
 Severity = Literal["high", "medium", "low", "info"]
-ChangeKind = Literal["appeared", "disappeared", "grew", "shrank"]
+ChangeKind = Literal["appeared", "disappeared", "grew", "shrank", "changed"]
 SafetyVerdict = Literal["safe", "unclear", "unsafe"]
 SecretVerdict = Literal["real", "placeholder", "unclear"]
 NearMissVerdict = Literal["distinct", "typosquat", "unclear"]
@@ -50,6 +50,31 @@ class Observation(BaseModel):
     key: str
     value: float | None = None
     label: str = ""
+
+    state: str = ""
+    """The measured *string* where the fact is an identity rather than a
+    magnitude — a version, an origin, a licence identifier.
+
+    ``value`` and this are the same idea at two types, and both are
+    diffed: a number moving past the probe's tolerance is ``grew`` or
+    ``shrank``, a state moving at all is ``changed``. A string has no
+    tolerance because it has no distance — ``2.32.5`` is not nearer to
+    ``2.32.4`` than to ``1.0.0`` in any sense a probe could declare — so
+    any move counts, and a probe that does not want every move reported
+    should not put the field in its state.
+
+    Kept apart from ``attrs`` deliberately. Everything in ``attrs`` is
+    carried for a reader; this is the part :func:`~vibe_sentinel.inventory.compare`
+    watches. Folding the two would mean either diffing every attr, which
+    turns a probe's own bookkeeping into drift, or declaring which attr
+    to watch, which is a declaration somebody can forget to write — and a
+    watched field nobody declared reads exactly like a field that never
+    changed.
+
+    Empty for observations that measure only a number, which is most of
+    them.
+    """
+
     attrs: dict[str, str] = Field(default_factory=dict)
 
     risk: str = ""
@@ -110,6 +135,15 @@ class Change(BaseModel):
     kind: ChangeKind
     before: float | None = None
     after: float | None = None
+
+    before_state: str = ""
+    after_state: str = ""
+    """The two ends of a ``changed``, carried beside the numeric pair
+    rather than inside it. ``before``/``after`` are what ``delta``
+    subtracts and what the trend fitting reads, and a union that
+    sometimes held a version string would make both of those a runtime
+    question. Empty for every other kind."""
+
     label: str = ""
     severity: Severity = "info"
     note: str = ""
@@ -126,6 +160,11 @@ class Change(BaseModel):
             return f"new: {self.label or self.key}"
         if self.kind == "disappeared":
             return f"gone: {self.label or self.key}"
+        if self.kind == "changed":
+            # The key, not the label. A label describes the state as it is
+            # *now* — "requests 2.28.0" — so pairing it with the transition
+            # prints the new value twice and the old one once.
+            return f"{self.key}: {self.before_state} -> {self.after_state}"
         before = "?" if self.before is None else f"{self.before:g}"
         after = "?" if self.after is None else f"{self.after:g}"
         return f"{self.label or self.key}: {before} -> {after}"
@@ -219,6 +258,21 @@ class DriftReport(BaseModel):
     """True when the model rated these changes. False means the
     severities are the mechanical ones from the comparison, and no
     rendering may claim the drift was reviewed."""
+    probes_run: int = 0
+    """How many probes ran at all this scan."""
+    unmeasured: list[str] = Field(default_factory=list)
+    """Probe ids that ran and produced no measurement, sorted.
+
+    The measurement counterpart of :attr:`analyzed`, and it exists for
+    the same reason: a failed probe is recorded rather than raised, so a
+    scan completes with its numbers simply missing, and "nothing changed"
+    is then the sentence a renderer reaches for. It is the wrong one. A
+    comparison against measurements that were never taken has not found
+    that the codebase is unchanged; it has found nothing, which is a
+    different statement and the one this codebase exists to keep apart.
+
+    ``probes_run == len(unmeasured)`` means nothing was measured at all.
+    """
 
     @property
     def drifted(self) -> bool:
@@ -387,6 +441,37 @@ BREVITY = (
     f'Keep "reason" to one sentence, under {chars_to_words(REASON_CHARS)} words. '
     f"Anything past that is cut off, so say the deciding thing first."
 )
+
+
+#: Said alongside it wherever a schema has a field that is legitimately
+#: empty — ``SafetyOpinion.resolves_to`` when nothing can be resolved,
+#: ``NearMissOpinion.suspect`` when neither name is the imposter.
+#:
+#: A constrained decoder cannot make a model emit a field it has nothing to
+#: say about. Every property is ``required``, so the grammar will not accept
+#: the closing brace early — but it accepts whitespace between any two
+#: tokens, for as long as there is room. Asked about `rm -rf build` with
+#: nothing to resolve, an 8B model wrote ``verdict`` and ``reason``,
+#: declined to start ``resolves_to``, and emitted newlines until it hit the
+#: ceiling: 0 of 3 answers at 512 tokens, and the same at 1024 and 2048,
+#: because more room is only more whitespace. Naming the field and saying
+#: what to put in it took the same three questions to 3 of 3, and from
+#: `length` at 15 s to `stop` at 8. Raising ``max_tokens``, lowering the
+#: temperature and both sampler penalties changed nothing: the model was not
+#: running out of room, it was declining to write a field nobody mentioned.
+#:
+#: The names are spelled out rather than left to "every field the schema
+#: names", because under ``json_schema`` the schema never reaches the
+#: prompt — it goes in ``response_format``, where the model reads it as a
+#: constraint and not as instructions.
+def every_field(*names: str) -> str:
+    """Tell the model to fill the fields it may have nothing to say about."""
+    listed = ", ".join(f'"{name}"' for name in names)
+    return (
+        f"Return every field, {listed} included. Where you have no answer for "
+        f"one, return it as an empty string — that is an answer, and leaving "
+        f"the field out is not."
+    )
 
 
 class ChangeAssessment(BaseModel):

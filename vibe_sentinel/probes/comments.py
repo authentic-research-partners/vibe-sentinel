@@ -27,7 +27,13 @@ import sys
 import tokenize
 from pathlib import Path
 
-from vibe_sentinel.probes import emit, iter_source_files, nothing_measured
+from vibe_sentinel.probes import (
+    emit,
+    iter_source_files,
+    not_measured,
+    nothing_measured,
+    unreadable_dirs,
+)
 
 #: Comment bodies that are instructions to other tools, not prose. A
 #: linter directive is not a model padding its output, so counting one
@@ -101,22 +107,25 @@ def _docstring_lines(tree: ast.Module) -> set[int]:
     return covered
 
 
-def measure_file(path: Path, counts: Counts) -> None:
-    """Fold one file's counts into ``counts``.
+def measure_file(path: Path, counts: Counts) -> bool:
+    """Fold one file's counts into ``counts``. False if it could not be.
 
     A file that cannot be read or parsed is skipped with a note on
-    stderr — stdout carries the JSON protocol and must stay clean.
+    stderr — stdout carries the JSON protocol and must stay clean. The
+    caller counts the skips, because stderr is discarded on a probe that
+    exits 0 and a ratio taken over an unknown subset of a package is not
+    that package's ratio.
     """
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as e:
         print(f"skipped {path}: {e}", file=sys.stderr)
-        return
+        return False
     try:
         tree = ast.parse(text, filename=str(path))
     except SyntaxError as e:
         print(f"skipped {path}: {e}", file=sys.stderr)
-        return
+        return False
 
     doc_lines = _docstring_lines(tree)
     comment_line_nos: set[int] = set()
@@ -125,7 +134,7 @@ def measure_file(path: Path, counts: Counts) -> None:
         tokens = list(tokenize.generate_tokens(io.StringIO(text).readline))
     except (tokenize.TokenError, IndentationError) as e:
         print(f"skipped {path}: {e}", file=sys.stderr)
-        return
+        return False
 
     for tok in tokens:
         if tok.type != tokenize.COMMENT:
@@ -151,6 +160,7 @@ def measure_file(path: Path, counts: Counts) -> None:
     counts.code_lines += code
     counts.comment_lines += len(comment_line_nos)
     counts.docstring_lines += len(doc_lines)
+    return True
 
 
 def package_of(path: Path, root: Path) -> str:
@@ -174,11 +184,13 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     per_package: dict[str, Counts] = {}
+    skipped: list[str] = []
     matched = 0
     for path in iter_source_files(root, args.glob):
         matched += 1
         key = package_of(path, root)
-        measure_file(path, per_package.setdefault(key, Counts()))
+        if not measure_file(path, per_package.setdefault(key, Counts())):
+            skipped.append(path.as_posix())
 
     parsed = sum(c.files for c in per_package.values())
     problem = nothing_measured("comments", root, args.glob, matched, parsed)
@@ -216,12 +228,16 @@ def main(argv: list[str] | None = None) -> int:
             }
         )
 
+    gaps = not_measured(skipped, unreadable_dirs(root))
+    observations.append(gaps)
+
     overall = (total_comment / total_code) if total_code else 0.0
     emit(
         observations,
         summary=(
             f"{len(per_package)} package(s); overall commentary ratio "
-            f"{overall:.3f} ({total_comment} comment lines / {total_code} code lines)"
+            f"{overall:.3f} ({total_comment} comment lines / {total_code} code "
+            f"lines); {gaps['label']}"
         ),
     )
     return 0

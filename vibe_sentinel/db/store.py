@@ -78,7 +78,7 @@ def save_run(
             )
             conn.executemany(
                 "INSERT INTO observations (run_id, probe_id, key, value, label,"
-                " attrs_json, risk) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                " state, attrs_json, risk) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     (
                         run_id,
@@ -86,6 +86,7 @@ def save_run(
                         obs.key,
                         obs.value,
                         obs.label,
+                        obs.state,
                         json.dumps(obs.attrs, sort_keys=True),
                         obs.risk,
                     )
@@ -95,8 +96,9 @@ def save_run(
 
         conn.executemany(
             "INSERT INTO changes (run_id, baseline_run_id, probe_id, key, kind,"
-            " before_value, after_value, label, severity, note)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " before_value, after_value, before_state, after_state, label,"
+            " severity, note)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 (
                     run_id,
@@ -106,6 +108,8 @@ def save_run(
                     c.kind,
                     c.before,
                     c.after,
+                    c.before_state,
+                    c.after_state,
                     c.label,
                     c.severity,
                     c.note,
@@ -227,8 +231,8 @@ def load_snapshot(conn: sqlite3.Connection, run_id: int) -> Snapshot | None:
 
     observations: dict[str, list[Observation]] = {}
     for row in conn.execute(
-        "SELECT probe_id, key, value, label, attrs_json, risk FROM observations"
-        " WHERE run_id = ? ORDER BY id",
+        "SELECT probe_id, key, value, label, state, attrs_json, risk"
+        " FROM observations WHERE run_id = ? ORDER BY id",
         (run_id,),
     ):
         observations.setdefault(row["probe_id"], []).append(
@@ -236,6 +240,10 @@ def load_snapshot(conn: sqlite3.Connection, run_id: int) -> Snapshot | None:
                 key=row["key"],
                 value=row["value"],
                 label=row["label"],
+                # Load-bearing: this is the baseline end of every `changed`
+                # comparison, so a snapshot rebuilt without it reports no
+                # state ever moved.
+                state=row["state"],
                 attrs=json.loads(row["attrs_json"]),
                 risk=row["risk"],
             )
@@ -270,13 +278,16 @@ def load_changes(conn: sqlite3.Connection, run_id: int) -> list[Change]:
             kind=row["kind"],
             before=row["before_value"],
             after=row["after_value"],
+            before_state=row["before_state"],
+            after_state=row["after_state"],
             label=row["label"],
             severity=row["severity"],
             note=row["note"],
         )
         for row in conn.execute(
-            "SELECT probe_id, key, kind, before_value, after_value, label,"
-            " severity, note FROM changes WHERE run_id = ? ORDER BY id",
+            "SELECT probe_id, key, kind, before_value, after_value, before_state,"
+            " after_state, label, severity, note FROM changes WHERE run_id = ?"
+            " ORDER BY id",
             (run_id,),
         )
     ]
@@ -294,11 +305,12 @@ def risks_at(conn: sqlite3.Connection, run_id: int) -> list[Observation]:
             key=row["key"],
             value=row["value"],
             label=row["label"],
+            state=row["state"],
             attrs=json.loads(row["attrs_json"]),
             risk=row["risk"],
         )
         for row in conn.execute(
-            "SELECT key, value, label, attrs_json, risk FROM observations"
+            "SELECT key, value, label, state, attrs_json, risk FROM observations"
             " WHERE run_id = ? AND risk != '' ORDER BY risk, key",
             (run_id,),
         )

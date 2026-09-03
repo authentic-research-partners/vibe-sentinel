@@ -34,6 +34,15 @@
 # silent-exceptions = { SOURCE_ROOT = "src" }
 # pattern-census = { SOURCE_ROOT = "src", PATTERN = "requests.get($$$ARGS)" }
 # file-length = { CATEGORIES = "agent=CLAUDE.md; docs=*.md; code=src/**/*.py; tests=tests/*.py" }
+# dependency-versions = { SCOPE = "declared" }
+#
+# SCOPE decides how much of the environment `dependency-versions` records.
+# `all`, the default, is every distribution on the interpreter's path — the
+# honest answer, since a version that moved is worth seeing whoever pulled it
+# in. `declared` narrows to what your manifest names plus everything those
+# transitively require; each distribution in scope costs two rows per scan for
+# the life of a history that is never rebuilt, so a very large environment may
+# prefer the closure.
 #
 # CATEGORIES is the one to edit. It decides what `file-length` measures at
 # all, and its entries are tried in order — the first that matches a file
@@ -292,6 +301,24 @@ timeout = 8.0
 # applies_to = "target"
 # pattern = '/exports/'
 # question = "Does this write customer data anywhere it could be committed?"
+#
+# Two `applies_to` values carry no pattern at all, because what they ask is a
+# fact about the tree rather than about the text. `outside-project` asks
+# whether a write lands outside the project directory. `undeclared-install`
+# asks whether a command installs a package name no manifest declares — the
+# only thing separating `uv pip install -e ".[dev]"`, which re-syncs what
+# pyproject.toml already says, from `uv pip install requests`, which adds a
+# name that came from nowhere. Both ship as built-ins asking a question.
+# Override one by its id to make it a rule instead:
+#
+# [[danger]]
+# id = "installing-undeclared-dependency"
+# title = "Installing a package that nothing in the project declares"
+# applies_to = "undeclared-install"
+# verdict = "unsafe"
+#
+# A danger that sets `verdict` needs no `question`: the answer is already
+# there, and the model is never asked for another.
 
 # --- The history database ---------------------------------------------------
 #

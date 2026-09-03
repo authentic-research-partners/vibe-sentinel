@@ -81,16 +81,28 @@ it.
   **loguru, not logging**. `print()` only where stdout is the output channel.
 - **A failed probe is recorded, not raised** — one broken template must not lose
   the other probes' measurements.
+- **A structural check resolves every unknown the quiet way.**
+  `outside-project` and `undeclared-install` ask about the tree rather than
+  the command text, and every unknown there reports nothing: a path that
+  cannot be resolved, a tree with no manifest, an install argument that is
+  not a bare package name. A miss leaves things as they were before the
+  check existed; a false positive blocks a command that was fine, and a
+  gate that stops `uv pip install -e ".[dev]"` is uninstalled by Thursday.
 - **Errors carry their remediation.** Name the command that fixes it.
 
 ## What runs on what
 
 The engine, history, trends, reports, journal and safety gate are
 language-agnostic — a probe is any command that prints the JSON protocol, and the
-journal and safety gate match command text. The shipped probes that parse code
-(`commentary-ratio`, `module-organization`, `silent-exceptions`) and the
-`licenses` and `packages` gates are Python-only; `pattern-census` covers any
-language ast-grep supports, and `file-length` and `credentials` parse nothing.
+journal and most of the safety gate match command text. The shipped probes
+that parse code (`commentary-ratio`, `module-organization`,
+`silent-exceptions`) and the `licenses` and `packages` gates are Python-only,
+and so is the `undeclared-install` danger, which reads `pyproject.toml`;
+`pattern-census` covers any language ast-grep supports, and `file-length` and
+`credentials` parse nothing. `dependency-versions` is Python-only for a
+different reason — it parses no code at all, but reads the installed set
+through `importlib.metadata`, so what it measures is the environment
+vibe-sentinel itself is installed in.
 
 The hook currently targets Claude Code's `PreToolUse` event. Any agent that can
 run a command before a tool call and read a JSON verdict fits the same shape.

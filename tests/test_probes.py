@@ -14,6 +14,9 @@ from pathlib import Path
 
 import pytest
 
+from vibe_sentinel.probes import NOT_MEASURED_KEY, unreadable_dirs
+from vibe_sentinel.probes.patterns import resolve_ast_grep, run_ast_grep
+
 
 def run_probe_module(module: str, args: list[str]) -> dict:
     result = subprocess.run(
@@ -419,6 +422,16 @@ def _total(payload: dict) -> dict:
     return next(o for o in payload["observations"] if o["key"] == "silent-total")
 
 
+def _measurements(payload: dict) -> list[dict]:
+    """The observations about the code, without the gap accounting.
+
+    `not-measured` is emitted by every probe on every run, at zero when
+    there is nothing to report, so a test counting what a probe found has
+    to say which it means.
+    """
+    return [o for o in payload["observations"] if o["key"] != NOT_MEASURED_KEY]
+
+
 def test_only_a_handler_that_does_nothing_counts(tmp_path: Path) -> None:
     """A handler that re-raises, wraps or records the failure is handling
     it, whatever its quality. Only a body that does nothing is a swallow,
@@ -511,7 +524,7 @@ def test_a_directory_that_discards_nothing_gets_no_key(tmp_path: Path) -> None:
         tmp_path,
         "def f():\n    try:\n        go()\n    except OSError:\n        raise\n",
     )
-    assert [o["key"] for o in payload["observations"]] == ["silent-total"]
+    assert [o["key"] for o in _measurements(payload)] == ["silent-total"]
     assert _total(payload)["value"] == 0.0
 
 
@@ -602,9 +615,9 @@ def test_the_first_matching_category_claims_the_file(tmp_path: Path) -> None:
     specific = _length(root, "agent=CLAUDE.md; docs=*.md")
     general = _length(root, "docs=*.md; agent=CLAUDE.md")
 
-    assert len(specific["observations"]) == 1, "one file, counted once"
-    assert specific["observations"][0]["attrs"]["category"] == "agent"
-    assert general["observations"][0]["attrs"]["category"] == "docs"
+    assert len(_measurements(specific)) == 1, "one file, counted once"
+    assert _measurements(specific)[0]["attrs"]["category"] == "agent"
+    assert _measurements(general)[0]["attrs"]["category"] == "docs"
     assert "agent nothing matched" in general["summary"]
 
 
@@ -753,3 +766,309 @@ def test_length_never_measures_a_virtualenv(tmp_path: Path) -> None:
     payload = _length(root, "docs=*.md")
 
     assert set(_values(payload, "lines:")) == {f"{root.as_posix()}/README.md"}
+
+
+# ---------------------------------------------------------------------------
+# Which binary pattern-census actually runs
+# ---------------------------------------------------------------------------
+
+
+def _fake_binary(directory: Path, name: str, script: str) -> Path:
+    binary = directory / name
+    binary.write_text(f"#!/bin/sh\n{script}\n", encoding="utf-8")
+    binary.chmod(0o755)
+    return binary
+
+
+def test_an_sg_that_is_not_ast_grep_is_refused_rather_than_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`sg` is ast-grep's short name and shadow-utils' setgid tool, which
+    ships at /usr/bin/sg on most Linux distributions. Run by mistake it
+    exits 1 with no stdout — indistinguishable here from ast-grep finding
+    nothing — so taking it on the strength of its name records a confident
+    zero for a measurement that never ran, and the real count arrives as
+    drift the first time the right binary is on PATH."""
+    _fake_binary(tmp_path, "sg", "echo 'Usage: sg group [[-c] command]' >&2\nexit 1")
+    monkeypatch.setenv("PATH", str(tmp_path))
+    with pytest.raises(RuntimeError, match="ast-grep not found"):
+        resolve_ast_grep()
+
+
+def test_sg_is_taken_when_it_says_it_is_ast_grep(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The short name is still ast-grep's own, so it stays usable — on the
+    binary's word rather than its filename."""
+    binary = _fake_binary(tmp_path, "sg", "echo 'ast-grep 0.45.3'")
+    monkeypatch.setenv("PATH", str(tmp_path))
+    assert resolve_ast_grep() == str(binary)
+
+
+def test_a_pattern_scan_that_could_not_read_the_tree_is_not_a_count(
+    tmp_path: Path,
+) -> None:
+    """ast-grep reports an unreadable path on stderr and still exits 0 with
+    JSON for the rest, so the count comes back short and confident. The
+    missing matches would then arrive as drift the day the permission is
+    fixed — the same fabricated movement the binary-identity check exists
+    to prevent."""
+    readable = tmp_path / "ok"
+    readable.mkdir()
+    (readable / "a.py").write_text("import subprocess\nsubprocess.run(['ls'])\n")
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    (locked / "b.py").write_text("import subprocess\nsubprocess.run(['ls'])\n")
+    locked.chmod(0o000)
+    try:
+        with pytest.raises(RuntimeError, match="could not read part of"):
+            run_ast_grep("subprocess.run($$$A)", "python", tmp_path, 30.0)
+    finally:
+        locked.chmod(0o755)
+
+
+# ---------------------------------------------------------------------------
+# What a probe could not measure
+# ---------------------------------------------------------------------------
+
+
+def test_every_probe_accounts_for_what_it_could_not_measure(tmp_path: Path) -> None:
+    """The key is emitted on every run, at zero when nothing was missed.
+
+    Always present makes it a series rather than a note: these probes
+    carry `tolerance = 0`, so the run where it leaves zero is the run it
+    is reported on."""
+    pkg = _pkg(
+        tmp_path,
+        {
+            "__init__.py": "",
+            "a.py": "import os\ntry:\n    x = 1\nexcept OSError:\n    pass\n",
+        },
+    )
+    payloads = {
+        "comments": run_probe_module("comments", ["--root", str(pkg)]),
+        "modules": run_probe_module("modules", ["--root", str(pkg)]),
+        "handlers": run_probe_module("handlers", ["--root", str(pkg)]),
+        "length": run_probe_module(
+            "length", ["--root", str(pkg), "--categories", "code=*.py"]
+        ),
+    }
+    for name, payload in payloads.items():
+        gap = next(
+            (o for o in payload["observations"] if o["key"] == NOT_MEASURED_KEY), None
+        )
+        assert gap is not None, f"{name} reported no gap accounting"
+        assert gap["value"] == 0.0, f"{name} claimed a gap in a readable tree"
+        assert gap["label"] in payload["summary"], f"{name} kept it out of the summary"
+
+
+@pytest.mark.parametrize("probe", ["comments", "modules", "handlers"])
+def test_a_file_that_cannot_be_parsed_is_counted_not_dropped(
+    tmp_path: Path, probe: str
+) -> None:
+    """A skipped file used to reach stderr only, and stderr is discarded on
+    a probe that exits 0. So the aggregates came back smaller and perfectly
+    confident: one unparseable module lowers the fan-in of everything it
+    imports, and the drop is reported as drift in files nobody touched."""
+    pkg = _pkg(
+        tmp_path,
+        {"__init__.py": "", "good.py": "import os\n", "broken.py": "def f(:\n"},
+    )
+    payload = run_probe_module(probe, ["--root", str(pkg)])
+    gap = next(o for o in payload["observations"] if o["key"] == NOT_MEASURED_KEY)
+    assert gap["value"] == 1.0
+    assert "broken.py" in gap["label"]
+    assert gap["attrs"]["unparsed"] == "1"
+
+
+def test_a_directory_that_cannot_be_read_is_counted_not_absent(tmp_path: Path) -> None:
+    """`Path.rglob` swallows a PermissionError and keeps going, so an
+    unreadable subtree is indistinguishable from one that is not there —
+    and the day the permission is fixed its files arrive as drift."""
+    pkg = _pkg(tmp_path, {"__init__.py": "", "a.py": "import os\n"})
+    locked = pkg / "locked"
+    locked.mkdir()
+    (locked / "b.py").write_text("import os\n", encoding="utf-8")
+    locked.chmod(0o000)
+    try:
+        assert unreadable_dirs(pkg) == ["locked"]
+        payload = run_probe_module("comments", ["--root", str(pkg)])
+        gap = next(o for o in payload["observations"] if o["key"] == NOT_MEASURED_KEY)
+        assert gap["value"] == 1.0
+        assert gap["attrs"]["unreadable_dirs"] == "1"
+    finally:
+        locked.chmod(0o755)
+
+
+def test_an_unreadable_dependency_directory_is_not_this_projects_problem(
+    tmp_path: Path,
+) -> None:
+    """EXCLUDED_DIRS is pruned before descent, so a virtualenv nobody can
+    read is not a finding about the code that was measured."""
+    pkg = _pkg(tmp_path, {"__init__.py": "", "a.py": "import os\n"})
+    venv = pkg / ".venv"
+    venv.mkdir()
+    venv.chmod(0o000)
+    try:
+        assert unreadable_dirs(pkg) == []
+    finally:
+        venv.chmod(0o755)
+
+
+def test_pattern_total_counts_only_what_the_breakdown_counts(tmp_path: Path) -> None:
+    """ast-grep is handed the whole root and finds the virtualenv too. The
+    per-directory keys were filtered and the total was not, so the total
+    counted the dependencies — and every upgrade of them would read as
+    drift in this codebase."""
+    root = tmp_path / "proj"
+    (root / ".venv" / "lib").mkdir(parents=True)
+    (root / "src").mkdir(parents=True)
+    (root / "src" / "a.py").write_text("import subprocess\nsubprocess.run(['ls'])\n")
+    (root / ".venv" / "lib" / "dep.py").write_text(
+        "import subprocess\nsubprocess.run(['ls'])\nsubprocess.run(['pwd'])\n"
+    )
+    payload = run_probe_module(
+        "patterns",
+        ["--root", str(root), "--pattern", "subprocess.run($$$A)", "--lang", "python"],
+    )
+    total = next(o for o in payload["observations"] if o["key"] == "pattern-total")
+    per_dir = sum(
+        o["value"]
+        for o in payload["observations"]
+        if o["key"].startswith("pattern-in:")
+    )
+    assert total["value"] == per_dir == 1.0
+    assert "1 match(es)" in payload["summary"]
+
+
+def test_a_category_whose_files_were_all_unreadable_says_so(tmp_path: Path) -> None:
+    """ "nothing matched" names the wrong cause: the glob is right and the
+    files are unreadable, which is a different thing to go and fix."""
+    root = _tree(tmp_path, {"a.md": "text\n"})
+    (root / "blob.bin").write_bytes(b"\xff\xfe\x00\x01")
+    payload = _length(root, "docs=*.md; binaries=*.bin")
+    assert "binaries nothing readable (1 file(s) skipped)" in payload["summary"]
+    assert "binaries nothing matched" not in payload["summary"]
+
+
+# ---------------------------------------------------------------------------
+# dependencies — the environment, which is the part of a project nothing
+# else records
+# ---------------------------------------------------------------------------
+
+
+def test_dependencies_probe_records_a_version_and_an_origin_per_package() -> None:
+    """Two series, not one observation carrying two facts. Folding them
+    would silently change what every recorded point of the series meant."""
+    payload = run_probe_module("dependencies", ["--scope", "all"])
+    keys = {o["key"] for o in payload["observations"]}
+    # pydantic is a runtime dependency of this package, so it is installed
+    # in any environment these tests run in.
+    assert "version:pydantic" in keys
+    assert "origin:pydantic" in keys
+
+
+def test_dependencies_probe_puts_the_version_in_state_not_value() -> None:
+    """A version is an identity, not a magnitude — 1.10 does not sort
+    after 1.9 — so it must not reach the column trends are fitted over."""
+    payload = run_probe_module("dependencies", ["--scope", "all"])
+    version = next(o for o in payload["observations"] if o["key"] == "version:pydantic")
+    assert version.get("value") is None
+    assert version["state"].count(".") >= 1
+
+
+def test_dependencies_probe_keys_survive_an_upgrade() -> None:
+    """The whole point. `version:pydantic` is the key whether pydantic is
+    at 2.10 or 2.12, so an upgrade is a change to one series rather than
+    one key vanishing and an unrelated one arriving."""
+    payload = run_probe_module("dependencies", ["--scope", "all"])
+    for observation in payload["observations"]:
+        assert "==" not in observation["key"]
+
+
+def test_dependencies_probe_counts_installed_as_the_one_number() -> None:
+    payload = run_probe_module("dependencies", ["--scope", "all"])
+    count = next(o for o in payload["observations"] if o["key"] == "count:installed")
+    versions = [o for o in payload["observations"] if o["key"].startswith("version:")]
+    assert count["value"] == float(len(versions))
+
+
+def test_dependencies_probe_reports_what_it_could_not_measure() -> None:
+    payload = run_probe_module("dependencies", ["--scope", "all"])
+    assert any(o["key"] == NOT_MEASURED_KEY for o in payload["observations"])
+
+
+def test_dependencies_probe_narrows_to_the_declared_closure() -> None:
+    declared = run_probe_module("dependencies", ["--root", ".", "--scope", "declared"])
+    every = run_probe_module("dependencies", ["--scope", "all"])
+    narrowed = next(
+        o for o in declared["observations"] if o["key"] == "count:installed"
+    )
+    total = next(o for o in every["observations"] if o["key"] == "count:installed")
+    assert narrowed["value"] <= total["value"]
+    assert narrowed["attrs"]["scope"] == "declared"
+
+
+def test_dependencies_probe_fails_when_nothing_declares_anything(
+    tmp_path: Path,
+) -> None:
+    """Not zero observations. An empty answer would read on the next
+    comparison as every dependency having been removed."""
+    result = run_probe_raw(
+        "dependencies", ["--root", str(tmp_path), "--scope", "declared"]
+    )
+    assert result.returncode == 2
+    assert "declares any dependency" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_state"),
+    [
+        ("", "index"),
+        (
+            '{"url": "file:///home/someone/proj", "dir_info": {"editable": true}}',
+            "editable",
+        ),
+        ('{"url": "file:///home/someone/proj", "dir_info": {}}', "local path"),
+        (
+            '{"url": "https://github.com/x/y", "vcs_info": {"vcs": "git"}}',
+            "git+https://github.com/x/y",
+        ),
+        ("not json at all", "direct (unreadable)"),
+        ("{}", "direct (no url)"),
+    ],
+)
+def test_origin_state_is_stable_across_machines(
+    payload: str, expected_state: str
+) -> None:
+    """A local absolute path never becomes the state. It is a machine's
+    home directory, which has no business in a report, and it would make
+    the series machine-specific — the same project checked out elsewhere
+    would report a change describing the checkout rather than the
+    dependency."""
+    from vibe_sentinel.probes.dependencies import origin_of
+
+    state, _detail = origin_of(payload)
+    assert state == expected_state
+    assert "/home/" not in state
+
+
+def test_origin_keeps_the_local_path_as_detail() -> None:
+    """Out of the state, but not thrown away — a reader still wants to
+    know which directory."""
+    from vibe_sentinel.probes.dependencies import origin_of
+
+    _state, detail = origin_of(
+        '{"url": "file:///home/someone/proj", "dir_info": {"editable": true}}'
+    )
+    assert detail == "file:///home/someone/proj"
+
+
+def test_origin_says_unrecorded_when_nothing_could_have_said_otherwise() -> None:
+    """An `.egg-info` has nowhere to put a direct URL, so an empty one is
+    not evidence of an index. Reporting `index` there would state as a
+    fact something nobody measured."""
+    from vibe_sentinel.probes.dependencies import origin_of
+
+    assert origin_of("", recorded=False)[0] == "unrecorded"
+    assert origin_of("", recorded=True)[0] == "index"

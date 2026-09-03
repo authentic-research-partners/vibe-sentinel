@@ -42,7 +42,12 @@ import re
 import sys
 from pathlib import Path
 
-from vibe_sentinel.probes import emit, iter_source_files
+from vibe_sentinel.probes import (
+    emit,
+    iter_source_files,
+    not_measured,
+    unreadable_dirs,
+)
 
 #: What ``length`` can count. One per run — see the module docstring.
 UNITS = ("lines", "words", "bytes")
@@ -189,16 +194,22 @@ def main(argv: list[str] | None = None) -> int:
     totals: dict[str, int] = dict.fromkeys(files, 0)
 
     observations: list[dict] = []
+    skipped: list[str] = []
+    skipped_in: dict[str, int] = dict.fromkeys(files, 0)
     longest_value, longest_path = -1, ""
     for path in sorted(claimed):
         try:
             raw = path.read_bytes()
         except OSError as e:
             print(f"skipped {path}: {e}", file=sys.stderr)
+            skipped.append(path.as_posix())
+            skipped_in[claimed[path]] += 1
             continue
         sizes = measure(raw)
         if sizes is None:
             print(f"skipped {path}: not UTF-8 text", file=sys.stderr)
+            skipped.append(path.as_posix())
+            skipped_in[claimed[path]] += 1
             continue
 
         category = claimed[path]
@@ -234,18 +245,26 @@ def main(argv: list[str] | None = None) -> int:
     # A category that matched nothing is named rather than omitted: it is
     # usually a glob with a typo in it, and an omitted category looks
     # exactly like a project that has no documentation.
-    breakdown = "; ".join(
-        f"{name} {files[name]} file(s), {totals[name]} {unit}"
-        if files[name]
-        else f"{name} nothing matched"
-        for name in files
-    )
+    # A category whose files all failed to read is a third thing again,
+    # and saying "nothing matched" about it names the wrong cause: the
+    # glob is right and the files are unreadable.
+    def describe(name: str) -> str:
+        if files[name]:
+            return f"{name} {files[name]} file(s), {totals[name]} {unit}"
+        if skipped_in[name]:
+            return f"{name} nothing readable ({skipped_in[name]} file(s) skipped)"
+        return f"{name} nothing matched"
+
+    breakdown = "; ".join(describe(name) for name in files)
+    measured_files = len(observations)
+    gaps = not_measured(skipped, unreadable_dirs(root))
+    observations.append(gaps)
     emit(
         observations,
         summary=(
-            f"{len(observations)} file(s), {sum(totals.values())} {unit} "
+            f"{measured_files} file(s), {sum(totals.values())} {unit} "
             f"under {root.as_posix()} — {breakdown}; longest "
-            f"{longest_path} ({longest_value} {unit})"
+            f"{longest_path} ({longest_value} {unit}); {gaps['label']}"
         ),
     )
     return 0

@@ -129,6 +129,26 @@ def test_failed_probe_is_not_compared() -> None:
     assert compare(_snapshot([("a", 1.0)]), current, [_probe()]).changes == []
 
 
+def test_a_failed_probe_is_carried_into_the_report_not_only_dropped() -> None:
+    """Not comparing it is right and is not enough. Nothing downstream
+    could see it, so a scan whose probes all failed rendered as a scan
+    that found nothing changed — which is the one sentence the report
+    must not produce about a measurement never taken."""
+    current = Snapshot(probes={"p": ProbeResult(probe_id="p", ok=False, error="boom")})
+    report = compare(_snapshot([("a", 1.0)]), current, [_probe()])
+    assert report.unmeasured == ["p"]
+    assert report.probes_run == 1
+
+
+def test_the_first_run_records_what_it_could_not_measure_too() -> None:
+    """The baseline every later scan compares against is the worst place
+    for a gap nobody can see afterwards."""
+    current = Snapshot(probes={"p": ProbeResult(probe_id="p", ok=False, error="boom")})
+    report = compare(None, current, [_probe()])
+    assert report.first_run is True
+    assert report.unmeasured == ["p"]
+
+
 def test_probe_missing_from_this_run_is_noted_as_info() -> None:
     current = Snapshot(probes={})
     report = compare(_snapshot([("a", 1.0)]), current, [_probe()])
@@ -140,3 +160,132 @@ def test_info_changes_alone_do_not_count_as_drift() -> None:
     report = compare(_snapshot([("a", 1.0)]), Snapshot(probes={}), [_probe()])
     assert report.changes
     assert report.drifted is False
+
+
+# ---------------------------------------------------------------------------
+# `changed` — a state moving, which is what makes a version trackable
+# ---------------------------------------------------------------------------
+
+
+def _stated(states: list[tuple[str, str]], probe_id: str = "p") -> Snapshot:
+    """A snapshot whose observations carry a state and no value."""
+    return Snapshot(
+        probes={
+            probe_id: ProbeResult(
+                probe_id=probe_id,
+                observations=[
+                    Observation(key=k, state=s, label=f"{k} {s}") for k, s in states
+                ],
+            )
+        }
+    )
+
+
+def test_a_state_that_moved_is_reported_as_changed() -> None:
+    report = compare(
+        _stated([("version:requests", "2.32.5")]),
+        _stated([("version:requests", "2.28.0")]),
+        [_probe()],
+    )
+    (change,) = report.changes
+    assert change.kind == "changed"
+    assert change.before_state == "2.32.5"
+    assert change.after_state == "2.28.0"
+    assert change.severity == "medium"
+
+
+def test_an_unchanged_state_is_not_a_change() -> None:
+    snap = _stated([("version:requests", "2.32.5")])
+    assert compare(snap, snap, [_probe()]).changes == []
+
+
+def test_a_state_has_no_tolerance() -> None:
+    """A version is an identity, so a probe's numeric tolerance cannot
+    admit a move: 2.32.5 is not nearer 2.32.4 than 1.0.0."""
+    report = compare(
+        _stated([("version:x", "2.32.5")]),
+        _stated([("version:x", "2.32.4")]),
+        [_probe(tolerance="99%")],
+    )
+    assert [c.kind for c in report.changes] == ["changed"]
+
+
+def test_a_state_arriving_where_there_was_none_is_not_a_change() -> None:
+    """The run after a probe starts recording a state must not announce
+    every key it emits as having changed from nothing into its first
+    value — that is a definition change, not drift in the codebase."""
+    before = _snapshot([("a", 1.0)])
+    after = Snapshot(
+        probes={
+            "p": ProbeResult(
+                probe_id="p",
+                observations=[Observation(key="a", value=1.0, state="2.0.0")],
+            )
+        }
+    )
+    assert compare(before, after, [_probe()]).changes == []
+
+
+def test_a_state_disappearing_is_not_a_change_either() -> None:
+    """The other direction, for the same reason: a probe that stopped
+    recording a state has not changed the thing it measured."""
+    before = Snapshot(
+        probes={
+            "p": ProbeResult(
+                probe_id="p",
+                observations=[Observation(key="a", value=1.0, state="2.0.0")],
+            )
+        }
+    )
+    assert compare(before, _snapshot([("a", 1.0)]), [_probe()]).changes == []
+
+
+def test_a_state_move_outranks_a_value_move_on_the_same_key() -> None:
+    """One change per (probe_id, key). That pair is the identity the
+    analysis pass rates against and the changes table indexes, so a
+    second row under it would land the model's severity on whichever was
+    seen last."""
+    before = Snapshot(
+        probes={
+            "p": ProbeResult(
+                probe_id="p",
+                observations=[Observation(key="a", value=1.0, state="1.0.0")],
+            )
+        }
+    )
+    after = Snapshot(
+        probes={
+            "p": ProbeResult(
+                probe_id="p",
+                observations=[Observation(key="a", value=99.0, state="2.0.0")],
+            )
+        }
+    )
+    (change,) = compare(before, after, [_probe()]).changes
+    assert change.kind == "changed"
+    # The numbers ride along rather than being dropped.
+    assert (change.before, change.after) == (1.0, 99.0)
+
+
+def test_a_state_that_appeared_is_still_an_appeared() -> None:
+    """A new key is a new key whatever it carries — `changed` is only
+    about a key present on both sides."""
+    report = compare(
+        _stated([("version:a", "1.0")]),
+        _stated([("version:a", "1.0"), ("version:b", "2.0")]),
+        [_probe()],
+    )
+    (change,) = report.changes
+    assert change.kind == "appeared"
+    assert change.key == "version:b"
+
+
+def test_changed_describes_itself_with_the_key_not_the_label() -> None:
+    """The label names the state as it is now, so pairing it with the
+    transition prints the new value twice."""
+    report = compare(
+        _stated([("version:requests", "2.32.5")]),
+        _stated([("version:requests", "2.28.0")]),
+        [_probe()],
+    )
+    assert report.changes[0].describe() == "version:requests: 2.32.5 -> 2.28.0"

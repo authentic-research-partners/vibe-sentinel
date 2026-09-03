@@ -66,6 +66,14 @@ from pydantic import BaseModel, ConfigDict
 
 from vibe_sentinel.paths import CONFIG_FILENAME
 from vibe_sentinel.pins import check_pins
+from vibe_sentinel.requirements import (
+    Declared,
+    iter_declared,
+    load_manifest,
+    name_of,
+    normalize,
+)
+from vibe_sentinel.requirements import parse as parse_declared
 
 if TYPE_CHECKING:  # pragma: no cover - the offline path must not pay for this
     from vibe_sentinel.config import SentinelConfig
@@ -136,11 +144,6 @@ def severity_rank(kind: str) -> int:
         return RISK_ORDER.index(kind)
     except ValueError:
         return len(RISK_ORDER)
-
-
-def normalize(name: str) -> str:
-    """PEP 503 normalisation. ``Foo.Bar_baz`` and ``foo-bar-baz`` are one package."""
-    return re.sub(r"[-_.]+", "-", name.strip()).lower()
 
 
 # --------------------------------------------------------------------------------------
@@ -228,8 +231,6 @@ def environment() -> Environment:
 # the installed environment says what will actually execute, and those differ exactly
 # when it matters.
 
-_REQ_RE = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*(\[[^\]]*\])?\s*(.*)$")
-
 
 class Requirement(BaseModel):
     """One declared dependency, as written."""
@@ -243,105 +244,34 @@ class Requirement(BaseModel):
     group: str  # project | extra:<name> | group:<name> | poetry[:<group>]
 
 
+def _as_requirement(entry: Declared) -> Requirement:
+    """One parsed manifest entry as the model that crosses a boundary."""
+    return Requirement(**entry._asdict())
+
+
 def parse_requirement(raw: str, group: str) -> Requirement | None:
     """Parse a PEP 508 requirement far enough to know its name and its bound.
 
-    Deliberately not a full PEP 508 parser: the two facts wanted here are the
-    distribution name and whether any version bound was stated, and both survive
-    a shape this simple. A requirement it cannot read at all returns None rather
-    than guessing a name.
+    The reading itself belongs to ``requirements.py``, which the safety gate
+    also uses in front of a tool call and so cannot import pydantic. This is
+    the same answer as a model.
     """
-    head, _, marker = raw.partition(";")
-    match = _REQ_RE.match(head)
-    if not match:
-        return None
-    name, _extras, specifier = match.groups()
-    if "@" in specifier:  # direct reference: name @ https://... or name @ file://
-        specifier = specifier.strip()
-    return Requirement(
-        name=normalize(name),
-        raw=raw.strip(),
-        specifier=specifier.strip(),
-        marker=marker.strip(),
-        group=group,
-    )
-
-
-def _poetry_requirements(tool: dict[str, Any]) -> list[Requirement]:
-    """Poetry's ``name = constraint`` tables, including its dependency groups."""
-    poetry = tool.get("poetry", {})
-    out: list[Requirement] = []
-    tables: list[tuple[str, dict[str, Any]]] = [
-        ("poetry", poetry.get("dependencies", {}) or {})
-    ]
-    for group_name, group in (poetry.get("group", {}) or {}).items():
-        tables.append((f"poetry:{group_name}", group.get("dependencies", {}) or {}))
-
-    for group_label, table in tables:
-        for name, constraint in table.items():
-            if normalize(name) == "python":  # the interpreter, not a package
-                continue
-            if isinstance(constraint, dict):
-                spec = str(constraint.get("version", ""))
-            else:
-                spec = str(constraint)
-            # Poetry writes "*" for "any version", which is the same statement as
-            # an empty specifier and should read as unconstrained either way.
-            out.append(
-                Requirement(
-                    name=normalize(name),
-                    raw=f"{name} = {constraint!r}",
-                    specifier="" if spec in ("", "*") else spec,
-                    marker="",
-                    group=group_label,
-                )
-            )
-    return out
+    entry = parse_declared(raw, group)
+    return _as_requirement(entry) if entry else None
 
 
 def declared_requirements(root: Path) -> list[Requirement]:
     """Every dependency this project writes down, in every manifest it might use."""
-    path = root / "pyproject.toml"
-    if not path.is_file():
+    data = load_manifest(root)
+    if data is None:
         return []
-    data = tomllib.loads(path.read_text(encoding="utf-8"))
-    out: list[Requirement] = []
-
-    project = data.get("project", {})
-    for raw in project.get("dependencies", []) or []:
-        req = parse_requirement(str(raw), "project")
-        if req:
-            out.append(req)
-    for extra, reqs in (project.get("optional-dependencies", {}) or {}).items():
-        for raw in reqs or []:
-            req = parse_requirement(str(raw), f"extra:{extra}")
-            if req:
-                out.append(req)
-
-    for group, reqs in (data.get("dependency-groups", {}) or {}).items():
-        for raw in reqs or []:
-            # PEP 735 allows {include-group = "other"}; the names it pulls in are
-            # already read from that other group's own list.
-            if not isinstance(raw, str):
-                continue
-            req = parse_requirement(raw, f"group:{group}")
-            if req:
-                out.append(req)
-
-    out.extend(_poetry_requirements(data.get("tool", {}) or {}))
-    return out
+    return [_as_requirement(entry) for entry in iter_declared(data)]
 
 
 def project_name(root: Path) -> str:
     """The distribution this repo builds, normalized. '' when it builds none."""
-    path = root / "pyproject.toml"
-    if not path.is_file():
-        return ""
-    data = tomllib.loads(path.read_text(encoding="utf-8"))
-    name = (data.get("project", {}) or {}).get("name")
-    if not name:
-        name = ((data.get("tool", {}) or {}).get("poetry", {}) or {}).get("name")
-    return normalize(str(name)) if name else ""
+    data = load_manifest(root)
+    return name_of(data) if data is not None else ""
 
 
 # --------------------------------------------------------------------------------------
@@ -426,6 +356,17 @@ class Installed(BaseModel):
     requires: tuple[str, ...] = ()  # normalized, extras-only requirements dropped
     installer: str = ""  # pip, uv, conda, ... — '' when the wheel recorded none
     direct_url: str = ""  # set when installed from a path/URL, not an index
+    provenance_recorded: bool = False
+    """Whether an installer wrote an install record for this distribution.
+
+    False means the two fields above are silent because nothing could have
+    filled them, not because the answer is no. Only the ``.dist-info``
+    format carries ``INSTALLER`` and ``direct_url.json``; an ``.egg-info``
+    has no place to put either, so reading an empty ``direct_url`` off one
+    and concluding "came from an index" states as a fact something that
+    was never recorded — the same mistake as folding a failed registry
+    lookup into "the name does not exist"."""
+
     summary: str = ""
     """The distribution's own one-line description, as it shipped it.
 
@@ -462,24 +403,66 @@ def _dist_text(dist: md.Distribution, name: str) -> str:
         return ""
 
 
+def _records_provenance(dist: md.Distribution, installer: str, direct_url: str) -> bool:
+    """Whether this metadata entry is one an installer wrote a record into.
+
+    Either field being present proves it. When both are empty the format
+    still decides the question, so ``WHEEL`` settles it: PEP 427 puts one
+    in every ``.dist-info`` and an ``.egg-info`` has none. Read last and
+    only when needed — it is one more file open per distribution, and the
+    common case answers before reaching it.
+    """
+    return bool(installer or direct_url) or _dist_text(dist, "WHEEL") != ""
+
+
 def installed_distributions() -> dict[str, Installed]:
-    """Every distribution on this interpreter's path, keyed by normalized name."""
+    """Every distribution on this interpreter's path, keyed by normalized name.
+
+    Two entries for one name — a ``.egg-info`` beside the ``.dist-info``,
+    which is what an editable install leaves behind — resolve to whichever
+    comes first on the path for *identity*, because that is the one whose
+    code would be imported.
+
+    Provenance is not identity, and taking it from the same winner loses
+    it. The ``.egg-info`` format has nowhere to record an installer or a
+    direct URL, so when it wins the path race both fields read empty and
+    an editable install reports as having come from an index. So those two
+    are backfilled from a later entry for the same name *at the same
+    version*, which is the same distribution recorded twice in two
+    formats. A version mismatch is a genuine disagreement between two
+    installs rather than one install written down twice, and nothing is
+    carried across it.
+    """
     out: dict[str, Installed] = {}
     for dist in md.distributions():
         if not (dist.metadata and dist.metadata.get("Name")):
             continue
         name = normalize(str(dist.metadata.get("Name")))
-        # Two site-packages entries for one name (a stale .egg-info beside a
-        # .dist-info) resolve to whichever comes first on the path, which is what
-        # would be imported.
-        if name in out:
+        version = str(dist.metadata.get("Version") or "")
+        installer = _dist_text(dist, "INSTALLER")
+        direct_url = _dist_text(dist, "direct_url.json")
+        recorded = _records_provenance(dist, installer, direct_url)
+
+        seen = out.get(name)
+        if seen is not None:
+            if seen.version != version or not recorded:
+                continue
+            out[name] = seen.model_copy(
+                update={
+                    "installer": seen.installer or installer,
+                    "direct_url": seen.direct_url or direct_url,
+                    "provenance_recorded": True,
+                }
+            )
             continue
+
         out[name] = Installed(
             name=name,
-            version=str(dist.metadata.get("Version") or ""),
+            version=version,
             requires=_requires(dist),
-            installer=_dist_text(dist, "INSTALLER"),
-            direct_url=_dist_text(dist, "direct_url.json"),
+            installer=installer,
+            direct_url=direct_url,
+            provenance_recorded=recorded,
             summary=str(dist.metadata.get("Summary") or "")[:200],
         )
     return out
@@ -1360,14 +1343,14 @@ def build_near_miss_context(inventory: Inventory, findings: list[Finding]) -> st
 
 def build_near_miss_question(finding: Finding) -> str:
     """The divergent half: one pair, named."""
-    from vibe_sentinel.schemas import BREVITY
+    from vibe_sentinel.schemas import BREVITY, every_field
 
     pair = " and ".join(repr(n) for n in finding.evidence[:2])
     return (
         f"Answer about this one pair, and nothing else.\n\n"
         f"{pair} are both installed and are one edit apart. Are these two "
         f"real packages, or is one of them a misspelling of the other?\n\n"
-        f"{BREVITY}"
+        f"{BREVITY} {every_field('suspect')}"
     )
 
 

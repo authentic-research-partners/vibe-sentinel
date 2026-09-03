@@ -714,3 +714,130 @@ def test_the_findings_key_never_moves_with_an_opinion(
     out = _adjudicate([_pair("reqests")])
     assert out.judgements[0].finding.name == "reqests"
     assert out.judgements[0].suspect == "requests"
+
+
+# --- provenance across two metadata entries for one name -------------------
+
+
+class _FakeMeta:
+    def __init__(self, name: str, version: str) -> None:
+        self._d = {"Name": name, "Version": version, "Summary": ""}
+
+    def get(self, key: str, default: object = None) -> object:
+        return self._d.get(key, default)
+
+    def get_all(self, key: str) -> list[str]:
+        return []
+
+
+class _FakeDist:
+    """One metadata entry, with only the files its format would carry."""
+
+    def __init__(self, name: str, version: str, files: dict[str, str]) -> None:
+        self.metadata = _FakeMeta(name, version)
+        self._files = files
+
+    def read_text(self, name: str) -> str | None:
+        return self._files.get(name)
+
+
+_EDITABLE = '{"url": "file:///somewhere/proj", "dir_info": {"editable": true}}'
+
+
+def _dist_info(name: str, version: str, **extra: str) -> _FakeDist:
+    """A `.dist-info`, which is the format that can carry provenance."""
+    return _FakeDist(name, version, {"WHEEL": "Wheel-Version: 1.0", **extra})
+
+
+def _egg_info(name: str, version: str) -> _FakeDist:
+    """An `.egg-info`, which has nowhere to put an installer or a URL."""
+    return _FakeDist(name, version, {"PKG-INFO": f"Name: {name}"})
+
+
+def test_provenance_is_taken_from_the_entry_that_records_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An editable install leaves an `.egg-info` in the project root and a
+    `.dist-info` in site-packages. The first wins the path race and has
+    nowhere to record an installer, so reading provenance off it alone
+    reports a local checkout as having come from an index."""
+    monkeypatch.setattr(
+        pk.md,
+        "distributions",
+        lambda: iter(
+            [
+                _egg_info("thing", "1.0"),
+                _dist_info(
+                    "thing", "1.0", INSTALLER="uv", **{"direct_url.json": _EDITABLE}
+                ),
+            ]
+        ),
+    )
+    installed = pk.installed_distributions()["thing"]
+    assert installed.installer == "uv"
+    assert installed.direct_url == _EDITABLE
+    assert installed.provenance_recorded is True
+
+
+def test_identity_still_comes_from_the_first_entry_on_the_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only provenance is backfilled. Which code would be imported is
+    still decided by path order, and that is what name and version
+    describe."""
+    monkeypatch.setattr(
+        pk.md,
+        "distributions",
+        lambda: iter([_egg_info("thing", "1.0"), _dist_info("thing", "1.0")]),
+    )
+    assert pk.installed_distributions()["thing"].version == "1.0"
+
+
+def test_nothing_is_carried_across_a_version_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two entries at the same version are one install written down twice.
+    Two at different versions are a genuine disagreement, and attaching
+    one's origin to the other's version would invent a fact."""
+    monkeypatch.setattr(
+        pk.md,
+        "distributions",
+        lambda: iter(
+            [
+                _egg_info("thing", "1.0"),
+                _dist_info(
+                    "thing", "2.0", INSTALLER="uv", **{"direct_url.json": _EDITABLE}
+                ),
+            ]
+        ),
+    )
+    installed = pk.installed_distributions()["thing"]
+    assert installed.version == "1.0"
+    assert installed.direct_url == ""
+    assert installed.provenance_recorded is False
+
+
+def test_an_egg_info_alone_records_no_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The distinction that matters: an empty direct_url here means
+    nothing was written down, not that the package came from an index."""
+    monkeypatch.setattr(
+        pk.md, "distributions", lambda: iter([_egg_info("thing", "1.0")])
+    )
+    assert pk.installed_distributions()["thing"].provenance_recorded is False
+
+
+def test_a_dist_info_with_no_direct_url_did_come_from_an_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other side of it. A `.dist-info` could have carried a direct
+    URL and does not, so its absence is a measurement."""
+    monkeypatch.setattr(
+        pk.md,
+        "distributions",
+        lambda: iter([_dist_info("thing", "1.0", INSTALLER="pip")]),
+    )
+    installed = pk.installed_distributions()["thing"]
+    assert installed.direct_url == ""
+    assert installed.provenance_recorded is True

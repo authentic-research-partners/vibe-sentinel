@@ -16,6 +16,29 @@ the model — no call, no latency, and it still holds with the backend down.
 
 Every key, with commentary: `vibe-sentinel scan --print-example`.
 
+All three converge on the same finding, and only two of them ask the model
+anything:
+
+```mermaid
+flowchart TB
+  LIC["<b>licenses</b><br/>every installed distribution resolved to SPDX<br/>through an ordered chain, then matched to your policy"]
+  PKG["<b>packages</b><br/>the declared graph<br/>vs the installed set"]
+  CRD["<b>credentials</b><br/>the rule set,<br/>over the tree"]
+  LQ["no model call —<br/>the expression is a fact"]
+  QP["typo, or two packages?"]
+  QC["is this key live?"]
+  F["a finding, keyed — first_seen is what answers when this started"]
+  R["restated on every run. A state never diffs"]
+  PIN["a pin settles it: accept · reason · verified. A new baseline never does"]
+  LIC -->|"what it cannot identify fails as UNIDENTIFIED,<br/>never silently passed"| LQ
+  LQ --> F
+  PKG -.->|"two installed names<br/>one edit apart"| QP
+  CRD -.->|"a prefix and its shape, never<br/>the value, and only to loopback"| QC
+  QP --> F
+  QC --> F
+  F --> R --> PIN
+```
+
 ---
 
 ## Credentials at rest
@@ -27,15 +50,15 @@ vibe-sentinel credentials --home       # the stores in ~ no .gitignore ever cove
 vibe-sentinel credentials --print-rules
 ```
 
-Two questions. **Files whose purpose is holding credentials**, where the name is
+Two questions arise. **Files whose purpose is holding credentials**, where the name is
 the signal: `.env*`, private keys and keystores, cloud credential files, registry
 and git tokens, `terraform.tfstate` and `*.tfvars`, database and cluster configs,
 shell history. And **credentials hardcoded into files that should hold none**,
-where the bytes are: PEM blocks, `AKIA…`/`AIza…`, vendor prefixes (`ghp_`,
+where the content reveals: PEM blocks, `AKIA…`/`AIza…`, vendor prefixes (`ghp_`,
 `glpat-`, `sk-ant-`, `sk_live_`), JWTs, URLs with an inline password, and a name
 meaning secret assigned a literal.
 
-**Why a model decides and a regex only nominates.** `AKIAIOSFODNN7EXAMPLE`
+**Why a model decides rather than a regex.** `AKIAIOSFODNN7EXAMPLE`
 appears in every AWS tutorial ever written. No pattern tells it from the key
 beside it that opens an account, and a gate that flags both gets switched off
 within a week. So the pattern nominates generously and a local model adjudicates:
@@ -43,7 +66,7 @@ within a week. So the pattern nominates generously and a local model adjudicates
 example, a revoked fixture), or `unclear`. `real` and `unclear` both fail —
 `unclear` is a real answer and the one that sends it to a person.
 
-**What it will not do.** This is the one check that reads secrets, so it refuses
+**What it will not do:** This is the one check that reads secrets, so it refuses
 to send an excerpt anywhere but loopback; `[credentials] allow_remote_model` is
 the deliberate override and is deliberately not a flag. Values reach the local
 model as a prefix plus their shape, and reach your terminal, the log and the
@@ -59,7 +82,7 @@ The exception is a value provably not a credential — a port, `true`,
 That set is enumerated, never inferred from length: `hunter22` is eight
 low-entropy characters and it is also somebody's password.
 
-**`.gitignore` is a separate, optional rule** (`gitignored = allow | warn |
+**The `.gitignore` file is a separate, optional rule** (`gitignored = allow | warn |
 deny`, default `warn`), because it keeps a file out of a commit and does nothing
 about the file — an agent with a shell reads `.env` with `cat` either way. We
 recommend `deny`, and the keychain: a secret that is not on disk is the only one
@@ -97,7 +120,7 @@ install. Rates and incidents: see the citations in `packages.py`.
 code cannot resolve; online, the interesting answer is *"yes, that package
 exists, and it was created last Tuesday."*
 
-Nine of these are facts. `near-miss` is not — two names an edit apart describes a
+Nine of these checks are factual. The `near-miss` check is not — two names an edit apart describes a
 typosquat and a rewrite shipped under a new name identically, and the rule had
 already grown a hand-written exception for digit suffixes (`httpx`/`httpx2` are
 both legitimate). So that pair, and nothing else here, goes to the local model
@@ -150,7 +173,25 @@ What this same agent ran before it, oldest first:
 | `observe` | flagged commands reviewed, verdict stored, nothing blocked |
 | `enforce` | an `unsafe` verdict refuses the call; `unclear` falls through |
 
-**Guarantees.** Never blocks because the model was slow or the backend down — the
+These are the two stages and where each verdict lands:
+
+```mermaid
+flowchart TB
+  TC(["an agent tool call"])
+  J[("journalled — every call, ~52 ms")]
+  TRI{"does a [[danger]] match?"}
+  REV["one model call per matched danger,<br/>with that agent's own recent commands"]
+  ALLOW(["falls through to the permission<br/>prompt you already have"])
+  DENY(["denied — the command never runs"])
+  TC --> J
+  TC --> TRI
+  TRI -->|no| ALLOW
+  TRI -->|yes| REV
+  REV -->|"safe · unclear"| ALLOW
+  REV -->|"unsafe, and only in enforce mode"| DENY
+```
+
+**Guarantees:** Never blocks because the model was slow or the backend down — the
 command runs and the row is marked `unreviewed`. Never blocks because of a bug in
 the gate: any failure lets the command through. Verdicts are stored apart from
 the commands, so the journal stays a record rather than a set of opinions.
@@ -179,14 +220,122 @@ vibe-sentinel safety --verdict unsafe      # what the gate has seen
 vibe-sentinel safety --print-dangers
 ```
 
+### When the question is about the tree, not the text
+
+Two dangers carry no `pattern` at all. They set `applies_to` instead, because
+what they ask cannot be asked of a command's text: `outside-project`, whether a
+write lands outside the project directory, and `undeclared-install`, whether a
+command installs a package name that no manifest declares. That second one is
+the only thing separating
+
+```bash
+uv pip install -e ".[dev]"     # re-syncing what pyproject.toml already says
+uv pip install requests        # a name that came from nowhere
+```
+
+Those are the same shape of command. The difference is in the manifest, so the
+check reads one — `project.dependencies`, the optional-dependency extras, PEP
+735 dependency groups, Poetry's tables, and the distribution this tree itself
+builds.
+
+It reads `pip install`, `pip3 install`, `python -m pip install` and `uv pip
+install`. Not `uv add`, `poetry add` or `pdm add`: those write the dependency
+down, which is the remediation rather than the fault. Not `pipx install`, a
+tool installed on purpose outside the project's dependencies, and not `conda
+install`, whose names are not the ones `pyproject.toml` carries. Nothing that
+is not a bare package name is treated as one — `-r requirements.txt`, `-e .`,
+a wheel, a URL, `$PKG`. A tree with no `pyproject.toml` reports nothing at
+all, because nowhere to read a declaration is not a declaration of nothing.
+
+Every one of those is the same rule, and it points one way: when in doubt, say
+nothing. A missed install leaves things as they were before the check existed.
+A gate that blocks `uv pip install -e ".[dev]"` is uninstalled by Thursday, and
+then it guards nothing. So the model is told which names are undeclared — that
+part is mechanical — and asked only whether those names are ones the work
+actually wanted.
+
+It ships asking a question. One line makes it a decision instead, with no model
+call and no latency, holding with the backend off:
+
+```toml
+[[danger]]
+id = "installing-undeclared-dependency"   # the built-in id: this overrides it
+title = "Installing a package that nothing in the project declares"
+applies_to = "undeclared-install"
+verdict = "unsafe"
+```
+
+---
+
+## Hooks worth wiring
+
+`vibe-sentinel hook --install` writes one `PreToolUse` entry — the journal, and
+the gate that reads it. The rest of `.claude/settings.json` is yours, and none
+of the four below needs anything this package does not already ship. The hook
+contract belongs to another program, so check the event names and what each one
+does with a hook's output against your agent's own reference before pasting.
+
+**`SessionStart` → `vibe-sentinel hook --replay`.** Drains
+`.vibe-sentinel/hook-spill.jsonl`, where events go when the database was locked
+or a migration was pending. Nobody remembers to run it by hand, and a gap in
+the journal reads as *the agent ran nothing*.
+
+**`SessionStart` → the gates.** A gate reports a state, every run, for as long
+as it is true — and an agent that never reads one starts every session not
+knowing this tree has an AGPL dependency in it and a key on disk. `vibe-sentinel
+licenses; vibe-sentinel packages; vibe-sentinel credentials` costs about 1.3 s
+on this repo and no model call. All three exit `1` when they find something,
+which a hook runner may report as a failure of the hook; end the line with
+`|| true` if yours does.
+
+**`PostToolUse` on `Bash` → `vibe-sentinel packages`.** The other half of the
+install question, and the half that cannot be asked earlier. A licence is not
+resolvable before the package is on disk: `licenses.py` reads the
+distribution's own `LICENSE` text, and an index offers only a declared
+classifier, which is the evidence it trusts least. So `undeclared-install` asks
+the one thing answerable in front of the command — *does anything declare this
+name* — and everything else is answerable a moment after it. Guard the hook on
+the command having actually been an install; one that costs 640 ms on every
+shell command is one you switch off.
+
+**Guard the guard.** An agent that can edit files can edit the file that turns
+the gate off, and the refusal it just read names that file:
+
+```toml
+[[danger]]
+id = "editing-the-guard"
+title = "Editing vibe-sentinel's own configuration or the hook wiring"
+applies_to = "target"
+pattern = '\.vibe-sentinel\.toml$|\.claude/settings\.json$'
+question = """
+Does this change what the safety gate checks, what the licence or package
+policy allows, or which pins stand? Each of those is a decision somebody
+recorded. Changing one on purpose is ordinary; changing one to get past a
+refusal that just named it is not.
+"""
+```
+
 ---
 
 ## Pins are not ignores
 
-A finding you have decided about is recorded as a decision, scoped to the rules
+A finding you have decided about gets recorded as a decision, scoped to the rules
 it names: accepting `orphan` for a package does not accept `squatted` for it next
 month. `reason` and `verified` are required — without them it is an `--ignore`
 with extra steps, and the whole point is that somebody looked and said why.
+
+A pin does not remove the finding. The gate still finds it, the run still
+records it, and the report still prints it — after the failures, in a band of
+its own. What changes is that it stops counting towards the exit code. That is
+the difference from an ignore, which makes a finding invisible: a pin leaves it
+visible and accounted for, so the next person sees the finding and the decision
+somebody made about it side by side.
+
+This is why the record keeps it rather than dropping the row. A pin is a
+decision somebody made on a date, and the run where a finding stopped failing
+because a pin arrived is worth as much as the run where it started — so
+`gate_findings` carries `pinned` beside `failing`. Editing a pin changes nothing
+that already happened; earlier runs keep the answer they had.
 
 ## Recorded, not only reported
 
@@ -199,5 +348,6 @@ excerpt, never the value.
 
 ## See Also
 
+- [Drift](drift.md) — the other half: what moved since the baseline
 - [Use of the local model](use-of-local-model.md) — what the model judges here, and what it cannot
 - [History database](database.md) — where gate findings live, and how to trim them

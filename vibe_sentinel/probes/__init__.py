@@ -29,6 +29,8 @@ layered with the project's own ``[[probe]]`` tables, not this list.
 from __future__ import annotations
 
 import json
+import os
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -99,6 +101,88 @@ def iter_source_files(root: Path, glob: str) -> list[Path]:
         for path in root.rglob(glob)
         if path.is_file() and not is_excluded(path, root)
     )
+
+
+def unreadable_dirs(root: Path) -> list[str]:
+    """Directories under ``root`` that could not be listed.
+
+    ``Path.rglob`` swallows a ``PermissionError`` and keeps going, so an
+    unreadable subtree is indistinguishable from one that is not there:
+    its files are never yielded, never counted as skipped, and every
+    total comes back smaller and perfectly confident. The day the
+    permission is fixed they arrive as drift that never happened.
+
+    Walked separately from :func:`iter_source_files` rather than folded
+    into it, so that function's glob semantics stay exactly ``rglob``'s.
+    Excluded directories are pruned before descent, so a virtualenv
+    nobody can read is not a finding about this project.
+    """
+    failures: list[str] = []
+
+    def note(error: OSError) -> None:
+        name = error.filename or ""
+        try:
+            failures.append(Path(name).relative_to(root).as_posix())
+        except ValueError:
+            failures.append(name)
+
+    for _current, subdirs, _files in os.walk(root, onerror=note):
+        subdirs[:] = [
+            d for d in subdirs if d not in EXCLUDED_DIRS and not d.endswith(".egg-info")
+        ]
+    return sorted(set(failures))
+
+
+#: The key every probe reports what it could not measure under. One key,
+#: one number, the same meaning in each probe — so a reader who learns it
+#: once knows it everywhere, and so the series is comparable across them.
+NOT_MEASURED_KEY = "not-measured"
+
+
+def not_measured(
+    skipped: Sequence[str], unreadable: Sequence[str] = ()
+) -> dict[str, Any]:
+    """The observation for what was in scope and could not be read.
+
+    Every probe emits this, always, even at zero. Keyed and always
+    present makes it a series rather than a note: a tree that starts
+    failing to parse moves it off zero, and these probes carry
+    ``tolerance = 0``, so that surfaces on the scan it happens.
+
+    Reported rather than raised, and the distinction is the same one
+    ``nothing_measured`` is on the other side of. A probe that measured
+    *nothing* fails, because there is no aggregate left for a
+    qualification to attach to. A probe that measured most of a tree
+    still has numbers worth keeping — and a repository holding one
+    permanently unparseable file would otherwise fail that probe on every
+    scan for ever, with nothing anyone could do to clear it, which is the
+    report-forever-with-no-decision shape this codebase has already been
+    wrong about once.
+
+    What it must never be is silent. The counts these probes emit are
+    sums over the files they could read, and a sum over an unknown subset
+    is not a measurement of the tree unless the gap is on the record
+    beside it.
+    """
+    missing = list(skipped) + [f"{d}/" for d in unreadable]
+    shown = ", ".join(missing[:3])
+    more = f" and {len(missing) - 3} more" if len(missing) > 3 else ""
+    # Leads with the key's own name because `compare()` renders an
+    # observation's label as the change line, and "every path was read"
+    # arriving on its own reads as a finding about the code.
+    if missing:
+        label = f"not measured: {len(missing)} path(s) — {shown}{more}"
+    else:
+        label = "not measured: none — every path in scope was read"
+    return {
+        "key": NOT_MEASURED_KEY,
+        "value": float(len(missing)),
+        "label": label,
+        "attrs": {
+            "unparsed": str(len(skipped)),
+            "unreadable_dirs": str(len(unreadable)),
+        },
+    }
 
 
 def emit(observations: list[dict[str, Any]], summary: str = "") -> None:

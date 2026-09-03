@@ -7,6 +7,37 @@ All notable changes to this project are recorded here. The format follows
 A release is refused if the version it names has no section here. The date on
 the heading is stamped at release; write `unreleased` and leave it.
 
+## [0.2.0] — 2026-09-03
+
+### Added
+
+- A `dependency-versions` probe: the installed version and origin of every
+  distribution, which neither a manifest nor a lock file records.
+- A fourth kind of change, `changed`, for an observation whose measured
+  identity moved rather than its number.
+- Dangers that ask about the tree instead of matching the command text:
+  `outside-project`, and `undeclared-install` for a package name no
+  manifest declares.
+- Every probe reports what it could not read or could not parse, and a scan
+  that measured nothing says so rather than reporting no drift.
+- `docs/drift.md` and `docs/getting-started.md`.
+
+### Changed
+
+- History schema 7. Run `vibe-sentinel migrate` before the first scan.
+- Package provenance is read from the metadata entry that records it, so an
+  editable install is no longer reported as installed from an index.
+
+### Fixed
+
+- The shipped probes run under the interpreter that has `vibe_sentinel`
+  importable. Installed beside the project, all five were failing.
+- `pattern-census` counted excluded directories in its total, and took
+  shadow-utils' `sg` for ast-grep — a zero it never measured.
+- The safety gate and the near-miss adjudication name every field they ask
+  for. A model with nothing to say about one wrote whitespace to the token
+  limit instead.
+
 ## [0.1.0] — 2026-09-03
 
 First public release.
@@ -25,4 +56,5 @@ First public release.
 - Agent command journal, with optional review of dangerous commands.
 - Model-free mode for CI: nothing is rated, and the report says so.
 
+[0.2.0]: https://github.com/authentic-research-partners/vibe-sentinel/releases/tag/v0.2.0
 [0.1.0]: https://github.com/authentic-research-partners/vibe-sentinel/releases/tag/v0.1.0
