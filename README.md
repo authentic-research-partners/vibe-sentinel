@@ -2,6 +2,23 @@
 
 *A necessary component for vibe coding beyond the prototype.*
 
+## Table of Contents
+
+- [GenAI-driven codebase maintenance and development challenges](#genai-driven-codebase-maintenance-and-development-challenges)
+  - [Invisible Structural Drift](#invisible-structural-drift)
+  - [Immediate Safety Risks](#immediate-safety-risks)
+  - [Supply Chain & Provenance Issues](#supply-chain--provenance-issues)
+- [Who Is Affected?](#who-is-affected)
+- [How Vibe Sentinel Helps](#how-vibe-sentinel-helps)
+- [What It Is Not](#what-it-is-not)
+- [How impactful are issues with uncontrolled GenAI development?](#how-impactful-are-issues-with-uncontrolled-genai-development)
+- [How Vibe Sentinel Works](#how-vibe-sentinel-works)
+- [What Vibe Sentinel can find and report](#what-vibe-sentinel-can-find-and-report)
+- [What It Costs to Adopt](#what-it-costs-to-adopt)
+- [Getting Started](#getting-started)
+- [Documentation](#documentation)
+- [License](#license)
+
 ## GenAI-driven codebase maintenance and development challenges
 
 ### Invisible Structural Drift
@@ -147,7 +164,7 @@ One baseline shows drift at one scale, though: a directory gaining two modules a
 
 | | |
 |---|---|
-| **Hardware** | An OpenAI-compatible local backend — vLLM, Ollama, llama.cpp, LM Studio. A known-good setup is an 8B model on one NVIDIA GPU of about 20GB; a scan makes a few small calls and none of them is long. No backend at all is supported: `--no-model` skips the two steps that need one and says in the report that they did not happen. That is the CI path. |
+| **Hardware** | An OpenAI-compatible local backend — vLLM, Ollama, llama.cpp, LM Studio. A known-good setup is an 8B model on one NVIDIA GPU of about 20GB; on an Apple Silicon Mac it is Qwen3 14B under Ollama, or any other 12–14B local model. A scan makes a few small calls and none of them is long. No backend at all is supported: `--no-model` skips the two steps that need one and says in the report that they did not happen. That is the CI path. |
 | **Your codebase** | Untouched. This is a command you point at a repository, not a library you import into one, and it installs *beside* your project — conda, venv, uv, poetry, pyenv all left alone. |
 | **Setup** | Two installs per machine, one generated config file, one scan. The defaults measure the current directory and are usually right to start with. |
 | **Runtime** | ~52 ms per hooked tool call for the journal, which judges nothing and blocks nothing. A scan is a handful of subprocess runs and about four small model calls. |

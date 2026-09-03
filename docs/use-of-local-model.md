@@ -68,8 +68,10 @@ structured_output = "json_schema"   # json_schema | json_object | none
 
 Pick a family **different from the one that writes your code** — one from the
 same family shares its blind spots about what normal structure looks like. An 8B
-model is enough. On a backend that serialises, set `concurrency = 1` under
-`[safety]`, `[credentials]`, `[packages]` and `[drift]`.
+model is enough; on an Apple Silicon Mac the default is Qwen3 14B under Ollama,
+and any other 12–14B local model does the job. On a backend that serialises,
+set `concurrency = 1` under `[safety]`, `[credentials]`, `[packages]` and
+`[drift]`.
 
 **One hard boundary:** a credential excerpt goes to the configured endpoint only
 if that endpoint is loopback. `[credentials] allow_remote_model = true` is the

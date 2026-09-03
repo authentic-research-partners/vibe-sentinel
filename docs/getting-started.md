@@ -31,7 +31,7 @@ pip install git+https://github.com/authentic-research-partners/vibe-sentinel    
 
 ## 2. Start the model backend
 
-Any OpenAI-compatible endpoint works — vLLM, Ollama, llama.cpp, LM Studio. Point `[llm] endpoint` and `[llm] model` at whatever you serve. An 8B model is enough: a scan makes a few small calls, and none of them take long.
+Any OpenAI-compatible endpoint works — vLLM, Ollama, llama.cpp, LM Studio. Point `[llm] endpoint` and `[llm] model` at whatever you serve. An 8B model is enough: a scan makes a few small calls, and none of them take long. On an Apple Silicon Mac, see [macOS — recommended setup](#macos--recommended-setup) below.
 
 A known-good setup, on an NVIDIA GPU with about 20GB, under Podman — Docker takes the same arguments with `--gpus all` in place of `--device`:
 
@@ -49,6 +49,60 @@ Put that argv in `[llm] start_command` and the tool runs it for you:
 vibe-sentinel backend start
 vibe-sentinel backend status
 ```
+
+### macOS — recommended setup
+
+On Apple Silicon Macs, the recommended local backend is **Ollama**. It is native on Apple Silicon and exposes the local API Vibe Sentinel needs. Nothing here is Ollama-specific — vLLM and the rest work too — but vLLM's Apple Silicon support is experimental and needs a source build, so Ollama is the path these instructions take.
+
+Vibe Sentinel does not need a large model. The model only reviews findings already produced by deterministic checks, so an 8B model is already enough; a 12–14B model is the comfortable default on a Mac with the memory for it.
+
+#### 1. Install Ollama
+
+Install Ollama for macOS from [ollama.com/download/mac](https://ollama.com/download/mac).
+
+After installation, confirm it is available:
+
+```bash
+ollama --version
+```
+
+If Ollama is not already running in the background, start it:
+
+```bash
+ollama serve
+```
+
+#### 2. Install the recommended model
+
+The default recommendation is Qwen3 14B. Any 12–14B local model works just as well — pick a family different from the one that writes your code:
+
+```bash
+ollama pull qwen3:14b
+```
+
+The standard Ollama build is quantized and uses roughly 9 GB for the model, so it runs comfortably on Macs with 16 GB or more unified memory while leaving room for the editor, coding agent, and Vibe Sentinel.
+
+#### 3. Test the model
+
+```bash
+ollama run qwen3:14b
+```
+
+Then point the config at it:
+
+```toml
+[llm]
+endpoint = "http://localhost:11434/v1"
+model = "qwen3:14b"
+
+# Qwen3 is a reasoning model and thinks before it answers. Nothing here needs
+# that — the model reviews findings the deterministic checks already made — and
+# on a laptop the tokens it spends thinking are the ones you wait for.
+[llm.extra_body]
+reasoning_effort = "none"
+```
+
+If a scan reports that the backend rejected the request, drop `[llm] structured_output` to `"json_object"`, then to `"none"` — the strongest mode a backend accepts is a property of that backend, not of the model.
 
 No backend is required: `--no-model` skips the two steps that need one and says so in the report. See [use-of-local-model.md](use-of-local-model.md).
 
