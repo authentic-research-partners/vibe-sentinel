@@ -241,7 +241,7 @@ measured whatever the root says.
 | `module-organization` | Modules, lines, and internal imports both ways | Directories growing past intent; a module reaching further, or more of the codebase coming to depend on it |
 | `silent-exceptions` | Handlers that discard the error, against how many handlers there are | Error handling quietly becoming error hiding, and the layer it started in |
 | `pattern-census` | ast-grep pattern occurrences | Constructs spreading into unexpected layers |
-| `file-length` | How long each file is, in categories you name | `CLAUDE.md` growing a section per session; the module everything gets appended to; docs outgrowing the code they describe |
+| `file-length` | How long each file is, in categories you name | `CLAUDE.md` growing a section per session; the module everything gets appended to; docs outgrowing the code they describe. With `UNIT = "bytes"` and an image glob, also the weight of what a site ships — the one unit defined for a file that is not text |
 | `dependency-versions` | The installed version of each distribution, and whether it came from an index | A package downgraded to make an error go away; a transitive version that moved with nothing in the project asking for it; a dependency that stopped coming from an index |
 
 ### Pointing one somewhere else
@@ -269,6 +269,51 @@ it, so name specific files before the globs that would swallow them — with
 `docs=*.md` first, `CLAUDE.md` is documentation and the category meant to watch
 it is empty. A category that matched nothing is named in the probe's summary
 rather than omitted, so a typo reads as a typo.
+
+### Measuring what a project ships
+
+`lines` is undefined for a PNG, and counting them would be inventing a number.
+`bytes` is not, so it is the one unit that measures a file which is not text —
+and the unit is part of the observation key, which means this is a *second*
+probe rather than a widening of the one counting your source:
+
+```toml
+[[probe]]
+id = "shipped-weight"
+title = "The weight of what is served"
+command = [
+    "python", "-m", "vibe_sentinel.probes.length",
+    "--root", "{SOURCE_ROOT}",
+    "--categories", "{CATEGORIES}",
+    "--unit", "{UNIT}",
+]
+timeout_s = 120.0
+tolerance = "15%"
+
+[[probe.placeholders]]
+name = "SOURCE_ROOT"
+default = "public"
+description = "The directory whose contents are served."
+
+[[probe.placeholders]]
+name = "CATEGORIES"
+default = "images=*.png,*.jpg,*.webp,*.avif; video=*.mp4; fonts=*.woff2"
+description = "What to weigh and what to call it."
+
+[[probe.placeholders]]
+name = "UNIT"
+default = "bytes"
+description = "The only unit defined for a file that is not text."
+```
+
+On a content-heavy site this is usually the larger number by some distance —
+ahead of any bundle — and it is the one nothing else records: an asset added
+at full camera resolution looks the same in a diff as one that was resized.
+A new key means a file became something the project serves.
+
+Under any other unit a binary is still skipped, and the probe says which
+files and why. Nothing changes for a project that does not declare one of
+these: the shipped categories match no binary.
 
 Redeclaring a `[[probe]]` replaces it wholesale, which freezes its command at whatever you copied; `[probes.parameters]` changes the value and leaves the rest
 to keep improving.

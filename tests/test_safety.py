@@ -28,6 +28,17 @@ def project(tmp_path: Path) -> Path:
     return tmp_path
 
 
+def applicable_builtins() -> int:
+    """How many built-ins apply to a project with no language manifest.
+
+    The ``project`` fixture is a bare tmp_path holding a config file and
+    nothing else, so every danger carrying ``requires`` is correctly
+    absent from its set. Counted rather than hard-coded so that adding a
+    conditional danger does not require editing an unrelated assertion.
+    """
+    return len([d for d in safety.BUILTIN_DANGERS if not d.requires])
+
+
 def set_mode(project: Path, mode: str) -> None:
     (project / ".vibe-sentinel.toml").write_text(
         f'[safety]\nmode = "{mode}"\n', encoding="utf-8"
@@ -491,7 +502,7 @@ question = "Does this touch db-prod-1? Staging is disposable; production is not.
 
     assert "our-production-database" in ids
     assert "deleting-files" in ids, "declaring one danger dropped the built-ins"
-    assert len(dangers) == len(safety.BUILTIN_DANGERS) + 1
+    assert len(dangers) == applicable_builtins() + 1
 
     signals = safety.triage(
         "Bash", "psql -h db-prod-1 -c 'select 1'", "", project, dangers
@@ -514,7 +525,7 @@ question = "Ours: is this deleting anything we cannot rebuild?"
     (deleting,) = [d for d in dangers if d.id == "deleting-files"]
 
     assert deleting.question.startswith("Ours:")
-    assert len(dangers) == len(safety.BUILTIN_DANGERS)
+    assert len(dangers) == applicable_builtins()
     assert safety.triage("Bash", "rm -rf build/", "", project, dangers) == ()
 
 
@@ -554,6 +565,160 @@ def test_a_stale_disable_entry_is_an_error(project: Path) -> None:
     write_config(project, '[safety]\ndisable = ["typo-here"]\n')
 
     with pytest.raises(ValueError, match="do not exist"):
+        safety.load_dangers(project)
+
+
+# --- `requires`: dangers that only apply to some trees ---------------------
+#
+# The npm entries are the reason this exists. In a Python repository they
+# can never fire, and a denylist is read by people: eight lines that
+# cannot match are worse than absent, because absent is honest.
+
+NPM_DANGER_IDS = frozenset(
+    {
+        "publishing-a-package",
+        "deploying-to-production",
+        "forcing-a-dependency-resolution",
+        "exposing-a-dev-server",
+        "lockfile",
+        "dependency-tree",
+    }
+)
+
+
+def npm(project: Path) -> Path:
+    """Make ``project`` look like a JavaScript one."""
+    (project / "package.json").write_text('{"name": "x"}', encoding="utf-8")
+    return project
+
+
+def test_npm_dangers_are_absent_without_a_package_json(project: Path) -> None:
+    ids = {d.id for d in safety.load_dangers(project)}
+
+    assert not (ids & NPM_DANGER_IDS), "npm dangers leaked into a Python tree"
+    assert "deleting-files" in ids, "filtering dropped an unconditional danger"
+
+
+def test_npm_dangers_arrive_with_a_package_json(project: Path) -> None:
+    ids = {d.id for d in safety.load_dangers(npm(project))}
+
+    assert NPM_DANGER_IDS <= ids
+    assert "deleting-files" in ids
+
+
+def test_requires_is_not_evaluated_without_a_root() -> None:
+    """Callers passing None are describing the set, not gating on it."""
+    ids = {d.id for d in safety.load_dangers(None)}
+
+    assert NPM_DANGER_IDS <= ids
+
+
+@pytest.mark.parametrize(
+    "command,expected",
+    [
+        ("npm publish", "publishing-a-package"),
+        ("pnpm publish --access public", "publishing-a-package"),
+        ("vercel --prod", "deploying-to-production"),
+        ("netlify deploy --prod --dir=out", "deploying-to-production"),
+        ("firebase deploy", "deploying-to-production"),
+        ("wrangler deploy", "deploying-to-production"),
+        ("npm i --force", "forcing-a-dependency-resolution"),
+        ("npm install --legacy-peer-deps", "forcing-a-dependency-resolution"),
+        ("vite --host", "exposing-a-dev-server"),
+        ("npm run dev -- --host 0.0.0.0", "exposing-a-dev-server"),
+    ],
+)
+def test_the_js_toolchain_escalates(project: Path, command: str, expected: str) -> None:
+    signals = safety.triage("Bash", command, "", npm(project))
+
+    assert expected in signals, f"{command!r} did not escalate"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # The far longer list: ordinary work that must stay silent.
+        "npm install",
+        "npm ci",
+        "npm run build",
+        "npm test",
+        "npx tsc --noEmit",
+        "pnpm add react",
+        "vite build",
+        "next build",
+        "vite --host localhost",
+        "next dev --hostname localhost",
+        "vercel",
+        "netlify deploy",
+        "wrangler dev",
+        "git commit -m 'publish the article'",
+    ],
+)
+def test_ordinary_js_work_stays_silent(project: Path, command: str) -> None:
+    assert safety.triage("Bash", command, "", npm(project)) == ()
+
+
+def test_a_lockfile_is_context_and_never_an_event(project: Path) -> None:
+    """Naming a lock file is not an incident; deleting one is.
+
+    `deleting-files` is what escalates. The signal rides along so the
+    model is told *what* is being deleted, and asking twice about one
+    command is what this avoids.
+    """
+    root = npm(project)
+
+    assert safety.triage("Bash", "cat package-lock.json", "", root) == ()
+
+    signals = safety.triage("Bash", "rm -rf node_modules package-lock.json", "", root)
+    assert "deleting-files" in signals
+    assert "lockfile" in signals
+    assert "dependency-tree" in signals
+
+
+def test_disable_may_name_a_danger_that_does_not_apply_here(project: Path) -> None:
+    """One shared config, used across a mixed set of repositories.
+
+    The id exists, so this is not the stale entry `disable` refuses; it
+    simply does not apply in a tree with no package.json. Filtering
+    before `disable` resolved would raise on half the repositories using
+    the same file.
+    """
+    write_config(project, '[safety]\ndisable = ["publishing-a-package"]\n')
+    ids = {d.id for d in safety.load_dangers(project)}
+
+    assert "publishing-a-package" not in ids
+    assert "deleting-files" in ids
+
+
+def test_a_project_may_declare_requires_on_its_own_danger(project: Path) -> None:
+    write_config(
+        project,
+        """
+[[danger]]
+id = "cargo-publish"
+pattern = 'cargo\\s+publish'
+question = "Is this releasing a crate?"
+requires = "Cargo.toml"
+""",
+    )
+    assert "cargo-publish" not in {d.id for d in safety.load_dangers(project)}
+
+    (project / "Cargo.toml").write_text("[package]\n", encoding="utf-8")
+    assert "cargo-publish" in {d.id for d in safety.load_dangers(project)}
+
+
+def test_requires_must_name_a_file_not_a_path(project: Path) -> None:
+    write_config(
+        project,
+        """
+[[danger]]
+id = "nested"
+pattern = 'x'
+question = "?"
+requires = "frontend/package.json"
+""",
+    )
+    with pytest.raises(ValueError, match="names one file at the project root"):
         safety.load_dangers(project)
 
 

@@ -98,6 +98,9 @@ journal and most of the safety gate match command text. The shipped probes
 that parse code (`commentary-ratio`, `module-organization`,
 `silent-exceptions`) and the `licenses` and `packages` gates are Python-only,
 and so is the `undeclared-install` danger, which reads `pyproject.toml`;
+a danger may instead carry `requires`, naming one file that must be at the root
+for it to apply at all — which is how the npm entries stay out of a Python
+repository's set rather than sitting in it unable to match;
 `pattern-census` covers any language ast-grep supports, and `file-length` and
 `credentials` parse nothing. `dependency-versions` is Python-only for a
 different reason — it parses no code at all, but reads the installed set

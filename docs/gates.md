@@ -265,6 +265,55 @@ applies_to = "undeclared-install"
 verdict = "unsafe"
 ```
 
+### When a danger applies to some trees and not others
+
+A danger may name a file that must sit at the project root for it to apply:
+
+```toml
+[[danger]]
+id = "cargo-publish"
+pattern = 'cargo\s+publish'
+question = "Is this releasing a crate, and did anyone ask for a release?"
+requires = "Cargo.toml"
+```
+
+Where that file is absent the danger is not in the set at all — not merely
+unmatched. `safety --print-dangers` does not list it, and nothing it could
+have matched is checked.
+
+The distinction is for whoever reads the list. A denylist is audited by
+people, and its value is that every line in it earns a place; eight entries
+that cannot fire in this repository are worse than eight that are absent,
+because matching nothing and being absent look identical from the outside and
+are not the same fact.
+
+That is how the JavaScript dangers ship. All of them carry
+`requires = "package.json"`:
+
+| Danger | What it asks about |
+|---|---|
+| `publishing-a-package` | `npm`/`yarn`/`pnpm`/`bun publish` — public immediately, and the version number is spent either way |
+| `deploying-to-production` | `vercel --prod`, `netlify deploy --prod`, `firebase deploy`, `wrangler deploy`, `gh-pages` — replacing what the public is being served |
+| `forcing-a-dependency-resolution` | `--force`, `--legacy-peer-deps` — proceeding past an incompatibility rather than resolving it, into a tree nothing declared and nothing tested |
+| `exposing-a-dev-server` | a bare `--host`, or one bound to `0.0.0.0` — serving source maps and unminified source to the network |
+| `lockfile`, `dependency-tree` | context only. `deleting-files` already escalates an `rm`; these ride along to say *what* is being deleted |
+
+The last row is the rule those two follow rather than an exception to it.
+`rm -rf node_modules` is routine, `deleting-files` already asks about it, and
+a second danger on the same command would mean the model is asked twice — the
+shape of gate somebody switches off. A signal attaches the fact without
+raising an event, the same way `home-directory` and `unexpanded-variable` do.
+
+`requires` is resolved last, after `use` and `disable`. So naming an npm
+danger in either is never an error in a repository that has no
+`package.json` — the id exists, it simply does not apply — and one shared
+`rule_files` set works across repositories in different languages.
+
+There is deliberately no danger on `npx`. The question worth asking is whether
+the package it runs is one any manifest declares, which is
+`undeclared-install`'s question and needs the manifest read; a pattern alone
+would fire on `npx tsc` and `npx prettier`, which is ordinary work.
+
 ---
 
 ## Hooks worth wiring

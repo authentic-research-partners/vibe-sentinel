@@ -754,6 +754,64 @@ def test_a_tree_of_nothing_but_binaries_is_the_never_taken_measurement(
     assert "UTF-8 text" in result.stderr
 
 
+def test_a_binary_is_measured_in_bytes(tmp_path: Path) -> None:
+    """A PNG has a size. That is the whole of what is defined for it, and
+    it is what a project watching the weight of what it ships wants."""
+    root = _tree(tmp_path, {})
+    blob = b"\x89PNG\r\n" + b"\x00" * 500
+    (root / "logo.png").write_bytes(blob)
+
+    payload = _length(root, "images=*.png", "--unit", "bytes")
+
+    assert _values(payload, "bytes:") == {
+        f"{root.as_posix()}/logo.png": float(len(blob))
+    }
+
+
+def test_a_binary_carries_no_line_or_word_count(tmp_path: Path) -> None:
+    """Counting either would be inventing a number, and an attribute is
+    read as a measurement that was taken."""
+    root = _tree(tmp_path, {"notes.md": "one two\n"})
+    (root / "logo.png").write_bytes(b"\x89PNG\r\n\xff")
+
+    payload = _length(root, "images=*.png; docs=*.md", "--unit", "bytes")
+    attrs = {
+        Path(o["key"].removeprefix("bytes:")).name: o["attrs"]
+        for o in payload["observations"]
+        if o["key"].startswith("bytes:")
+    }
+
+    assert set(attrs["logo.png"]) == {"category", "bytes"}
+    assert set(attrs["notes.md"]) == {"category", "lines", "words", "bytes"}
+
+
+@pytest.mark.parametrize("unit", ["lines", "words"])
+def test_a_binary_is_still_skipped_under_any_other_unit(
+    tmp_path: Path, unit: str
+) -> None:
+    """`bytes` is the exception, not a general widening."""
+    root = _tree(tmp_path, {"notes.md": "one two\n"})
+    (root / "logo.png").write_bytes(b"\x89PNG\r\n\xff")
+
+    result = run_probe_raw(
+        "length",
+        [
+            "--root",
+            str(root),
+            "--categories",
+            "images=*.png; docs=*.md",
+            "--unit",
+            unit,
+        ],
+    )
+
+    assert result.returncode == 0
+    assert _values(json.loads(result.stdout), f"{unit}:").keys() == {
+        f"{root.as_posix()}/notes.md"
+    }
+    assert "--unit bytes" in result.stderr, "the skip note names the remedy"
+
+
 def test_length_never_measures_a_virtualenv(tmp_path: Path) -> None:
     """Load-bearing here in a way it is not for the other probes: this is
     the one whose root is the project root by default, which is exactly

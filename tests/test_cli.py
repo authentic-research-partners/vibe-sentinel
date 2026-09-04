@@ -508,6 +508,60 @@ def test_print_dangers_shows_what_is_asked(
     assert "context signal" in out
 
 
+def test_a_multi_paragraph_question_stays_under_its_label(
+    project: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """Column zero is where the danger *ids* are.
+
+    A continuation line printed there reads as commentary on the whole
+    list rather than as part of the entry above it, which is what makes
+    the list unscannable once it is long.
+    """
+    _config(
+        project,
+        '[[danger]]\nid = "multi"\npattern = "x"\n'
+        'question = """First line.\n\nSecond paragraph."""\n',
+    )
+    assert main(["safety", str(project), "--print-dangers"]) == 0
+    lines = capfd.readouterr().out.splitlines()
+
+    (head,) = [ln for ln in lines if "First line." in ln]
+    (rest,) = [ln for ln in lines if "Second paragraph." in ln]
+    assert head.startswith("  asks:     ")
+    assert rest.startswith(" " * len("  asks:     ") + "Second")
+    assert "" in lines, "the blank line between paragraphs is not padded"
+
+
+def test_describing_the_configuration_never_opens_the_database(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--print-dangers` returns before anything opens the database, so a
+    warning about its condition would land on the reader who asked what
+    the tool checks for — about a thing that could not have affected
+    them.
+
+    Asserted against the call rather than against the log: a healthy
+    database has nothing to warn about, so an assertion on the output
+    would pass whether or not the check ran.
+    """
+    from vibe_sentinel.db import maintenance
+
+    checked: list[Path] = []
+    monkeypatch.setattr(
+        maintenance, "maybe_check", lambda root, config: checked.append(root)
+    )
+
+    assert main(["safety", str(project), "--print-dangers"]) == 0
+    assert checked == []
+
+    # The control: a command that does read the database still gets the
+    # check. Its own exit code is beside the point — `history` on an
+    # empty database is an error, and `auto_check` runs before either
+    # way.
+    main(["history", str(project)])
+    assert checked, "the check must still run where the database is used"
+
+
 def test_a_broken_danger_set_is_an_error_with_the_file_named(
     project: Path, logged: list[str]
 ) -> None:

@@ -82,6 +82,14 @@ def _load(args: argparse.Namespace) -> tuple[SentinelConfig, Path]:
 #: and `migrate` is the remedy the check would be recommending.
 _NO_AUTO_CHECK = frozenset({"db", "migrate", "backups", "hook"})
 
+#: Flags that make a command describe its configuration rather than do its
+#: work: `scan --print-probes`, `--print-config`, `safety --print-dangers`.
+#: Each returns before anything opens the database, so a warning about the
+#: database's condition is the first thing printed by a command that could
+#: not have been affected by it — and it lands on the reader who was
+#: asking what the tool checks for, not on the one running a scan.
+_DESCRIBE_ONLY = ("print_probes", "print_config", "print_dangers")
+
 
 def auto_check(args: argparse.Namespace) -> None:
     """Run the periodic health check, at most once per configured interval.
@@ -96,6 +104,8 @@ def auto_check(args: argparse.Namespace) -> None:
     scan somebody actually asked for.
     """
     if getattr(args, "command", None) in _NO_AUTO_CHECK:
+        return
+    if any(getattr(args, flag, False) for flag in _DESCRIBE_ONLY):
         return
     try:
         from vibe_sentinel.db import maintenance

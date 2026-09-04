@@ -114,6 +114,27 @@ class Danger:
     creation, and trusted itself over the instruction. A question informs
     a judgement; only this decides one."""
 
+    requires: str = ""
+    """A filename that must exist at the project root for this to apply.
+
+    Empty — the default — means it always applies. A danger naming one is
+    inert everywhere that file is absent: it is not merely unmatched, it
+    is not in the set at all, so ``--print-dangers`` does not list it and
+    ``use``/``disable`` do not have to know about it.
+
+    This exists because a denylist is read by people. The npm dangers
+    below ask about publishing a package and deploying a site, and in a
+    repository with no ``package.json`` those questions are not
+    conservative, they are noise — eight entries that can never fire, in
+    front of a set whose whole value is that every line in it earns its
+    place. Matching nothing and being absent look identical from the
+    outside; they are not the same thing to somebody auditing what this
+    gate actually checks.
+
+    Checked against the root, not searched for: a ``package.json`` three
+    directories down belongs to something vendored or nested, and this
+    question is about what the repository *is*."""
+
 
 #: Every git danger below is anchored at the *subcommand*, not searched
 #: for anywhere in the line: `git commit -m "restore the config"` is not a
@@ -325,6 +346,78 @@ BUILTIN_DANGERS: tuple[Danger, ...] = (
             "wrote down."
         ),
     ),
+    # --- JavaScript toolchain ------------------------------------------
+    # `requires` keeps every one of these out of a Python repository's
+    # danger set entirely. What they have in common is that the command
+    # reaches something outside the working tree and does not come back:
+    # a published version, a live site, a resolved dependency graph. The
+    # rest of this list is mostly about losing local work, which is the
+    # kind of loss a repository can absorb.
+    Danger(
+        id="publishing-a-package",
+        title="Publishing a package to a registry",
+        pattern=r"\b(?:npm|yarn|pnpm|bun)\s+publish\b",
+        requires="package.json",
+        question=(
+            "A published version is public immediately and cannot be "
+            "replaced — an unpublish window is narrow where it exists at "
+            "all, and the version number is spent either way. Does the "
+            "history show anyone asking for a release, and does this carry "
+            "--dry-run?"
+        ),
+    ),
+    Danger(
+        id="deploying-to-production",
+        title="Deploying to a live environment",
+        pattern=(
+            r"\bvercel\b[^|;&]*\s--prod\b"
+            r"|\bnetlify\s+deploy\b[^|;&]*\s--prod"
+            r"|\bfirebase\s+deploy\b"
+            r"|\bwrangler\s+(?:deploy|publish)\b"
+            r"|\bgh-pages\b"
+        ),
+        requires="package.json",
+        question=(
+            "This replaces what the public is currently being served. Does "
+            "the history show the build and the tests that produced what is "
+            "about to go out, and was a deploy what was being asked for — or "
+            "is it a step the agent added to finish the job?"
+        ),
+    ),
+    Danger(
+        id="forcing-a-dependency-resolution",
+        title="Overriding the resolver to make an install succeed",
+        pattern=(r"\b(?:npm|pnpm|yarn|bun)\b[^|;&]*\s--(?:force|legacy-peer-deps)\b"),
+        requires="package.json",
+        question=(
+            "These flags do not fix an incompatibility, they proceed past "
+            "one: the tree that results is a combination nothing declared "
+            "and nothing tested. Does the history show the conflict this is "
+            "silencing, and was resolving it the actual task?"
+        ),
+    ),
+    Danger(
+        id="exposing-a-dev-server",
+        title="Binding a development server to every interface",
+        # Two shapes, because a bound address and a bare flag are
+        # different things. `--host 0.0.0.0` says it outright; a bare
+        # `--host` is Vite's spelling of the same thing and is only bare
+        # if what follows is another flag or the end of the command.
+        # Without that second half, `--host localhost` — which is the
+        # safe form — matches, and the first person to hit that turns
+        # this gate off.
+        pattern=(
+            r"(?<![\w-])--host[=\s]+(?:0\.0\.0\.0|::)(?![\w.])"
+            r"|(?<![\w-])--host(?=\s*(?:$|[|;&]|-))"
+        ),
+        requires="package.json",
+        question=(
+            "A bare --host, or one bound to 0.0.0.0, serves this machine's "
+            "development build to the whole network — including source maps, "
+            "unminified source and whatever is in the environment. Is this "
+            "running somewhere that is only ever a trusted network?"
+        ),
+    ),
 )
 
 #: Context signals: never a reason to escalate, always worth attaching
@@ -382,6 +475,28 @@ _BUILTIN_SIGNALS: tuple[Danger, ...] = (
         escalates=False,
     ),
     Danger("chained", "Several commands in one", "", r"(?:&&|\|\||;)", escalates=False),
+    # Both of these are reached by `deleting-files`, which already
+    # escalates an `rm`. Declared as signals rather than as dangers of
+    # their own so the model is asked once and told what is being
+    # deleted, instead of being asked twice about one command —
+    # `rm -rf node_modules` is routine, and a gate that interrogates it
+    # twice is the gate somebody switches off.
+    Danger(
+        "lockfile",
+        "A lock file",
+        "",
+        r"\b(?:package-lock\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?)\b",
+        escalates=False,
+        requires="package.json",
+    ),
+    Danger(
+        "dependency-tree",
+        "The installed dependency tree",
+        "",
+        r"\bnode_modules\b",
+        escalates=False,
+        requires="package.json",
+    ),
 )
 
 BUILTIN_DANGERS = BUILTIN_DANGERS + _BUILTIN_SIGNALS
@@ -393,6 +508,35 @@ _WRITING_TOOLS = frozenset({"Write", "Edit", "NotebookEdit", "MultiEdit"})
 #: ``applies_to`` values that ask a question about the tree rather than
 #: matching text, and so carry no ``pattern``.
 _STRUCTURAL = frozenset({"outside-project", "undeclared-install"})
+
+
+def _applicable(merged: dict[str, Danger], root: Path) -> tuple[Danger, ...]:
+    """Drop the dangers whose ``requires`` file is not at ``root``.
+
+    Applied last, after ``use`` and ``disable`` have been resolved, so
+    that naming an npm danger in either of them is never an error in a
+    repository that has no ``package.json`` — the id exists, it simply
+    does not apply here. Filtering first would turn a shared config used
+    across a mixed set of repositories into one that raises on half of
+    them.
+
+    Each distinct filename is stat-ed once rather than once per danger.
+    This runs in front of every tool call, and the npm entries all name
+    the same file.
+    """
+    seen: dict[str, bool] = {}
+    keep: list[Danger] = []
+    for danger in merged.values():
+        if not danger.requires:
+            keep.append(danger)
+            continue
+        present = seen.get(danger.requires)
+        if present is None:
+            present = (root / danger.requires).is_file()
+            seen[danger.requires] = present
+        if present:
+            keep.append(danger)
+    return tuple(keep)
 
 
 def load_dangers(root: Path | None = None) -> tuple[Danger, ...]:
@@ -428,11 +572,15 @@ def load_dangers(root: Path | None = None) -> tuple[Danger, ...]:
 
     merged: dict[str, Danger] = {d.id: d for d in BUILTIN_DANGERS}
     if root is None:
+        # No root, so no tree to ask about: `requires` cannot be
+        # evaluated. Everything is returned rather than nothing, because
+        # the callers that pass None are describing the set rather than
+        # gating on it.
         return tuple(merged.values())
 
     path = root / CONFIG_FILENAME
     if not path.is_file():
-        return tuple(merged.values())
+        return _applicable(merged, root)
     try:
         with path.open("rb") as handle:
             data = tomllib.load(handle)
@@ -493,7 +641,7 @@ def load_dangers(root: Path | None = None) -> tuple[Danger, ...]:
     for danger_id in disable:
         del merged[danger_id]
 
-    return tuple(merged.values())
+    return _applicable(merged, root)
 
 
 def _dangers_in_file(path: Path) -> list[Danger]:
@@ -567,6 +715,14 @@ def _danger_from_toml(raw: dict[str, object], path: Path, index: int) -> Danger:
                 f"{where} ({danger_id}) has a pattern that is not a valid "
                 f"regular expression: {e}"
             ) from e
+    requires = str(raw.get("requires", "")).strip()
+    if requires and ("/" in requires or "\\" in requires or requires == ".."):
+        raise ValueError(
+            f"{where} ({danger_id}) has requires={requires!r}. It names one "
+            f"file at the project root — 'package.json', 'go.mod' — not a "
+            f"path. A danger that applies only to a nested directory is a "
+            f"pattern question, not an applicability one."
+        )
     return Danger(
         id=danger_id,
         title=str(raw.get("title", danger_id)),
@@ -575,6 +731,7 @@ def _danger_from_toml(raw: dict[str, object], path: Path, index: int) -> Danger:
         applies_to=applies_to,
         verdict=verdict,
         escalates=escalates,
+        requires=requires,
     )
 
 

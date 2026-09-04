@@ -7,6 +7,38 @@ All notable changes to this project are recorded here. The format follows
 A release is refused if the version it names has no section here. The date on
 the heading is stamped at release; write `unreleased` and leave it.
 
+## [unreleased]
+
+### Added
+
+- Dangers for the JavaScript toolchain: `publishing-a-package`,
+  `deploying-to-production`, `forcing-a-dependency-resolution` and
+  `exposing-a-dev-server`, with `lockfile` and `dependency-tree` as context
+  signals. What they have in common is that the command reaches something
+  outside the working tree and does not come back.
+- `requires` on a danger: one filename that must sit at the project root for
+  it to apply at all. The npm dangers above all carry
+  `requires = "package.json"`, so a Python repository's danger set is
+  unchanged — they are absent from it rather than sitting in it unable to
+  match.
+- `file-length` measures files that are not text when `UNIT = "bytes"`. An
+  image has a size and does not have lines, so a second probe with an image
+  glob tracks the weight of what a project ships. No existing baseline gains
+  a key: the shipped categories match no binary.
+- `docs/frontend-support.md`, a design note on what frontend support would
+  take.
+
+### Fixed
+
+- `safety --print-dangers` indents a multi-paragraph question under its
+  label. Every line after the first was printed at column zero, which is
+  where the danger ids are, so the paragraph read as commentary on the whole
+  list rather than as part of the entry above it.
+- The automatic database check is skipped for `--print-probes`,
+  `--print-config` and `--print-dangers`. All three return before anything
+  opens the database, so a warning about its condition was the first thing
+  printed by a command that could not have been affected by it.
+
 ## [0.2.0] — 2026-09-03
 
 ### Added

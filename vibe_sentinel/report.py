@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import sys
+import textwrap
 from typing import TYPE_CHECKING
 
 from vibe_sentinel.journal import (
@@ -811,6 +812,30 @@ def render_triage(command: str, signals: tuple[str, ...]) -> None:
     print(f"  signals: {', '.join(signals)}")
 
 
+#: The label a question is printed under, and therefore the column its
+#: continuation lines have to reach. One constant so the two cannot drift.
+_ASKS_LABEL = "  asks:     "
+
+
+def _asks(question: str) -> str:
+    """A question under its label, with continuation lines aligned to it.
+
+    Printed as one f-string, a multi-paragraph question puts every line
+    after the first at column zero — which is where the danger *ids*
+    are. The paragraph then reads as commentary on the whole list rather
+    than as part of the entry above it, and three of the built-ins have
+    one: the `git checkout` disambiguation, the reset guidance, and the
+    verdict key on `undeclared-install`.
+
+    Blank lines are left alone; `textwrap.indent` does not pad a line
+    with nothing on it, which is what keeps the paragraph breaks visible.
+    """
+    head, newline, rest = question.partition("\n")
+    if not newline:
+        return f"{_ASKS_LABEL}{head}"
+    return f"{_ASKS_LABEL}{head}\n" + textwrap.indent(rest, " " * len(_ASKS_LABEL))
+
+
 def render_dangers(dangers: object) -> None:
     """Print the active danger set: what is checked for, and what is asked."""
     items = list(dangers)  # type: ignore[call-overload]
@@ -830,7 +855,7 @@ def render_dangers(dangers: object) -> None:
         if danger.verdict:
             print(f"  verdict:  {danger.verdict}  (declared; the model is not asked)")
         else:
-            print(f"  asks:     {danger.question}")
+            print(_asks(danger.question))
 
     if context:
         print("\nContext signals — never escalate on their own, attached to a")

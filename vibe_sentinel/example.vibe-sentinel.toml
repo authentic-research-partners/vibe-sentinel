@@ -247,6 +247,17 @@ timeout = 8.0
 # command over the instruction. A question informs a judgement; only `verdict`
 # decides one.
 #
+# `requires` names one file that must sit at the project root for the danger to
+# apply at all. A danger naming a file that is not there is not in the set:
+# `--print-dangers` does not list it, and `use`/`disable` may still name it
+# without error, so one shared rule file works across repositories in different
+# languages. This is how the npm dangers ship — `publishing-a-package`,
+# `deploying-to-production`, `forcing-a-dependency-resolution`,
+# `exposing-a-dev-server`, and the `lockfile` and `dependency-tree` context
+# signals all carry `requires = "package.json"`, so a Python repository never
+# sees them. Use it for the same reason: a denylist is read by people, and a
+# line that cannot fire is worse than one that is absent.
+#
 # [[danger]]
 # id = "our-production-database"
 # title = "Anything pointed at production"
