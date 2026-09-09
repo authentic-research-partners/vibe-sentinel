@@ -2,19 +2,24 @@ cff-version: 1.2.0
 message: "If you use vibe-sentinel in your work, please cite it as below."
 type: software
 title: vibe-sentinel
-version: 0.2.0
-date-released: "2026-09-03"
+version: 0.3.0
+date-released: "2026-09-09"
 abstract: >
-  Guards structural expectations about how a codebase is organized, and
-  reports drift. Probes measure the shape of a tree — modules per package,
-  commentary against code, where a pattern occurs, dependency licences and
-  provenance, credentials at rest — and every run is recorded to an
-  append-only history that later runs compare against. Three gates turn a
-  measurement into a decision that must be pinned rather than suppressed.
-  An optional PreToolUse hook journals a coding agent's commands and, when
-  asked, reviews a dangerous one against what that agent already ran. Runs
-  entirely on the user's machine via a local OpenAI-compatible model, and
-  works without a model at all.
+  Safeguards a codebase against the problems AI coding agents introduce:
+  structural drift, secrets at rest, unvetted dependencies, and dangerous
+  commands. Probes measure the shape of a tree — modules per package,
+  commentary against code, where a pattern occurs, the installed version and
+  origin of every dependency — and every run is recorded to an append-only
+  history that later runs compare against, over a horizon and as a fitted
+  direction as well as against a baseline. Lenses put a question about what
+  moved to the model, in the project's own words. Gates report a standing
+  state instead of a transition — a key at rest, where a dependency came
+  from, what licence arrived with it — on every run, cleared only by a pin
+  that records a reason and a date. An optional PreToolUse hook journals a
+  coding agent's commands and reviews a dangerous one against what that
+  agent already ran; it is the only check that can refuse an action, and it
+  ships off by default. Runs entirely on the user's machine via a local
+  OpenAI-compatible model, which is required.
 authors:
   - family-names: Samsonau
     given-names: Sergey V.

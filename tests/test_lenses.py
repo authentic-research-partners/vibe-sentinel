@@ -339,7 +339,6 @@ def test_a_lens_that_was_asked_and_did_not_answer_is_not_answered(
     report = asyncio.run(
         analyze_drift(_report(_change("p", "k")), _snapshot(), lenses=(_lens("one"),))
     )
-    assert report.analyzed is False
     assert report.lenses[0].asked is True
     assert report.lenses[0].answered is False
     assert report.changes[0].severity == "low", "the mechanical severity survives"
@@ -361,7 +360,6 @@ def test_one_lens_failing_does_not_lose_the_others(
             lenses=(_lens("bad"), _lens("good")),
         )
     )
-    assert report.analyzed is True
     assert report.assessment == "kept"
 
 
@@ -396,7 +394,7 @@ def test_a_silent_report_asks_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
         raise AssertionError("a report with nothing in it was sent to the model")
 
     monkeypatch.setattr(analyze_mod, "llm_query", explode)
-    assert asyncio.run(analyze_drift(_report(), _snapshot())).analyzed is False
+    assert asyncio.run(analyze_drift(_report(), _snapshot())).assessment == ""
 
 
 # --- the answer has a size, and it is known in advance ----------------------
@@ -431,7 +429,6 @@ def test_a_verbose_answer_is_clipped_rather_than_lost(
     report = asyncio.run(
         analyze_drift(_report(_change("p", "k")), _snapshot(), lenses=(_lens("one"),))
     )
-    assert report.analyzed is True
     assert report.changes[0].severity == "high"
     assert len(report.changes[0].note) == NOTE_CHARS
 
@@ -445,3 +442,54 @@ def test_the_prompt_quotes_the_cap_the_schema_enforces() -> None:
 
     assert f"{chars_to_words(NOTE_CHARS)} words" in analyze_mod.ANALYZE_SYSTEM_PROMPT
     assert str(MAX_RATED) in analyze_mod.ANALYZE_SYSTEM_PROMPT
+
+
+# --- [drift] rule_files ------------------------------------------------------
+
+
+def test_lenses_load_from_a_rule_file(tmp_path: Path) -> None:
+    """A set of questions is a document somebody owns, and it is usually
+    not the person editing `[llm] endpoint` two tables above it."""
+    (tmp_path / "rules").mkdir()
+    (tmp_path / "rules" / "ask.toml").write_text(
+        '[[lens]]\nid = "shared"\nquestion = "Is it moving?"\n', encoding="utf-8"
+    )
+    root = _config(tmp_path, '[drift]\nrule_files = ["rules/*.toml"]\n')
+
+    assert "shared" in {lens.id for lens in load_lenses(root)}
+
+
+def test_the_project_config_overrides_a_lens_from_a_rule_file(tmp_path: Path) -> None:
+    """Rule files first, this file last, exactly as the probe set layers."""
+    (tmp_path / "rules").mkdir()
+    (tmp_path / "rules" / "ask.toml").write_text(
+        '[[lens]]\nid = "shared"\ntitle = "from the file"\nquestion = "q?"\n',
+        encoding="utf-8",
+    )
+    root = _config(
+        tmp_path,
+        '[drift]\nrule_files = ["rules/*.toml"]\n\n'
+        '[[lens]]\nid = "shared"\ntitle = "local"\nquestion = "q?"\n',
+    )
+
+    by_id = {lens.id: lens for lens in load_lenses(root)}
+    assert by_id["shared"].title == "local"
+
+
+def test_a_lens_rule_file_glob_matching_nothing_is_an_error(tmp_path: Path) -> None:
+    """The same rule the watches keep: a question that is never asked reads
+    exactly like a question that found nothing."""
+    root = _config(tmp_path, '[drift]\nrule_files = ["rules/*.toml"]\n')
+    with pytest.raises(ValueError, match="matches no file"):
+        load_lenses(root)
+
+
+def test_a_rule_file_may_carry_a_probe_and_no_lens(tmp_path: Path) -> None:
+    """The other half of the same file, from this loader's side."""
+    (tmp_path / "rules").mkdir()
+    (tmp_path / "rules" / "measure.toml").write_text(
+        '[[probe]]\nid = "p"\ntitle = "t"\ncommand = ["echo"]\n', encoding="utf-8"
+    )
+    root = _config(tmp_path, '[drift]\nrule_files = ["rules/*.toml"]\n')
+
+    assert load_lenses(root)  # the built-in lens, and no error

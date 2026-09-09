@@ -16,7 +16,7 @@ import pytest
 from vibe_sentinel import credentials as creds
 from vibe_sentinel import licenses as lic
 from vibe_sentinel import packages as pkg
-from vibe_sentinel.pins import check_pins, required_keys
+from vibe_sentinel.policy import check_pins, required_keys
 
 GOOD = {
     "packages": ["certifi"],
@@ -141,3 +141,80 @@ def test_a_complete_pin_loads_in_every_gate(tmp_path: Path) -> None:
     assert creds.load_policy(root=root).accepts(
         "tests/fixtures/server.pem", "private-key-file"
     )
+
+
+# --- a second pin over one subject, in all three gates ---------------------
+#
+# The bug these guard: every gate's lookup returned the *first* pin whose
+# selector matched, so a path or a package an earlier entry already named
+# could never be widened by a later one. The second pin read as a decision
+# and settled nothing — the same failure `check_pins` refuses for a
+# misspelled key, arriving through a spelling that is correct.
+
+
+def test_a_later_credential_pin_widens_a_path_an_earlier_one_names() -> None:
+    policy = creds.Policy(
+        pins=(
+            {"paths": ["tests/*.py"], "accept": ["assigned-secret"]},
+            {"paths": ["tests/*.py"], "accept": ["password-shape"]},
+        )
+    )
+    assert policy.accepts("tests/test_config.py", "assigned-secret")
+    assert policy.accepts("tests/test_config.py", "password-shape")
+    assert not policy.accepts("tests/test_config.py", "private-key-block")
+
+
+def test_the_credential_pin_on_record_is_the_one_that_accepted() -> None:
+    """Which reason gets recorded matters: it is what a reader is shown
+    as the argument for this finding being settled."""
+    policy = creds.Policy(
+        pins=(
+            {"paths": ["a.py"], "accept": ["assigned-secret"], "reason": "fixtures"},
+            {"paths": ["a.py"], "accept": ["password-shape"], "reason": "model names"},
+        )
+    )
+    first = policy.pin_for("a.py", "assigned-secret")
+    second = policy.pin_for("a.py", "password-shape")
+    assert first is not None and first["reason"] == "fixtures"
+    assert second is not None and second["reason"] == "model names"
+    assert policy.pin_for("a.py", "private-key-block") is None
+
+
+def test_a_later_package_pin_widens_a_name_an_earlier_one_names() -> None:
+    policy = pkg.Policy(
+        pins=(
+            {"packages": ["filelock"], "accept": ["orphan"]},
+            {"packages": ["FileLock"], "accept": ["undeclared"]},
+        )
+    )
+    # The second pin spells it with different case; normalisation makes them
+    # one name, which is exactly how a second pin ends up shadowed.
+    assert policy.accepts("filelock", "orphan")
+    assert policy.accepts("filelock", "undeclared")
+    assert not policy.accepts("filelock", "squatted")
+
+
+def test_a_later_licence_pin_widens_a_package_an_earlier_one_names() -> None:
+    """Two readings of one package's licence — an older release pinned to
+    one expression, a newer to another — both have to count."""
+    policy = lic.Policy(
+        allowed=frozenset({"MIT"}),
+        pins=(
+            {
+                "packages": ["chardet"],
+                "accept": ["LGPL-2.1"],
+                "reason": "r",
+                "verified": "2026-01-01",
+            },
+            {
+                "packages": ["chardet"],
+                "accept": ["MIT"],
+                "reason": "r",
+                "verified": "2026-01-01",
+            },
+        ),
+    )
+    assert policy.pin_for("chardet", "MIT") is not None
+    assert policy.pin_for("chardet", "LGPL-2.1") is not None
+    assert policy.pin_for("chardet", "AGPL-3.0") is None
+    assert len(policy.pins_for("chardet")) == 2

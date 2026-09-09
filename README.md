@@ -2,6 +2,30 @@
 
 *A necessary component for vibe coding beyond the prototype.*
 
+Frontier models offer incredible intelligence and take no responsibility for it: behavior changes unpredictably between versions of the same model, and nothing in the loop answers for what that does to your codebase. Coding agents are not built to hold a line against it either; they serve a different goal, which is to make the change you asked for. 
+
+A local open-source model can: pinned, from a different family than the one writing your code, and fully under your team's control. It can only judge, though, once something else has turned the codebase into a question small enough to answer — and that something else is most of the code here. *Probes* measure: keyed counts, ratios and installed versions, recorded on every run. *Lenses* are the questions put to the model about what moved since the baseline, phrased in your own words. *Gates* answer a kind of question that needs no history at all — whether a key is sitting in the working tree, where a dependency came from, what licence arrived with it. And one gate runs in front of the agent's command instead of after it, judging what is about to happen rather than how it was written: whether the delete about to run clears a build directory or a home directory, whether an install names a package no manifest declares. It is the only check here that can refuse an action, and it ships off by default. In every case the mechanism finds and the model judges what it found; the model can neither add a finding nor drop one.
+
+The gates work on the first run, against rules that ship. The drift rules are yours, and that is the point rather than a gap: a probe or a lens published widely enough enters the next training corpus, and a model trained on it writes code that satisfies it — at which point it stops measuring what it stood for. So Vibe Sentinel ships the machinery, the built-in rule sets and enough examples to start, and the questions worth asking about your own repository are yours to write, hand in hand with the cases that say whether the model answers them well.
+
+## Table of Contents
+
+- [GenAI-driven codebase maintenance and development challenges](#genai-driven-codebase-maintenance-and-development-challenges)
+  - [Invisible Structural Drift](#invisible-structural-drift)
+  - [Immediate Safety Risks](#immediate-safety-risks)
+  - [Supply Chain & Provenance Issues](#supply-chain--provenance-issues)
+- [Who Is Affected?](#who-is-affected)
+- [How Vibe Sentinel Helps](#how-vibe-sentinel-helps)
+- [What It Is Not](#what-it-is-not)
+- [Why it is built this way](#why-it-is-built-this-way)
+- [How impactful are issues with uncontrolled GenAI development?](#how-impactful-are-issues-with-uncontrolled-genai-development)
+- [How Vibe Sentinel Works](#how-vibe-sentinel-works)
+- [What Vibe Sentinel can find and report](#what-vibe-sentinel-can-find-and-report)
+- [What It Costs to Adopt](#what-it-costs-to-adopt)
+- [Getting Started](#getting-started)
+- [Documentation](#documentation)
+- [License](#license)
+
 ## GenAI-driven codebase maintenance and development challenges
 
 ### Invisible Structural Drift
@@ -35,7 +59,7 @@ Most teams match at least one of these, and the first run settles half of it: wh
 - **Stops dangerous commands before they run** — safety gate blocks `rm -rf`, undeclared installs, based on what that agent already did.
 - **Finds what's true now** — credentials at rest, dependency provenance, license policy. Reports every run until resolved.
 - **Keeps a command journal** — answers "what have the agents been doing?" with a record, not recollection.
-- **Model is optional** — `--no-model` runs all mechanical checks (CI path). Local model only rates what the mechanisms already found.
+- **A local model does the judging, and nothing else** — the deterministic half of this tool exists to turn a repository into a question small enough for an 8B model to answer. It rates what the mechanisms already found; it never chooses what to measure, and it never leaves the machine.
 
 **The combination necessary for intelligent, reliable, predictable vibe coding: model + agent + sentinel.** The model generates. The agent acts. The sentinel remembers what the repository is supposed to look like, records what happens, flags meaningful drift, and can stop an irreversible command before it runs.
 
@@ -46,6 +70,24 @@ Most teams match at least one of these, and the first run settles half of it: wh
 **It is not a vulnerability scanner.** It records which version of each dependency is installed and reports when one moves; it never asks whether that version has a published CVE. That question is answered well already — pip-audit, Dependabot, osv-scanner — and its answer is true of a repository no agent has ever touched, which is the line everything here sits on the other side of. Worth knowing what those tools send in order to answer it: pip-audit queries an index once per installed package, so one run hands a third party the name and exact version of everything on the machine. This tool reads the same set through `importlib.metadata` and tells nobody.
 
 It judges two things, and neither of them is your code. The **safety gate** judges an agent's *action* before it runs — whether `rm -rf "$DIR"` is about to remove a build directory or a home directory is a question about what will happen, not about how the command is written. The **credentials gate** judges a *fact about the tree* — whether a string sitting in it would open something. Both have answers that do not depend on anyone's taste.
+
+## Why it is built this way
+
+**Why there is a model at all, rather than only deterministic checks.** A probe produces a number, and a number is not a finding: a directory going from 2 modules to 11 is a god-module split apart or a grab-bag taking over, and the measurement says neither. Same everywhere else: whether `rm -rf "$DIR"` removes a build directory or a home directory is answerable from what that agent already ran, not from the command's text; `hunter22` is eight low-entropy characters and also somebody's password; `httpx` and `httpx2` are two real packages, one edit apart. That last one is the worked example: it was a deterministic rule until it started collecting hand-written exceptions, which is what a judgement looks like before anyone admits it is one. So the mechanism nominates and the model judges, and the model can neither lengthen the list nor shorten it.
+
+**Why the model is local.** Four reasons, none a preference. The credentials gate reads secrets: an excerpt reaches a loopback endpoint or nowhere, whatever the config says. A hosted judge would have to be told what is installed here — the inventory this tool refuses to send even under `--online`. The safety gate runs in front of every tool call on a ~52 ms budget, which has no room for a network round trip. The model is pinned, and from a different family than the one writing the code: a judge whose weights change under you silently re-grades your history.
+
+**Why it is open source.** It reads your entire working tree, including the files with keys in them, and decides which commands an agent may run. A checker nobody can read is a rule nobody can check. The mechanism is public; the rules are yours and stay in your repository. Publishing the machinery costs nothing, and publishing the rules is what would ruin them.
+
+**Why the rules are per project and per company.** A shipped list of verbs cannot know which of your database hosts is production; a shipped list of key formats cannot know which prefix your auth service mints; nothing outside your ecosystem knows that two of your package names are meant to look alike. A sharper reason is [below](#how-vibe-sentinel-works): what a rule does once it reaches a training corpus. Measured, and reverted, twice: a shipped signal line for `file-length` made a deliberately calm case rate `high`; one for `silent-exceptions` worked and went anyway, because a shipped signal is a claim on behalf of every project that installs this.
+
+**No fallbacks, ever.** When something this tool depends on is not there — the model, a policy file, a timestamp, an answer — the run fails and names the command that fixes it, rather than handing back something shaped like the answer it could not get. The test is one question: if this branch runs, does the result still mean what it would have meant? A credentials report listing candidates nobody judged is shaped exactly like a report of a clean tree.
+
+**A pin is a decision, not an ignore.** Clearing a gate finding takes a pin carrying what it accepts, a reason, and the date somebody verified it. Anything less is `--ignore` with extra steps, which is the mechanism these gates were written to replace.
+
+**A threshold is measured or it is not a threshold.** Every constant in the trend fitting carries the runs it took to establish it. The textbook cutoff of 3.5 for an anomaly is wrong here: estimated from ten runs it calls 8.4% of clean values anomalous — fifteen false alarms a scan on this repository, and a section nobody reads. It is twenty runs and 5.0 now, with the measured table beside it in `trends.py`.
+
+**It is held to its own thesis.** This repository's structure is guarded by the tool it builds: the probes are in its own `.vibe-sentinel.toml`, every scan is in its own `history.db`, and six internal layers are declared in a test that fails on an upward import, a cycle, or a module nobody placed. A claim about codebases in general that its author will not accept about their own is worth discounting.
 
 ## How impactful are issues with uncontrolled GenAI development?
 
@@ -64,22 +106,23 @@ Three things measure, and none of them needs a model to do it. The local model i
 
 ```mermaid
 flowchart TB
-  CFG[".vibe-sentinel.toml<br/>probes · lenses · dangers · secrets<br/>yours, layered over the built-ins"]
-  H["<b>hook</b><br/>judges an action<br/>before it runs"]
-  P["<b>probes</b><br/>measure what moved<br/>since the baseline"]
-  G["<b>gates</b><br/>measure what is true<br/>of the tree right now"]
-  DB[("<b>history.db</b> — every run recorded, never rebuilt")]
-  M["the local model rates what one of the three already found.<br/>It never chooses what to measure, and --no-model skips it"]
+  CFG[".vibe-sentinel.toml<br/>· rules/*.toml"]
+  H["<b>hook</b><br/>an action, before it runs"]
+  P["<b>probes</b><br/>what moved since the baseline"]
+  G["<b>gates</b><br/>what is true of the tree now"]
+  M["the <b>local model</b> judges what one of the three found —<br/>never what to measure, and never skipped"]
+  DB[("<b>history.db</b><br/>every run recorded, never rebuilt")]
   OUT["deny a command · report<br/>--update accepts drift · a pin settles a gate finding"]
-  CFG --> H & P & G
+  CFG -- "dangers" --> H
+  CFG -- "probes · lenses" --> P
+  CFG -- "secrets · licence policy" --> G
+  H & P & G --> M --> OUT
   H & P & G --> DB
-  DB --> OUT
-  DB -.-> M -.-> OUT
 ```
 
 What separates the checks is *when* the answer arrives, and whether the check can stop anything by itself.
 
-| When | Capability | What it catches | Command |
+| When | Check | What it catches | Command |
 |---|---|---|---|
 | **Before the command runs** | Safety gate | Dangerous shell operations, and installs of package names no manifest declares, judged against what that agent already ran. The only check that can refuse an action — and it ships off by default | `vibe-sentinel safety` |
 | **As the agent works** | Command journal | Nothing. It records every tool call as it happens, which is what makes the review above answerable | `vibe-sentinel hook --install` |
@@ -88,7 +131,7 @@ What separates the checks is *when* the answer arrives, and whether the check ca
 | | License policy | Dependencies with unexpected or disallowed licenses | `vibe-sentinel licenses` |
 | **From the second run** | Structural drift | Directories, modules, code patterns, and the installed version and origin of every dependency, moving away from the recorded baseline — over a week or a month, the movement too slow for any single comparison, and the fitted direction no comparison of two points can show | `vibe-sentinel scan` |
 
-Every one of them exits `1` when it found something, and only the safety gate stops anything on its own. The rest become gates when you route them into a pre-commit hook, a CI job, or back into the coding session — see [Getting Started](docs/getting-started.md#routing-it-somewhere).
+Every one of them exits `1` when it found something, and only the safety gate stops anything on its own. The rest stop nothing by themselves; routing one into a pre-commit hook, a CI job, or back into the coding session is what makes an exit code block something — see [Getting Started](docs/getting-started.md#routing-it-somewhere).
 
 The division of labour is the same in each case. A deterministic mechanism finds the facts; the model is asked one question about them.
 
@@ -102,7 +145,9 @@ The division of labour is the same in each case. A deterministic mechanism finds
 
 That is what keeps the output reproducible, and why the model can be small and local. It is pinned, and from a different family than the one changing the codebase, so the measuring instrument stays independent of the thing it measures.
 
-The rules are yours for a related reason. A rule published widely enough enters the next training corpus, and a model trained on it writes code that satisfies it — at which point the rule stops measuring what it stood for. Probes, dangers, secrets and lenses are declared in your repository rather than shipped in the package, so what this tool checks is something no training run has seen.
+The rules are yours for a related reason. A rule published widely enough enters the next training corpus, and a model trained on it writes code that satisfies it — at which point the rule stops measuring what it stood for. The built-in probes, dangers, secrets and lenses are a starting point rather than the answer: a rule you write layers over them, or replaces one by id, and what this tool then checks in your repository is something no training run has seen. One or two live in `.vibe-sentinel.toml`; past that, `rule_files` under `[probes]`, `[drift]`, `[safety]` and `[credentials]` takes a glob — `rules/*.toml` — and one directory holds all four kinds, because each loader reads its own half of a file.
+
+So are the questions. A `[[danger]]` is a command shape the safety gate stops on and a `[[secret]]` is a key format the credentials gate looks for; each of those, like a `[[lens]]`, carries the question the model is actually asked about a match, and the drift, licence and package passes take a standing `guidance` note in front of theirs. A shipped list of verbs cannot know which of your database hosts is production, and a shipped question cannot know that two of your package names are meant to look alike.
 
 ## What Vibe Sentinel can find and report
 
@@ -147,7 +192,7 @@ One baseline shows drift at one scale, though: a directory gaining two modules a
 
 | | |
 |---|---|
-| **Hardware** | An OpenAI-compatible local backend — vLLM, Ollama, llama.cpp, LM Studio. A known-good setup is an 8B model on one NVIDIA GPU of about 20GB; a scan makes a few small calls and none of them is long. No backend at all is supported: `--no-model` skips the two steps that need one and says in the report that they did not happen. That is the CI path. |
+| **Hardware** | An OpenAI-compatible local backend — vLLM, Ollama, llama.cpp, LM Studio. A known-good setup is an 8B model on one NVIDIA GPU of about 20GB; on an Apple Silicon Mac it is Qwen3 14B under Ollama, or any other 12–14B local model. A scan makes a few small calls and none of them is long. A backend is required: judging is half of what this tool does, and a run that cannot reach one exits 2 rather than reporting what it managed without it. |
 | **Your codebase** | Untouched. This is a command you point at a repository, not a library you import into one, and it installs *beside* your project — conda, venv, uv, poetry, pyenv all left alone. |
 | **Setup** | Two installs per machine, one generated config file, one scan. The defaults measure the current directory and are usually right to start with. |
 | **Runtime** | ~52 ms per hooked tool call for the journal, which judges nothing and blocks nothing. A scan is a handful of subprocess runs and about four small model calls. |
@@ -161,10 +206,19 @@ One baseline shows drift at one scale, though: a directory gaining two modules a
 ```bash
 uv tool install vibe-sentinel     # beside your project, not into it
 
-vibe-sentinel credentials         # what is true now — no config, no history
+# A local model is required — it decides which findings are real. Serve one
+# on any OpenAI-compatible endpoint, then point [llm] at it. See below.
+vibe-sentinel backend status      # ready? then everything under here works
+
+vibe-sentinel credentials         # what is true now — no history needed
 vibe-sentinel scan                # the gates, plus the baseline for next time
 vibe-sentinel hook --install      # start the journal
 ```
+
+A run that cannot reach a model exits `2` and names the fix, rather than
+reporting the mechanical half as though it were the whole answer — which is a
+report of unjudged candidates, and that is shaped exactly like a report of a
+clean tree.
 
 Full instructions — the backend, the config, the journal, and how to route a check into pre-commit or CI — are in [Getting Started](docs/getting-started.md).
 
@@ -176,6 +230,8 @@ Full instructions — the backend, the config, the journal, and how to route a c
 | Gates — credentials, provenance, licences, command safety | [docs/gates.md](docs/gates.md) |
 | Drift — probes, lenses, horizons, trends | [docs/drift.md](docs/drift.md) |
 | Use of the local model | [docs/use-of-local-model.md](docs/use-of-local-model.md) |
+| Adding a probe — the measurement, its question, and its cases | [docs/adding-a-probe.md](docs/adding-a-probe.md) |
+| Evals — how often the model's four judgements match a labelled corpus, as a rate rather than a pass | [docs/evals.md](docs/evals.md) |
 | History database | [docs/database.md](docs/database.md) |
 | Development and contributing | [docs/development.md](docs/development.md) |
 

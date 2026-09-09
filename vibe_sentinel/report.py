@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import sys
+import textwrap
 from typing import TYPE_CHECKING
 
 from vibe_sentinel.journal import (
@@ -34,7 +35,7 @@ from vibe_sentinel.schemas import (
 from vibe_sentinel.trends import ANOMALY_MIN_RUNS, ANOMALY_Z, SIGNIFICANCE
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only, never imported
-    from vibe_sentinel.credentials import Findings, Policy, Secret
+    from vibe_sentinel.credentials import Adjudication, Policy, Secret
     from vibe_sentinel.db.maintenance import DatabaseSize, HealthReport, PruneResult
 
 _SEVERITY_RANK = {"high": 0, "medium": 1, "low": 2, "info": 3}
@@ -90,17 +91,13 @@ def render_terminal(snapshot: Snapshot, report: DriftReport) -> None:
         return
 
     # Said before the severities rather than after them, because it is what
-    # they mean. `analyzed` is False under --no-model and whenever the model
-    # did not answer, and a `[high]` that nobody rated is the mechanical one
-    # compare() assigned. Same rule as render_agent's and as the credentials
-    # report's "NOT adjudicated" line: never claim a review that did not
-    # happen, in the renderer a person actually reads.
-    rated = (
-        "reviewed by an independent local model"
-        if report.analyzed
-        else "mechanical comparison only — the model did not review these"
+    # they mean: every severity below was rated by a model of a different
+    # family from whatever wrote the code. There is no other kind of drift
+    # report any more — a run whose model did not answer failed instead of
+    # printing this.
+    print(
+        f"\nDrift since {report.baseline_at} (reviewed by an independent local model)"
     )
-    print(f"\nDrift since {report.baseline_at} ({rated})")
     for c in _ordered(report):
         mark = _KIND_MARK.get(c.kind, "?")
         print(f"  {mark} [{c.severity}] {c.describe()}")
@@ -397,11 +394,7 @@ def render_agent(report: DriftReport, gates: GateState | None = None) -> str:
             f"{report.baseline_at}.{read}" + standing
         )
 
-    reviewed = (
-        " and reviewed by an independent local model"
-        if report.analyzed
-        else " (mechanical comparison only — the model did not review these)"
-    )
+    reviewed = " and reviewed by an independent local model"
     lines = [
         "VIBE SENTINEL: STRUCTURAL DRIFT DETECTED",
         "",
@@ -811,6 +804,72 @@ def render_triage(command: str, signals: tuple[str, ...]) -> None:
     print(f"  signals: {', '.join(signals)}")
 
 
+#: The label a question is printed under, and therefore the column its
+#: continuation lines have to reach. One constant so the two cannot drift.
+_ASKS_LABEL = "  asks:     "
+
+
+def _asks(question: str) -> str:
+    """A question under its label, with continuation lines aligned to it.
+
+    Printed as one f-string, a multi-paragraph question puts every line
+    after the first at column zero — which is where the danger *ids*
+    are. The paragraph then reads as commentary on the whole list rather
+    than as part of the entry above it, and three of the built-ins have
+    one: the `git checkout` disambiguation, the reset guidance, and the
+    verdict key on `undeclared-install`.
+
+    Blank lines are left alone; `textwrap.indent` does not pad a line
+    with nothing on it, which is what keeps the paragraph breaks visible.
+    """
+    head, newline, rest = question.partition("\n")
+    if not newline:
+        return f"{_ASKS_LABEL}{head}"
+    return f"{_ASKS_LABEL}{head}\n" + textwrap.indent(rest, " " * len(_ASKS_LABEL))
+
+
+def _origin(source: str) -> str:
+    """The line every rule listing ends on: where this one came from.
+
+    Printed for a declared rule and not for a built-in, because the
+    built-ins are the majority and a column that repeats "built-in" forty
+    times is one nobody reads. What somebody is actually looking for is
+    which of these are theirs, and whether the file they just wrote loaded
+    at all.
+    """
+    return "" if source in ("", "built-in") else f"  from:     {source}"
+
+
+def render_lens_set(lenses: object) -> None:
+    """Print the active lens set: what each asks, and what it watches.
+
+    The lens set had no listing at all until this, which made it the one
+    declarable a project could not inspect without triggering an error in
+    it. A question nobody can read is one nobody edits.
+    """
+    items = list(lenses)  # type: ignore[call-overload]
+    if not items:
+        print("No lenses are active — the drift report will carry no commentary.")
+        print("  [drift] use_builtins = false and no [[lens]] declared.")
+        return
+
+    for lens in items:
+        print(f"\n{lens.id}")
+        print(f"  {lens.title}")
+        watch = ", ".join(lens.watch) if lens.watch else "every probe"
+        print(f"  watches:  {watch}")
+        print(_asks(lens.question))
+        origin = _origin(lens.source)
+        if origin:
+            print(origin)
+
+    declared = [lens for lens in items if lens.source not in ("", "built-in")]
+    print(
+        f"\n{len(items)} lens(es) active, {len(declared)} declared here. "
+        f"A lens is asked only when the probes it watches moved."
+    )
+
+
 def render_dangers(dangers: object) -> None:
     """Print the active danger set: what is checked for, and what is asked."""
     items = list(dangers)  # type: ignore[call-overload]
@@ -830,13 +889,17 @@ def render_dangers(dangers: object) -> None:
         if danger.verdict:
             print(f"  verdict:  {danger.verdict}  (declared; the model is not asked)")
         else:
-            print(f"  asks:     {danger.question}")
+            print(_asks(danger.question))
+        origin = _origin(danger.source)
+        if origin:
+            print(origin)
 
     if context:
         print("\nContext signals — never escalate on their own, attached to a")
         print("verdict once something else has:")
         for danger in context:
-            print(f"  {danger.id:<22} {danger.title}")
+            mine = "" if danger.source in ("", "built-in") else f"   [{danger.source}]"
+            print(f"  {danger.id:<22} {danger.title}{mine}")
 
     print(f"\n{len(checks)} check(s), {len(context)} context signal(s).")
 
@@ -1008,9 +1071,9 @@ def render_pattern_match(
 # ---------------------------------------------------------------------------
 
 #: Worst first. `unclear` outranks `placeholder` because it is the one that
-#: needs a person, and `unreviewed` sits at the bottom on its own: it is not
-#: a verdict about the file, it is the absence of one.
-_SECRET_ORDER = ("real", "unclear", "placeholder", "pinned", "unreviewed")
+#: needs a person. There is no row for a candidate nobody judged: a review
+#: that did not happen fails the run rather than reaching this listing.
+_SECRET_ORDER = ("real", "unclear", "placeholder", "pinned")
 
 _EXPOSURE_NOTE = {
     "tracked": "tracked by git",
@@ -1021,7 +1084,7 @@ _EXPOSURE_NOTE = {
 }
 
 
-def render_credentials(findings: Findings, policy: Policy) -> None:
+def render_credentials(findings: Adjudication, policy: Policy) -> None:
     """Print what was found, what was decided, and who decided it."""
     from vibe_sentinel.credentials import KEYCHAIN_ADVICE
 
@@ -1031,13 +1094,8 @@ def render_credentials(findings: Findings, policy: Policy) -> None:
         f"{scan.files_read} file(s) read, {scan.files_skipped} skipped, "
         f"{len(scan.candidates)} candidate(s) flagged"
     )
-    if findings.reviewed:
+    if findings.model:
         print(f"adjudicated by {findings.model}")
-    elif findings.judgements:
-        # Never let a listing read as a review. Same rule as DriftReport.analyzed.
-        print("NOT adjudicated — every verdict below is mechanical")
-    if findings.note:
-        print(f"\n{findings.note}")
     if scan.git_note:
         print(f"note: {scan.git_note}")
     if scan.truncated:
@@ -1136,4 +1194,7 @@ def render_secret_rules(secrets: tuple[Secret, ...]) -> None:
                 )
             else:
                 print(f"  asks:     {_one_line(secret.question, 88)}")
+            origin = _origin(secret.source)
+            if origin:
+                print(origin)
     print(f"\n{len(secrets)} rule(s) active.")

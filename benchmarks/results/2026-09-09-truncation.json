@@ -1,0 +1,203 @@
+{
+  "environment": {
+    "cpu": "Intel(R) Core(TM) i7-14700",
+    "gpu": "NVIDIA RTX 4000 Ada Generation, 20475 MiB",
+    "max_tokens": 1024,
+    "model": "qwen3-8b-fp8",
+    "note": "vLLM 0.18.0 serving RedHatAI/Qwen3-8B-FP8-dynamic under podman: --kv-cache-dtype fp8 --max-model-len 40960 --max-num-seqs 256 --max-num-batched-tokens 8192 --gpu-memory-utilization 0.85; the engine reports a 98,064-token GPU KV cache, and one request of this shape occupies about 2,300 of them, so the cache runs out somewhere past 40 concurrent. Widths 1 and 2 are omitted deliberately: measured at 207.64s +-1.1% and 101.02s +-6.6% over 16 requests, they cost two thirds of the runtime to re-confirm, so the baseline here is the shipped default of 4",
+    "python": "3.13.2",
+    "served": "serving: qwen3-8b-fp8",
+    "structured_output": "json_schema",
+    "temperature": 0.2,
+    "when": "2026-09-09"
+  },
+  "repeat": 3,
+  "requests": 16,
+  "suites": [
+    {
+      "id": "truncation",
+      "measurements": [
+        {
+          "id": "fits",
+          "label": "max_tokens = 1024 (the answer fits)",
+          "passes": [
+            {
+              "answered": 16,
+              "latencies": [
+                7.784416918000716,
+                9.119497309999133,
+                13.235282404999452,
+                14.518170855999415,
+                8.864974931000688,
+                9.3861541210008,
+                11.045645093998246,
+                8.233594618999632,
+                11.655800731999989,
+                9.866241750998597,
+                10.359265391998633,
+                9.10412717500003,
+                10.50434488800056,
+                11.454450413999439,
+                8.665447119999953,
+                10.072984262000318
+              ],
+              "preemptions": 0,
+              "prefix_hits": 21312,
+              "prefix_queries": 21734,
+              "seconds": 44.72376043300028,
+              "truncated": 0,
+              "unanswered": 0
+            },
+            {
+              "answered": 16,
+              "latencies": [
+                7.297175977000734,
+                8.530733890998818,
+                12.017282906999753,
+                14.369439424999655,
+                9.255399985999247,
+                7.679596407000645,
+                10.594604580999658,
+                18.958407882000756,
+                8.100958864999484,
+                15.389836189999187,
+                10.531857743999353,
+                10.97842036899965,
+                8.73925200099984,
+                11.305826617999628,
+                15.7638080730012,
+                11.912840289000087
+              ],
+              "preemptions": 0,
+              "prefix_hits": 21024,
+              "prefix_queries": 21744,
+              "seconds": 50.38049511600002,
+              "truncated": 0,
+              "unanswered": 0
+            },
+            {
+              "answered": 16,
+              "latencies": [
+                8.554450333000204,
+                8.909542045001217,
+                10.927616089000367,
+                11.625376216999939,
+                10.07094222699925,
+                7.894924718999391,
+                10.488113074001376,
+                17.642265483998926,
+                9.673598201999994,
+                12.629672452001614,
+                8.554244169999947,
+                18.097633848999976,
+                7.8684568099997705,
+                9.73456521999833,
+                8.817380071001025,
+                25.229587255998922
+              ],
+              "preemptions": 0,
+              "prefix_hits": 20832,
+              "prefix_queries": 21744,
+              "seconds": 54.4536510199996,
+              "truncated": 0,
+              "unanswered": 0
+            }
+          ],
+          "requests": 16,
+          "width": 4
+        },
+        {
+          "id": "truncates",
+          "label": "max_tokens = 256 (the answer is cut off)",
+          "passes": [
+            {
+              "answered": 13,
+              "latencies": [
+                16.99359958000059,
+                19.734086991998993,
+                22.761410794000767,
+                22.798284907999914,
+                18.252153314999305,
+                19.083929577998788,
+                18.020562278001307,
+                22.801303723001183,
+                17.89940058100001,
+                16.238569351999104,
+                16.62412729800053,
+                18.073430747999737,
+                17.2271402869992,
+                19.67633347300034,
+                16.47213379400091,
+                17.112861449000775
+              ],
+              "preemptions": 0,
+              "prefix_hits": 43008,
+              "prefix_queries": 43468,
+              "seconds": 80.74911025499932,
+              "truncated": 19,
+              "unanswered": 3
+            },
+            {
+              "answered": 12,
+              "latencies": [
+                18.12192708299881,
+                18.276460070999747,
+                20.18494636899959,
+                20.698533411001335,
+                18.493533296999885,
+                17.17675708599927,
+                20.988705949999712,
+                22.81599378499959,
+                17.870130072000393,
+                23.035554586998842,
+                16.28108673799943,
+                23.01657628800058,
+                18.151068252000186,
+                17.46085865999885,
+                18.288341206998666,
+                22.65129836199958
+              ],
+              "preemptions": 0,
+              "prefix_hits": 43008,
+              "prefix_queries": 43488,
+              "seconds": 83.04049914900133,
+              "truncated": 20,
+              "unanswered": 4
+            },
+            {
+              "answered": 15,
+              "latencies": [
+                16.25302042600015,
+                17.20501583999976,
+                17.5561711499995,
+                18.560475132999272,
+                15.33915663299922,
+                18.670521766000093,
+                22.538367709999875,
+                22.791980833999332,
+                15.274489171999448,
+                15.602394243000163,
+                16.60714894100056,
+                15.420476373999918,
+                17.41925488800007,
+                17.981102923000435,
+                17.40842709700155,
+                19.164417247999154
+              ],
+              "preemptions": 0,
+              "prefix_hits": 43008,
+              "prefix_queries": 43488,
+              "seconds": 74.96366451799986,
+              "truncated": 17,
+              "unanswered": 1
+            }
+          ],
+          "requests": 16,
+          "width": 4
+        }
+      ],
+      "note": "16 requests per pass at width 4, one shared prefix. The arms differ in one thing: the answer budget \u2014 1024 tokens against 256, which the answers overrun so llm_query retries them at 512.  NOT MEASURED: 8 request(s) in the 256-token arm never came back \u2014 the doubled retry at 512 truncated too, and llm_query doubles once. That timed a failure, not a retry. Raise [_TRUNCATING_TOKENS].",
+      "question": "What does an answer that overruns its budget cost?"
+    }
+  ]
+}

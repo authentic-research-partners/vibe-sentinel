@@ -41,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from collections.abc import Iterable
 from typing import Any
 
 import httpx
@@ -63,6 +64,16 @@ _RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
 #: by under a factor of two. A prompt whose answer still will not fit is
 #: one to make smaller, and the message that gives up says so.
 _TRUNCATION_ESCALATION = 2
+
+#: Seconds to wait for the TCP connection, as opposed to for the answer.
+#: ``llm_timeout`` is the model's budget to think and defaults to 300s,
+#: which is right for a scan and wrong for a socket: applied to the connect
+#: phase it turns an unreachable backend into a five-minute hang per
+#: attempt, three attempts deep, before the error that names the fix. That
+#: is the mandatory-model failure path, so it is the one that has to be
+#: quick. ``check_endpoint`` has always bounded its own probe for the same
+#: reason; this is the same bound on the requests themselves.
+_CONNECT_TIMEOUT_S = 10.0
 
 _JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
 
@@ -141,15 +152,15 @@ async def llm_query(
 ) -> dict[str, Any] | None:
     """Ask the model one question; return the parsed JSON object.
 
-    Returns None when the model answers with something unparseable — the
-    callers treat that as "no answer" and carry on with placeholder
-    defaults or mechanical severities, because a scan that reports
-    structure without the model's commentary is far more useful than no
-    scan at all.
+    Returns None when the model answers with something unparseable after
+    the retries above. That is *no answer*, and it is the caller's job to
+    treat it as one: the credentials gate raises, the near-miss gate leaves
+    the finding standing, and the drift pass records the lens as asked and
+    unanswered. None of them substitutes a verdict.
 
-    Raises :class:`LLMConnectionError` only when the endpoint itself is
+    Raises :class:`LLMConnectionError` when the endpoint itself is
     unreachable after retries, which is a setup problem the user needs
-    told about rather than degraded past.
+    told about rather than worked around.
     """
     config = config or SentinelConfig()
     mode = config.structured_output
@@ -178,7 +189,9 @@ async def llm_query(
     url = config.llm_endpoint.rstrip("/") + "/chat/completions"
     own_client = client is None
     if own_client:
-        client = httpx.AsyncClient(timeout=config.llm_timeout)
+        client = httpx.AsyncClient(
+            timeout=httpx.Timeout(config.llm_timeout, connect=_CONNECT_TIMEOUT_S)
+        )
     assert client is not None  # narrowing for mypy
 
     try:
@@ -281,11 +294,38 @@ async def llm_query(
             f"{_MAX_ATTEMPTS} attempts: {last_error}\n"
             f"  Check it is running:  vibe-sentinel backend status\n"
             f"  Start it:             vibe-sentinel backend start\n"
-            f"  Or scan without it:   vibe-sentinel scan --no-model"
+            f"  The model is not optional: it rates every change this tool "
+            f"reports and decides which credential candidates are real."
         )
     finally:
         if own_client:
             await client.aclose()
+
+
+def raise_if_unreachable(results: Iterable[object]) -> None:
+    """Re-raise the first :class:`LLMConnectionError` in a gathered fan-out.
+
+    Every fan-out here is ``asyncio.gather(..., return_exceptions=True)``,
+    because one bad answer must not lose the others. An unreachable endpoint
+    is not one bad answer: every request discovers the same fact
+    independently, so the exception arrives once per item and each copy
+    carries the same remediation.
+
+    Two things follow, and the second is why this is a function rather than
+    a habit. Reported, it is the same error concatenated N times and the
+    remediation scrolls off the top. *Not* reported — folded into the
+    per-item "no answer" path — it is worse than noise: a drift report whose
+    lenses all failed on a dead backend still renders under "reviewed by an
+    independent local model", and a near-miss pair nobody could judge reads
+    as a pair the model declined to settle. That is the shape this codebase
+    refuses everywhere else: no verdict may mean "nobody looked".
+
+    `credentials.review` had this and the other two fan-outs did not, which
+    is a fact with one owner living in three places. Now it has one.
+    """
+    for item in results:
+        if isinstance(item, LLMConnectionError):
+            raise item
 
 
 def _truncated(payload: dict[str, Any]) -> bool:
@@ -331,7 +371,17 @@ def _parse_completion(
 
 
 async def check_endpoint(config: SentinelConfig) -> tuple[bool, str]:
-    """Probe the endpoint's ``/models``. Returns ``(reachable, detail)``."""
+    """Probe the endpoint's ``/models``. Returns ``(reachable, detail)``.
+
+    An empty model list is a state, not a malformed answer, and saying so
+    is the difference between a diagnostic and a shrug. Ollama with nothing
+    pulled yet answers ``{"object": "list", "data": null}`` — the key is
+    present and null rather than absent — so a ``.get("data", [])`` hands
+    back ``None``, iterating it raises, and the reader was told the server
+    returned "an unexpected shape". That is the *documented* first-run
+    state on the macOS path, where the next instruction is ``ollama pull``,
+    and the message sent them looking for a protocol fault instead.
+    """
     url = config.llm_endpoint.rstrip("/") + "/models"
     headers = {}
     if config.api_key:
@@ -346,7 +396,14 @@ async def check_endpoint(config: SentinelConfig) -> tuple[bool, str]:
         return False, f"HTTP {response.status_code}: {response.text[:200]}"
 
     try:
-        served = [m["id"] for m in response.json().get("data", [])]
+        # `or []` covers both "no key" and "the key is null": a list
+        # endpoint that lists nothing is empty, however it spells it.
+        served = [m["id"] for m in (response.json().get("data") or [])]
     except (ValueError, KeyError, TypeError):
         return True, "reachable, but /models returned an unexpected shape"
-    return True, f"serving: {', '.join(served) or '(none listed)'}"
+    if not served:
+        return True, (
+            "reachable, but serving no models — load one into the backend, "
+            "then check '[llm] model' names it"
+        )
+    return True, f"serving: {', '.join(served)}"

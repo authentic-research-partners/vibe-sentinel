@@ -7,6 +7,100 @@ All notable changes to this project are recorded here. The format follows
 A release is refused if the version it names has no section here. The date on
 the heading is stamped at release; write `unreleased` and leave it.
 
+## [0.3.0] — 2026-09-09
+
+### Added
+
+- `python -m evals`, scoring the four model judgements against labelled
+  corpora in `evals/`. `docs/evals.md`.
+- `[[lens.case]]`, eval cases declared under a lens in the project's own
+  config. `docs/adding-a-probe.md`.
+- `python -m benchmarks`, timing this tool's model traffic on your own
+  backend: fan-out width, the shared system message, a client per call, a
+  truncation. `benchmarks/README.md`.
+- `vibe-sentinel backend monitor`: queue depth, KV cache use, prefix-cache hit
+  rate and truncated answers, from a Prometheus `/metrics` endpoint.
+- `rule_files` under `[probes]`, `[drift]`, `[safety]` and `[credentials]`, so
+  declared rules live in their own files rather than the config.
+- `scan --list-lenses`, and a `source` on all four listings naming where a
+  declared rule came from.
+- `dangers.default.toml` and `secrets.default.toml`, the shipped danger and
+  secret sets as data. They were Python literals.
+- `minted-token` and `password-shape`, credential rules keyed on the value
+  rather than the variable's name or a vendor's prefix.
+- `pwd`, `pat`, `bearer`, `dsn`, `salt` and `signing`/`session`/`encryption`/
+  `master` keys in the `assigned-secret` name list.
+- Dangers for the JavaScript toolchain: `publishing-a-package`,
+  `deploying-to-production`, `forcing-a-dependency-resolution` and
+  `exposing-a-dev-server`, with `lockfile` and `dependency-tree` as context.
+- `requires` on a danger: a filename that must sit at the project root for the
+  danger to apply at all.
+- `file-length` measures files that are not text when `UNIT = "bytes"`.
+- `[packages] guidance`, a project's standing note about its own names, put in
+  front of the near-miss question.
+- A probe's `attrs` reach the model that rates its changes.
+- `tests/test_layers.py`: the package's six layers, failing on an upward
+  import, a cycle, or a module nobody placed.
+- `docs/frontend-support.md`.
+
+### Changed
+
+- The local model is required. A run that cannot reach one, or whose model
+  does not answer, exits 2.
+- The three gates are named for the stage they are at: `licenses.audit` was
+  `licenses.check`, `credentials.search` was `credentials.collect`,
+  `licenses.Finding` was `Violation`, `credentials.Adjudication` was `Findings`.
+- `pins.py` is `policy.py`. All three gates resolve policy through one order:
+  the organisation's file, then the project's own table.
+
+### Removed
+
+- `--no-model`, and the degraded paths behind it: `Snapshot.used_model`,
+  `DriftReport.analyzed`, the `unreviewed` credential verdict. The
+  `runs.used_model` and `runs.analyzed` columns stay.
+
+### Fixed
+
+- Every shipped system prompt says its content is data rather than
+  instruction, and names the field an injection attempt is reported in. Four
+  of the five were missing it.
+- The safety gate no longer substitutes the built-in `[[danger]]` set for one
+  that will not load, and no longer reads an unparseable config as
+  `mode = "off"`.
+- One definition of what is not this project's source: `probes`, `packages`,
+  `credentials` and `licenses` kept four disagreeing lists and now all read
+  `probes.EXCLUDED_DIRS`, widened to their union. A tree keeping source in one
+  of those directories should point `SOURCE_ROOT` at it.
+- The safety, credentials and provenance gates ask at the configured
+  `[llm] max_tokens` instead of pinning it to 512.
+- The word limit a prompt states sits below the character cap the clipping
+  enforces, converted by `schemas.chars_to_words`.
+- `assigned-secret`, `password-shape` and `minted-token` match a quoted key —
+  `"password": "x"`, the JSON and YAML form.
+- `$(...)` and backticks join `${VAR}` as values that cannot be credentials,
+  and a `sha512-…` subresource-integrity digest with them.
+- `running-unseen-code` requires `eval` in a command position, so
+  `git commit -m "Add the eval framework"` no longer escalates.
+- `silent-exceptions` reports the discard share as `silent-share:<dir>` beside
+  the count. Existing keys are unchanged.
+- An unreachable model endpoint fails in seconds rather than the 300s
+  `llm_timeout`, and is reported once rather than once per candidate.
+- `backend status` reads an empty model list as one, not as an unexpected
+  shape.
+- A `.vibe-sentinel.toml` that cannot be parsed or validated exits 2 naming
+  the file, instead of a pydantic traceback.
+- A pin an earlier pin already shadowed is no longer inert; the lookup is
+  `policy.matching`.
+- `db check` reports an unreadable history timestamp as its own finding rather
+  than as zero days.
+- Every subcommand's own `--help` says what the command does, and five options
+  gained help text.
+- `parameters` no longer describes its values as the model's choice.
+- `safety --print-dangers` indents a multi-paragraph question under its label.
+- The automatic database check is skipped for `--print-probes`,
+  `--print-config` and `--print-dangers`.
+- `hook.handle` and `hook.guard` take `default_cwd`, not `fallback_cwd`.
+
 ## [0.2.0] — 2026-09-03
 
 ### Added

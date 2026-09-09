@@ -28,6 +28,17 @@ def project(tmp_path: Path) -> Path:
     return tmp_path
 
 
+def applicable_builtins() -> int:
+    """How many built-ins apply to a project with no language manifest.
+
+    The ``project`` fixture is a bare tmp_path holding a config file and
+    nothing else, so every danger carrying ``requires`` is correctly
+    absent from its set. Counted rather than hard-coded so that adding a
+    conditional danger does not require editing an unrelated assertion.
+    """
+    return len([d for d in safety.builtin_dangers() if not d.requires])
+
+
 def set_mode(project: Path, mode: str) -> None:
     (project / ".vibe-sentinel.toml").write_text(
         f'[safety]\nmode = "{mode}"\n', encoding="utf-8"
@@ -491,7 +502,7 @@ question = "Does this touch db-prod-1? Staging is disposable; production is not.
 
     assert "our-production-database" in ids
     assert "deleting-files" in ids, "declaring one danger dropped the built-ins"
-    assert len(dangers) == len(safety.BUILTIN_DANGERS) + 1
+    assert len(dangers) == applicable_builtins() + 1
 
     signals = safety.triage(
         "Bash", "psql -h db-prod-1 -c 'select 1'", "", project, dangers
@@ -514,7 +525,7 @@ question = "Ours: is this deleting anything we cannot rebuild?"
     (deleting,) = [d for d in dangers if d.id == "deleting-files"]
 
     assert deleting.question.startswith("Ours:")
-    assert len(dangers) == len(safety.BUILTIN_DANGERS)
+    assert len(dangers) == applicable_builtins()
     assert safety.triage("Bash", "rm -rf build/", "", project, dangers) == ()
 
 
@@ -557,6 +568,160 @@ def test_a_stale_disable_entry_is_an_error(project: Path) -> None:
         safety.load_dangers(project)
 
 
+# --- `requires`: dangers that only apply to some trees ---------------------
+#
+# The npm entries are the reason this exists. In a Python repository they
+# can never fire, and a denylist is read by people: eight lines that
+# cannot match are worse than absent, because absent is honest.
+
+NPM_DANGER_IDS = frozenset(
+    {
+        "publishing-a-package",
+        "deploying-to-production",
+        "forcing-a-dependency-resolution",
+        "exposing-a-dev-server",
+        "lockfile",
+        "dependency-tree",
+    }
+)
+
+
+def npm(project: Path) -> Path:
+    """Make ``project`` look like a JavaScript one."""
+    (project / "package.json").write_text('{"name": "x"}', encoding="utf-8")
+    return project
+
+
+def test_npm_dangers_are_absent_without_a_package_json(project: Path) -> None:
+    ids = {d.id for d in safety.load_dangers(project)}
+
+    assert not (ids & NPM_DANGER_IDS), "npm dangers leaked into a Python tree"
+    assert "deleting-files" in ids, "filtering dropped an unconditional danger"
+
+
+def test_npm_dangers_arrive_with_a_package_json(project: Path) -> None:
+    ids = {d.id for d in safety.load_dangers(npm(project))}
+
+    assert NPM_DANGER_IDS <= ids
+    assert "deleting-files" in ids
+
+
+def test_requires_is_not_evaluated_without_a_root() -> None:
+    """Callers passing None are describing the set, not gating on it."""
+    ids = {d.id for d in safety.load_dangers(None)}
+
+    assert NPM_DANGER_IDS <= ids
+
+
+@pytest.mark.parametrize(
+    "command,expected",
+    [
+        ("npm publish", "publishing-a-package"),
+        ("pnpm publish --access public", "publishing-a-package"),
+        ("vercel --prod", "deploying-to-production"),
+        ("netlify deploy --prod --dir=out", "deploying-to-production"),
+        ("firebase deploy", "deploying-to-production"),
+        ("wrangler deploy", "deploying-to-production"),
+        ("npm i --force", "forcing-a-dependency-resolution"),
+        ("npm install --legacy-peer-deps", "forcing-a-dependency-resolution"),
+        ("vite --host", "exposing-a-dev-server"),
+        ("npm run dev -- --host 0.0.0.0", "exposing-a-dev-server"),
+    ],
+)
+def test_the_js_toolchain_escalates(project: Path, command: str, expected: str) -> None:
+    signals = safety.triage("Bash", command, "", npm(project))
+
+    assert expected in signals, f"{command!r} did not escalate"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # The far longer list: ordinary work that must stay silent.
+        "npm install",
+        "npm ci",
+        "npm run build",
+        "npm test",
+        "npx tsc --noEmit",
+        "pnpm add react",
+        "vite build",
+        "next build",
+        "vite --host localhost",
+        "next dev --hostname localhost",
+        "vercel",
+        "netlify deploy",
+        "wrangler dev",
+        "git commit -m 'publish the article'",
+    ],
+)
+def test_ordinary_js_work_stays_silent(project: Path, command: str) -> None:
+    assert safety.triage("Bash", command, "", npm(project)) == ()
+
+
+def test_a_lockfile_is_context_and_never_an_event(project: Path) -> None:
+    """Naming a lock file is not an incident; deleting one is.
+
+    `deleting-files` is what escalates. The signal rides along so the
+    model is told *what* is being deleted, and asking twice about one
+    command is what this avoids.
+    """
+    root = npm(project)
+
+    assert safety.triage("Bash", "cat package-lock.json", "", root) == ()
+
+    signals = safety.triage("Bash", "rm -rf node_modules package-lock.json", "", root)
+    assert "deleting-files" in signals
+    assert "lockfile" in signals
+    assert "dependency-tree" in signals
+
+
+def test_disable_may_name_a_danger_that_does_not_apply_here(project: Path) -> None:
+    """One shared config, used across a mixed set of repositories.
+
+    The id exists, so this is not the stale entry `disable` refuses; it
+    simply does not apply in a tree with no package.json. Filtering
+    before `disable` resolved would raise on half the repositories using
+    the same file.
+    """
+    write_config(project, '[safety]\ndisable = ["publishing-a-package"]\n')
+    ids = {d.id for d in safety.load_dangers(project)}
+
+    assert "publishing-a-package" not in ids
+    assert "deleting-files" in ids
+
+
+def test_a_project_may_declare_requires_on_its_own_danger(project: Path) -> None:
+    write_config(
+        project,
+        """
+[[danger]]
+id = "cargo-publish"
+pattern = 'cargo\\s+publish'
+question = "Is this releasing a crate?"
+requires = "Cargo.toml"
+""",
+    )
+    assert "cargo-publish" not in {d.id for d in safety.load_dangers(project)}
+
+    (project / "Cargo.toml").write_text("[package]\n", encoding="utf-8")
+    assert "cargo-publish" in {d.id for d in safety.load_dangers(project)}
+
+
+def test_requires_must_name_a_file_not_a_path(project: Path) -> None:
+    write_config(
+        project,
+        """
+[[danger]]
+id = "nested"
+pattern = 'x'
+question = "?"
+requires = "frontend/package.json"
+""",
+    )
+    with pytest.raises(ValueError, match="names one file at the project root"):
+        safety.load_dangers(project)
+
+
 @pytest.mark.parametrize(
     ("body", "expected"),
     [
@@ -581,23 +746,98 @@ def test_a_malformed_danger_says_what_is_wrong(
         safety.load_dangers(project)
 
 
-def test_a_broken_danger_set_falls_back_rather_than_opening_the_gate(
+BROKEN_DANGER = '[[danger]]\nid = "a"\nquestion = "y"\npattern = "([unclosed"\n'
+
+
+def test_a_broken_danger_set_is_recorded_not_swapped_for_the_builtins(
     project: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A typo in the config must not silently stop checking anything."""
-    write_config(
-        project,
-        '[safety]\nmode = "observe"\n\n[[danger]]\nid = "a"\n'
-        'question = "y"\npattern = "([unclosed"\n',
-    )
+    """No fallbacks. Running the shipped set instead produces a verdict about
+    a policy nobody declared, and it reads exactly like a verdict about
+    theirs — which is the point of declaring one: a shipped list cannot know
+    which of your database hosts is production.
+
+    `observe` never refuses, so what it owes is a legible record of the gap.
+    """
+    write_config(project, '[safety]\nmode = "observe"\n\n' + BROKEN_DANGER)
     monkeypatch.setattr(hook, "review", _opinion("safe"))
 
-    hook.guard(payload(project, "rm -rf /"))
+    _, decision = hook.guard(payload(project, "rm -rf /"))
 
+    assert decision is None, "observe never refuses"
     (row,) = reviews(project)
-    assert "deleting-files" in row.signal_list(), (
-        "a broken config left the gate checking nothing"
+    assert row.verdict == "unreviewed"
+    assert not row.reviewed
+    assert "[[danger]]" in row.reason
+    assert "deleting-files" not in row.signal_list(), (
+        "nothing was triaged, and the record must not imply otherwise"
     )
+
+
+def test_a_broken_danger_set_refuses_under_enforce(project: Path) -> None:
+    """It cannot tell whether the command is dangerous, so it does not say
+    that it is safe. Blunt on purpose: every flagged command is refused
+    until the file is fixed, which is what makes it impossible to miss."""
+    write_config(project, '[safety]\nmode = "enforce"\n\n' + BROKEN_DANGER)
+
+    _, decision = hook.guard(payload(project, "rm -rf /"))
+
+    assert decision is not None
+    reason = decision["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "could not tell whether" in reason
+    assert "--print-dangers" in reason, "an error carries its remediation"
+
+
+def test_a_broken_danger_set_is_not_a_refusal_when_the_gate_is_off(
+    project: Path,
+) -> None:
+    """The mode is read first and the danger set only after it. A project
+    that never turned this on must not be refused a command over a table it
+    does not use."""
+    write_config(project, '[safety]\nmode = "off"\n\n' + BROKEN_DANGER)
+
+    _, decision = hook.guard(payload(project, "rm -rf /"))
+
+    assert decision is None
+    assert reviews(project) == []
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '[safety]\nmode = "enfroce"\n',  # a typo in the value
+        "safety = 5\n",  # not a table at all
+        '[safety\nmode = "enforce"\n',  # TOML that will not parse
+    ],
+)
+def test_a_mode_that_cannot_be_read_is_not_off(project: Path, body: str) -> None:
+    """The worst fallback this project had. A stray comma or `enfroce`
+    returned "off", so the gate stopped running while the line above it
+    still said enforce — and nothing anywhere said otherwise."""
+    write_config(project, body)
+    with pytest.raises(ValueError, match="safety|mode|could not be read"):
+        safety.configured_mode(project)
+
+
+def test_an_unreadable_config_refuses_the_command(project: Path) -> None:
+    write_config(project, '[safety\nmode = "enforce"\n')
+
+    _, decision = hook.guard(payload(project, "rm -rf /"))
+
+    assert decision is not None
+    reason = decision["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "could not read its own configuration" in reason
+
+
+@pytest.mark.parametrize(
+    "body",
+    ["", "[safety]\n", "[probes]\nuse_builtins = false\n"],
+)
+def test_nothing_declared_is_genuinely_off(project: Path, body: str) -> None:
+    """The other half of the rule: a declared default is not a fallback.
+    Nothing failed here — nobody asked for the gate."""
+    write_config(project, body)
+    assert safety.configured_mode(project) == "off"
 
 
 def test_the_prompt_asks_the_configured_questions(project: Path) -> None:
@@ -980,8 +1220,42 @@ def test_the_question_names_the_field_the_schema_demands() -> None:
     """
     from vibe_sentinel.schemas import SafetyOpinion
 
-    question = safety.build_question(safety.BUILTIN_DANGERS[0])
+    question = safety.build_question(safety.builtin_dangers()[0])
     for field in SafetyOpinion.model_fields:
         if field == "verdict":
             continue  # the whole question is what to put here
         assert field in question, f"the question never mentions {field}"
+
+
+# --- `eval` is dangerous as a command, not as a word ------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'eval "$(direnv hook bash)"',  # a command position: the line itself
+        'ls && eval "$CMD"',  # after a separator
+        "echo $(eval whoami)",  # inside a substitution
+        'bash -c "eval $BOOTSTRAP"',  # a nested shell is a command position
+        "sh -lc 'eval $x'",  # and so is a login one
+        'python -c "eval(open(f).read())"',  # -c is -c in any language
+    ],
+)
+def test_eval_in_a_command_position_escalates(project: Path, command: str) -> None:
+    assert "running-unseen-code" in safety.triage("Bash", command, "", project)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'git commit -m "Add the eval framework"',  # prose in a message
+        'pytest tests/ -k "eval or corpus"',  # a filter expression
+        "python -m evals all --mechanical",  # a word that starts with it
+        'grep -rn "eval" vibe_sentinel/',  # searching for the word
+    ],
+)
+def test_the_word_eval_in_an_argument_does_not(project: Path, command: str) -> None:
+    """`\\beval\\b` matched prose, and a gate that stops `git commit` is one
+    nobody keeps. Measured: it was the whole of this corpus's false-alarm
+    rate, 1 in 42, against a bar of under 1%."""
+    assert safety.triage("Bash", command, "", project) == ()

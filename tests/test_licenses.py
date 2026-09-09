@@ -20,23 +20,6 @@ from vibe_sentinel import licenses as cl
 ALLOWED = {"MIT", "Apache-2.0", "BSD-3-Clause", "ISC", "PSF-2.0", "CC0-1.0"}
 
 
-def _this_checkout_policy() -> cl.Policy:
-    """The licence policy of the repository these tests live in.
-
-    A policy is a statement about one environment, so it belongs to a
-    checkout rather than to the package: the development tree carries one,
-    a published tree does not, and neither does a user's clone. Skip where
-    there is none — the assertions below have no subject there, and a test
-    that fails for the absence of a file it never shipped is a test that
-    tells a contributor their checkout is broken when it is not.
-    """
-    root = Path(__file__).resolve().parent.parent
-    try:
-        return cl.load_policy(root=root)
-    except FileNotFoundError:
-        pytest.skip("this checkout declares no licence policy")
-
-
 # --- the substring bug this module exists to remove ------------------------
 
 
@@ -487,7 +470,7 @@ def test_the_model_cannot_change_the_verdict(tmp_path: Path) -> None:
     # ... and the verdict is untouched.
     assert cl.resolve(dist).spdx == "GPL-3.0"
     policy = cl.Policy(allowed=ALLOWED, pins=())
-    ok, bad = cl.check([dist], policy)
+    ok, bad = cl.audit([dist], policy)
     assert not ok and len(bad) == 1
 
 
@@ -542,7 +525,7 @@ def test_a_pin_is_not_order_sensitive() -> None:
     dist = _FakeDist(
         _FakeMeta({"Name": "p", "Version": "1", "License": "MPL-2.0 AND MIT"})
     )
-    ok, bad = cl.check([dist], policy)
+    ok, bad = cl.audit([dist], policy)
     assert not bad and len(ok) == 1
 
 
@@ -555,7 +538,7 @@ def test_a_pin_still_fails_when_the_set_of_terms_changes() -> None:
     dist = _FakeDist(
         _FakeMeta({"Name": "p", "Version": "1", "License": "GPL-3.0 AND MIT"})
     )
-    ok, bad = cl.check([dist], policy)
+    ok, bad = cl.audit([dist], policy)
     assert not ok and len(bad) == 1
 
 
@@ -640,7 +623,7 @@ def test_unidentifiable_fails_rather_than_defaulting_permissive() -> None:
     dist = _FakeDist(_FakeMeta({"Name": "p", "Version": "1"}))
     res = cl.resolve(dist)
     assert res.spdx == cl.UNIDENTIFIED
-    _, bad = cl.check([dist], cl.Policy(allowed=ALLOWED, pins=()))
+    _, bad = cl.audit([dist], cl.Policy(allowed=ALLOWED, pins=()))
     assert len(bad) == 1
 
 
@@ -658,7 +641,7 @@ def test_pin_accepts_the_verified_license() -> None:
             ["License :: OSI Approved :: Mozilla Public License 2.0 (MPL 2.0)"],
         )
     )
-    ok, bad = cl.check([dist], policy)
+    ok, bad = cl.audit([dist], policy)
     assert len(ok) == 1 and not bad
 
 
@@ -675,7 +658,7 @@ def test_pin_fails_when_upstream_relicenses() -> None:
             ["License :: OSI Approved :: GNU General Public License (GPL)"],
         )
     )
-    ok, bad = cl.check([dist], policy)
+    ok, bad = cl.audit([dist], policy)
     assert not ok
     assert "upstream license may have changed" in bad[0].why
 
@@ -687,24 +670,6 @@ def test_pin_patterns_glob() -> None:
     )
     assert policy.pin_for("nvidia-cublas") is not None
     assert policy.pin_for("numpy") is None
-
-
-def test_shipped_policy_loads_and_covers_this_environment() -> None:
-    """The real policy, from .vibe-sentinel.toml, against the real env."""
-    import importlib.metadata as md
-
-    policy = _this_checkout_policy()
-    ok, bad = cl.check(list(md.distributions()), policy)
-    assert not bad, [f"{v.resolved.name}: {v.why}" for v in bad]
-    assert ok
-
-
-def test_policy_allows_no_copyleft_without_a_pin() -> None:
-    policy = _this_checkout_policy()
-    for banned in ("GPL-3.0", "AGPL-3.0", "LGPL-3.0", "MPL-2.0"):
-        assert not cl.evaluate_expression(banned, policy.allowed, policy.exceptions), (
-            f"{banned} must not be in allowed_spdx — pin it per-package instead"
-        )
 
 
 # --- categories ------------------------------------------------------------
@@ -944,7 +909,7 @@ def test_a_config_can_teach_the_resolver_a_licence(tmp_path: Path) -> None:
         tmp_path / "d",
         {"LICENSE": "ACME CORPORATION INTERNAL SOURCE LICENCE\nInternal use only."},
     )
-    ok, bad = cl.check([dist], policy)
+    ok, bad = cl.audit([dist], policy)
     assert not bad and len(ok) == 1
     assert ok[0].spdx == "LicenseRef-Acme-Internal"
 
@@ -959,7 +924,7 @@ def test_a_custom_fingerprint_cannot_hide_a_copyleft_term(tmp_path: Path) -> Non
         tmp_path / "d",
         {"LICENSE": "ACME CORPORATION INTERNAL SOURCE LICENCE\n" + GPL_TEXT},
     )
-    ok, bad = cl.check([dist], policy)
+    ok, bad = cl.audit([dist], policy)
     assert not ok and len(bad) == 1
     assert bad[0].resolved.spdx == "GPL-3.0 AND LicenseRef-Acme-Internal"
 
@@ -1036,7 +1001,7 @@ def test_guidance_cannot_move_a_verdict(tmp_path: Path) -> None:
     )
     policy = cl.load_policy(root=tmp_path)
     dist = _FilesDist(tmp_path / "d", {"LICENSE": GPL_TEXT})
-    ok, bad = cl.check([dist], policy)
+    ok, bad = cl.audit([dist], policy)
     assert not ok and len(bad) == 1
 
 
@@ -1191,17 +1156,6 @@ def test_project_licence_is_identified(tmp_path: Path) -> None:
 
 def test_absent_project_licence_is_none(tmp_path: Path) -> None:
     assert cl.project_license(tmp_path) is None
-
-
-def test_this_repo_is_mit_and_carries_no_foreign_headers() -> None:
-    root = Path(__file__).resolve().parent.parent
-    own = cl.project_license(root)
-    assert own is not None and own.spdx == "MIT"
-    policy = _this_checkout_policy()
-    for found in cl.scan_source(root):
-        assert cl.evaluate_expression(found.spdx, policy.allowed, policy.exceptions), (
-            f"{found.path} carries {found.spdx}, which the policy does not accept"
-        )
 
 
 # --- what the shipped example hands a new user -----------------------------

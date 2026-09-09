@@ -37,36 +37,64 @@ from typing import Any
 
 #: Directories no probe measures, whatever root it is pointed at.
 #:
+#: Directories that are not this project's own source. **The one
+#: definition.** Every walk in this package reads it — the probes here,
+#: and the three gates, each of which used to keep its own copy. The four
+#: copies said the same thing in four different ways and had drifted to 18,
+#: 15, 22 and 11 entries: `env` was known to one of them, so a project laid
+#: out by `python -m venv env` had every probe measuring its own
+#: virtualenv, and `site-packages` was missing from the licence walk. They
+#: share no text, so no duplicate-code check could see it. See CLAUDE.md,
+#: "A fact has one owner".
+#:
 #: Not a convenience. A probe told to measure ``.`` in a project with a
 #: virtualenv at the root will otherwise walk it, and dependency source
 #: outnumbers project source by two orders of magnitude — this repository
 #: baselined 3,143 ``.venv`` observations against 74 of its own before
 #: this list existed. The result is not merely noisy: every dependency
 #: upgrade then reads as structural drift in *your* codebase, which is
-#: the one thing these numbers must never say.
+#: the one thing these numbers must never say. The gates have their own
+#: version of the same harm: dependency source read as your imports, every
+#: vendored key reported as yours, a third party's licence header
+#: attributed to you.
 #:
 #: Matched on directory name at any depth, so ``src/node_modules`` goes
 #: too. A project that genuinely keeps source in a directory named
-#: ``build`` should point ``SOURCE_ROOT`` at it directly.
+#: ``build`` should point ``SOURCE_ROOT`` at it directly. A caller needing
+#: more than this writes ``EXCLUDED_DIRS | {"extra"}`` at its own site,
+#: with the reason — a second whole copy is what this replaced.
 EXCLUDED_DIRS: frozenset[str] = frozenset(
     {
+        # version control
         ".git",
         ".hg",
         ".svn",
+        # environments and installed dependencies
         ".venv",
         "venv",
+        "env",
+        "site-packages",
         ".tox",
         ".nox",
-        "site-packages",
+        # vendored dependencies
         "node_modules",
+        "bower_components",
+        "vendor",
+        # caches
         "__pycache__",
         ".mypy_cache",
         ".ruff_cache",
         ".pytest_cache",
         ".ipynb_checkpoints",
+        ".gradle",
+        ".terraform",
+        # build output
         "build",
         "dist",
         ".eggs",
+        ".next",
+        ".nuxt",
+        # ours
         ".vibe-sentinel",
     }
 )

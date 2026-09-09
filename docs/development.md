@@ -34,6 +34,19 @@ layout conventions ruff cannot express. They live in the development repository,
 so a contribution is judged on the three checks above and a rule violation comes
 back as review feedback rather than as a check you cannot run.
 
+The evals are separate, and deliberately not a check:
+
+```bash
+python -m evals all --mechanical   # triage, the credential patterns, the pairing
+python -m evals                    # everything, against your backend
+```
+
+A test asserts a behaviour and fails; an eval reports a **rate** over a labelled
+corpus, and a rate is a number rather than a verdict. Nothing in them fails a
+build. Run them when you change a rule set, a prompt, or a token budget — those
+are the things whose effect only shows up as a rate. [Evals](evals.md) has the
+corpora, what each suite measures, and how to add a case.
+
 ## Is it a probe, a gate, or a lens?
 
 Ask what the finding *is*, not what it looks at.
@@ -98,6 +111,9 @@ journal and most of the safety gate match command text. The shipped probes
 that parse code (`commentary-ratio`, `module-organization`,
 `silent-exceptions`) and the `licenses` and `packages` gates are Python-only,
 and so is the `undeclared-install` danger, which reads `pyproject.toml`;
+a danger may instead carry `requires`, naming one file that must be at the root
+for it to apply at all — which is how the npm entries stay out of a Python
+repository's set rather than sitting in it unable to match;
 `pattern-census` covers any language ast-grep supports, and `file-length` and
 `credentials` parse nothing. `dependency-versions` is Python-only for a
 different reason — it parses no code at all, but reads the installed set

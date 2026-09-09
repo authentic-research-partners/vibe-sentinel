@@ -518,13 +518,16 @@ def test_suppress_counts_the_same_as_except_pass(tmp_path: Path) -> None:
 def test_a_directory_that_discards_nothing_gets_no_key(tmp_path: Path) -> None:
     """So the layer that starts discarding errors reports an `appeared`
     rather than a move from zero: that it began at all is the finding.
-    The tree-wide total is reported anyway — it is the series that has to
-    stay continuous to be worth a trend."""
+    The two tree-wide keys are reported anyway — they are the series that
+    have to stay continuous to be worth a trend."""
     payload = _handlers(
         tmp_path,
         "def f():\n    try:\n        go()\n    except OSError:\n        raise\n",
     )
-    assert [o["key"] for o in _measurements(payload)] == ["silent-total"]
+    assert [o["key"] for o in _measurements(payload)] == [
+        "silent-total",
+        "silent-share-total",
+    ]
     assert _total(payload)["value"] == 0.0
 
 
@@ -752,6 +755,64 @@ def test_a_tree_of_nothing_but_binaries_is_the_never_taken_measurement(
 
     assert result.returncode == 2
     assert "UTF-8 text" in result.stderr
+
+
+def test_a_binary_is_measured_in_bytes(tmp_path: Path) -> None:
+    """A PNG has a size. That is the whole of what is defined for it, and
+    it is what a project watching the weight of what it ships wants."""
+    root = _tree(tmp_path, {})
+    blob = b"\x89PNG\r\n" + b"\x00" * 500
+    (root / "logo.png").write_bytes(blob)
+
+    payload = _length(root, "images=*.png", "--unit", "bytes")
+
+    assert _values(payload, "bytes:") == {
+        f"{root.as_posix()}/logo.png": float(len(blob))
+    }
+
+
+def test_a_binary_carries_no_line_or_word_count(tmp_path: Path) -> None:
+    """Counting either would be inventing a number, and an attribute is
+    read as a measurement that was taken."""
+    root = _tree(tmp_path, {"notes.md": "one two\n"})
+    (root / "logo.png").write_bytes(b"\x89PNG\r\n\xff")
+
+    payload = _length(root, "images=*.png; docs=*.md", "--unit", "bytes")
+    attrs = {
+        Path(o["key"].removeprefix("bytes:")).name: o["attrs"]
+        for o in payload["observations"]
+        if o["key"].startswith("bytes:")
+    }
+
+    assert set(attrs["logo.png"]) == {"category", "bytes"}
+    assert set(attrs["notes.md"]) == {"category", "lines", "words", "bytes"}
+
+
+@pytest.mark.parametrize("unit", ["lines", "words"])
+def test_a_binary_is_still_skipped_under_any_other_unit(
+    tmp_path: Path, unit: str
+) -> None:
+    """`bytes` is the exception, not a general widening."""
+    root = _tree(tmp_path, {"notes.md": "one two\n"})
+    (root / "logo.png").write_bytes(b"\x89PNG\r\n\xff")
+
+    result = run_probe_raw(
+        "length",
+        [
+            "--root",
+            str(root),
+            "--categories",
+            "images=*.png; docs=*.md",
+            "--unit",
+            unit,
+        ],
+    )
+
+    assert result.returncode == 0
+    assert _values(json.loads(result.stdout), f"{unit}:").keys() == {
+        f"{root.as_posix()}/notes.md"
+    }
+    assert "--unit bytes" in result.stderr, "the skip note names the remedy"
 
 
 def test_length_never_measures_a_virtualenv(tmp_path: Path) -> None:
@@ -1072,3 +1133,112 @@ def test_origin_says_unrecorded_when_nothing_could_have_said_otherwise() -> None
 
     assert origin_of("", recorded=False)[0] == "unrecorded"
     assert origin_of("", recorded=True)[0] == "index"
+
+
+def test_every_walk_in_the_package_skips_the_same_directories(
+    tmp_path: Path,
+) -> None:
+    """One definition of what is not source, and four callers reading it.
+
+    Behavioural on purpose. Asserting ``credentials.SKIP_DIRS is
+    EXCLUDED_DIRS`` would still pass the day somebody writes
+    ``SKIP_DIRS = EXCLUDED_DIRS | {...}`` and stops descending by their
+    own rule, and it would not have caught the bug this replaces: four
+    copies of the same fact, 18, 15, 22 and 11 entries, sharing no text.
+    ``env`` was in one of them, so a project laid out by ``python -m venv
+    env`` had every probe measuring its own virtualenv; ``site-packages``
+    was missing from the licence walk.
+
+    So this plants what each walker is looking for inside directories that
+    are not this project's source, and asserts that none of them comes
+    back with it.
+    """
+    from vibe_sentinel import credentials as creds
+    from vibe_sentinel import licenses, packages
+    from vibe_sentinel.probes import iter_source_files
+
+    intruder = (
+        "# SPDX-License-Identifier: GPL-3.0\n"
+        "import requests\n"
+        'DATABASE_PASSWORD = "Tr7pQz2wLx9mKv4d"\n'
+    )
+    for directory in ("env", "site-packages", "vendor", ".terraform", ".next"):
+        planted = tmp_path / directory
+        planted.mkdir()
+        (planted / "dep.py").write_text(intruder, encoding="utf-8")
+
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "app.py").write_text("import httpx\n", encoding="utf-8")
+
+    # the probes' own walk
+    assert [p.name for p in iter_source_files(tmp_path, "*.py")] == ["app.py"]
+
+    # provenance: dependency source must not be read as this project's imports
+    assert {i.module for i in packages.source_imports(tmp_path)} == {"httpx"}
+
+    # licences: a vendored GPL header is not this project's licence
+    assert licenses.scan_source(tmp_path) == []
+
+    # credentials: a key in a dependency is not a key in this tree
+    scan = creds.search(tmp_path, creds.builtin_secrets(), creds.Policy())
+    assert [c.path for c in scan.candidates] == []
+
+
+def test_the_share_is_a_key_and_not_only_an_attr(tmp_path: Path) -> None:
+    """A question about a proportion cannot be answered from a count.
+
+    The probe's own subject is the proportion — "discards a fifth of what
+    it catches" — and it reported one only in prose. A lens asking whether
+    the share was rising was handed `before=14 after=16` with the
+    denominator inside the label, and believed the two numbers; three
+    rewordings of the question did not change that, and giving the ratio a
+    value of its own did. So a directory that grew while discarding
+    proportionally less shows a count that grew beside a share that fell.
+    """
+    two_of_three = (
+        "def f():\n    try:\n        go()\n    except OSError:\n        pass\n"
+        "def g():\n    try:\n        go()\n    except OSError:\n        pass\n"
+        "def h():\n    try:\n        go()\n    except OSError:\n        raise\n"
+    )
+    payload = _handlers(tmp_path, two_of_three)
+    keyed = {o["key"]: o for o in payload["observations"]}
+
+    share = next(v for k, v in keyed.items() if k.startswith("silent-share:"))
+    count = next(v for k, v in keyed.items() if k.startswith("silent-in:"))
+    assert count["value"] == 2.0
+    assert share["value"] == pytest.approx(2 / 3, abs=1e-4)
+    assert "66.7%" in share["label"]
+    assert keyed["silent-share-total"]["value"] == pytest.approx(2 / 3, abs=1e-4)
+
+
+def test_the_summary_counts_directories_and_not_observations(tmp_path: Path) -> None:
+    """ "across N of M directories" counts directories, and M bounds N.
+
+    It was `len(observations) - 1`, which was right while a directory
+    contributed exactly one entry and the tree-wide total was the only
+    other one. `silent-share:<dir>` gave every reporting directory a
+    second entry and `silent-share-total` a second total, so the count
+    became observations rather than directories and the probe printed
+    "across 7 of 3 directories" — a number larger than its own
+    denominator, on every scan, in a summary a reader is meant to trust.
+
+    Asserted on a tree where the two differ: three directories, one of
+    which discards nothing and so carries no key at all.
+    """
+    silent = "def f():\n    try:\n        go()\n    except OSError:\n        pass\n"
+    clean = "def g():\n    try:\n        go()\n    except OSError:\n        raise\n"
+    for directory, body in (("a", silent), ("b", silent), ("c", clean)):
+        pkg = tmp_path / directory
+        pkg.mkdir()
+        (pkg / "m.py").write_text(body, encoding="utf-8")
+
+    payload = run_probe_module("handlers", ["--root", str(tmp_path)])
+    summary = payload["summary"]
+
+    # Two of the three discard; the third carries no `silent-in:` key.
+    assert "across 2 of 3 directories" in summary, summary
+    reporting = sum(
+        1 for o in payload["observations"] if str(o["key"]).startswith("silent-in:")
+    )
+    assert reporting == 2

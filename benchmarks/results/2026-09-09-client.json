@@ -1,0 +1,203 @@
+{
+  "environment": {
+    "cpu": "Intel(R) Core(TM) i7-14700",
+    "gpu": "NVIDIA RTX 4000 Ada Generation, 20475 MiB",
+    "max_tokens": 1024,
+    "model": "qwen3-8b-fp8",
+    "note": "vLLM 0.18.0 serving RedHatAI/Qwen3-8B-FP8-dynamic under podman: --kv-cache-dtype fp8 --max-model-len 40960 --max-num-seqs 256 --max-num-batched-tokens 8192 --gpu-memory-utilization 0.85; the engine reports a 98,064-token GPU KV cache, and one request of this shape occupies about 2,300 of them, so the cache runs out somewhere past 40 concurrent. Widths 1 and 2 are omitted deliberately: measured at 207.64s +-1.1% and 101.02s +-6.6% over 16 requests, they cost two thirds of the runtime to re-confirm, so the baseline here is the shipped default of 4",
+    "python": "3.13.2",
+    "served": "serving: qwen3-8b-fp8",
+    "structured_output": "json_schema",
+    "temperature": 0.2,
+    "when": "2026-09-09"
+  },
+  "repeat": 3,
+  "requests": 16,
+  "suites": [
+    {
+      "id": "client",
+      "measurements": [
+        {
+          "id": "own",
+          "label": "a fresh client per call (what llm_query does)",
+          "passes": [
+            {
+              "answered": 16,
+              "latencies": [
+                7.1036623870004405,
+                8.378531134001605,
+                11.166249030000472,
+                13.008691639999597,
+                10.526193088000582,
+                10.82623611499912,
+                10.660865896999894,
+                16.93098480000117,
+                10.005648164999002,
+                9.737236577999283,
+                12.184891873999732,
+                13.813770061999094,
+                14.619837249001648,
+                12.961987930999385,
+                11.748572877999322,
+                19.545862080000006
+              ],
+              "preemptions": 0,
+              "prefix_hits": 21504,
+              "prefix_queries": 21734,
+              "seconds": 55.41078229099912,
+              "truncated": 0,
+              "unanswered": 0
+            },
+            {
+              "answered": 16,
+              "latencies": [
+                8.294939202000023,
+                11.605441334000716,
+                13.066400374000295,
+                13.22868204400038,
+                12.240864583000075,
+                9.198628887999803,
+                14.376644680000027,
+                14.805406707000657,
+                7.973111459999927,
+                16.300612147999345,
+                9.909085240000422,
+                11.625382076999813,
+                10.305470899998909,
+                9.676212034000855,
+                23.338517424999736,
+                14.12714722400051
+              ],
+              "preemptions": 0,
+              "prefix_hits": 21504,
+              "prefix_queries": 21744,
+              "seconds": 52.56692576000023,
+              "truncated": 0,
+              "unanswered": 0
+            },
+            {
+              "answered": 16,
+              "latencies": [
+                8.07396717300071,
+                8.845062812000833,
+                7.043208271999902,
+                15.594590145999973,
+                16.371313400999497,
+                11.261509265999848,
+                9.05569469999864,
+                9.808239231999323,
+                11.938907305000612,
+                9.462145633000546,
+                9.911275886001022,
+                8.724735623000015,
+                18.281336977001047,
+                9.736920434999774,
+                8.936423993000062,
+                14.396360164000725
+              ],
+              "preemptions": 0,
+              "prefix_hits": 21504,
+              "prefix_queries": 21744,
+              "seconds": 48.5088975460003,
+              "truncated": 0,
+              "unanswered": 0
+            }
+          ],
+          "requests": 16,
+          "width": 4
+        },
+        {
+          "id": "shared",
+          "label": "one client for the whole fan-out",
+          "passes": [
+            {
+              "answered": 16,
+              "latencies": [
+                9.794489629999589,
+                11.9010809779993,
+                12.536824193999564,
+                12.56643770700066,
+                8.840780238000661,
+                14.111069380000117,
+                11.46366290900005,
+                16.157535005000682,
+                9.347003830000176,
+                9.725446571001157,
+                7.57018298299954,
+                14.909783289998813,
+                9.039083887999368,
+                14.363081126999532,
+                7.267607034998946,
+                9.650790773001063
+              ],
+              "preemptions": 0,
+              "prefix_hits": 21504,
+              "prefix_queries": 21734,
+              "seconds": 48.46682213400163,
+              "truncated": 0,
+              "unanswered": 0
+            },
+            {
+              "answered": 16,
+              "latencies": [
+                8.021512993000215,
+                8.39637528700041,
+                9.846481173000939,
+                14.89689660499971,
+                9.612169433999952,
+                12.560852906000946,
+                12.23308984599862,
+                16.2930568519987,
+                21.685738533000404,
+                12.23038697300035,
+                8.890209122999295,
+                8.400556622000295,
+                13.794347385999572,
+                9.8574354400007,
+                12.245695171999614,
+                24.57418868000059
+              ],
+              "preemptions": 0,
+              "prefix_hits": 21504,
+              "prefix_queries": 21744,
+              "seconds": 57.38762582399977,
+              "truncated": 0,
+              "unanswered": 0
+            },
+            {
+              "answered": 16,
+              "latencies": [
+                9.497713722999833,
+                9.631521961000544,
+                10.545153394999943,
+                11.697473337999327,
+                7.22424101300021,
+                7.849353732000964,
+                10.890901971999483,
+                12.884805171999687,
+                9.898756045999107,
+                8.549414647000958,
+                8.401422112001455,
+                9.313414487000045,
+                9.657993273000102,
+                14.37976273700042,
+                16.10623570899952,
+                12.499476044000403
+              ],
+              "preemptions": 0,
+              "prefix_hits": 21504,
+              "prefix_queries": 21744,
+              "seconds": 44.19622773899937,
+              "truncated": 0,
+              "unanswered": 0
+            }
+          ],
+          "requests": 16,
+          "width": 4
+        }
+      ],
+      "note": "16 requests per pass at width 4, one shared prefix. Constructing one httpx.AsyncClient measured at 11.0 ms on this machine \u2014 the cost the fresh-client arm pays per request.",
+      "question": "Is a client per call costing anything measurable?"
+    }
+  ]
+}

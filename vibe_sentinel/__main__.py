@@ -5,24 +5,28 @@ Surfaces:
 - ``scan``       — run the probes, record the structure, report drift.
 - ``history``    — list recorded runs, or show one in detail.
 - ``trend``      — the recorded history, fitted: slopes and anomalies.
-- ``parameters`` — what the model chose for a probe's placeholders.
+- ``parameters`` — the values a probe's placeholders were filled with.
 - ``migrate``    — update the history database's schema.
 - ``backups``    — list every copy of the database, however it was made.
 - ``db``         — size, health, backup, prune, vacuum the history file.
 - ``hook``       — record one agent tool call; install the hook.
 - ``commands``   — what the coding agent ran, and which actor ran it.
+- ``credentials``— passwords and keys sitting at rest in the tree.
 - ``safety``     — verdicts on those commands, or try the gate on one.
 - ``licenses``   — check dependency licences against the policy.
 - ``packages``   — check dependency provenance: does it exist, who added it.
 - ``backend``    — start, stop, or check the model server.
 
-Command implementations live in :mod:`vibe_sentinel.cli`.
+Command implementations live in :mod:`vibe_sentinel.cli`. This module is
+the surface itself: one ``_add_*`` builder per command, listed once in
+:data:`COMMANDS`, which is the order ``--help`` prints them in.
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -32,6 +36,13 @@ from vibe_sentinel import __version__
 
 if TYPE_CHECKING:
     from vibe_sentinel.config import SentinelConfig
+
+    #: What ``add_subparsers()`` hands back. Named because every builder
+    #: below takes one and the spelling is longer than the parameter it
+    #: annotates. Type-checking only: ``_SubParsersAction`` is generic to
+    #: the stubs and not subscriptable at runtime, and every annotation
+    #: here is a string anyway (``from __future__ import annotations``).
+    Subparsers = argparse._SubParsersAction[argparse.ArgumentParser]
 
 
 def _setup_logging(config: SentinelConfig) -> None:
@@ -49,22 +60,27 @@ def _setup_logging(config: SentinelConfig) -> None:
     )
 
 
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="vibe-sentinel",
-        description=(
-            "Guards structural expectations about how a codebase is "
-            "organized, and reports drift."
-        ),
-    )
-    parser.add_argument(
-        "--version", action="version", version=f"vibe-sentinel {__version__}"
-    )
-    sub = parser.add_subparsers(dest="command")
+def _command(
+    sub: argparse._SubParsersAction[argparse.ArgumentParser],
+    name: str,
+    help: str,
+) -> argparse.ArgumentParser:
+    """Register one subcommand, with its one-line help used twice.
 
-    # --- scan ---
-    p_scan = sub.add_parser(
-        "scan", help="Run the probes, record the structure, report drift"
+    argparse keeps ``help`` and ``description`` apart and fills in neither
+    from the other: ``help`` is the line the parent listing shows, and
+    ``description`` is the sentence ``vibe-sentinel <name> --help`` prints
+    above the flags. A command declared with only ``help`` therefore has a
+    sub-help that names every option and never says what the command is
+    for — which is what happened to all fourteen of them. Declaring a
+    subcommand any other way is what ``test_cli_help.py`` refuses.
+    """
+    return sub.add_parser(name, help=help, description=help)
+
+
+def _add_scan(sub: Subparsers) -> None:
+    p_scan = _command(
+        sub, "scan", help="Run the probes, record the structure, report drift"
     )
     p_scan.add_argument(
         "root",
@@ -112,16 +128,19 @@ def _build_parser() -> argparse.ArgumentParser:
         "exit code and moves no baseline.",
     )
     p_scan.add_argument(
-        "--no-model",
-        action="store_true",
-        help="Skip the local model entirely: fill placeholders from their "
-        "declared defaults and report drift without the significance "
-        "analysis. The path for CI or a machine with no GPU.",
-    )
-    p_scan.add_argument(
         "--list-probes",
         action="store_true",
-        help="Print the active probe set and exit.",
+        help="Print the active probe set — the built-ins, whatever this "
+        "project declares on top, the values each will run with, and which "
+        "file every declared one came from. Then exit without scanning.",
+    )
+    p_scan.add_argument(
+        "--list-lenses",
+        action="store_true",
+        help="Print the active lens set — what each question asks, which "
+        "probes it watches, and which file declared it. A lens is only put "
+        "to the model when the probes it watches moved, so this is where to "
+        "look when one is never answered. Then exit without scanning.",
     )
     p_scan.add_argument(
         "--print-example",
@@ -145,8 +164,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_scan.add_argument("--config", help="Path to .vibe-sentinel.toml")
 
-    # --- history ---
-    p_hist = sub.add_parser("history", help="List recorded runs, or show one")
+
+def _add_history(sub: Subparsers) -> None:
+    p_hist = _command(sub, "history", help="List recorded runs, or show one")
     p_hist.add_argument("root", nargs="?", default=None, help="Project root")
     p_hist.add_argument("--run", type=int, default=None, help="Show this run in detail")
     p_hist.add_argument("--limit", type=int, default=20, help="Runs to list")
@@ -155,8 +175,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_hist.add_argument("--config", help="Path to .vibe-sentinel.toml")
 
-    # --- trend ---
-    p_trend = sub.add_parser(
+
+def _add_trend(sub: Subparsers) -> None:
+    p_trend = _command(
+        sub,
         "trend",
         help="Fit the recorded history — slopes, whether they mean "
         "anything, and points that left their own trend",
@@ -192,19 +214,24 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_trend.add_argument("--config", help="Path to .vibe-sentinel.toml")
 
-    # --- parameters ---
-    p_params = sub.add_parser(
+
+def _add_parameters(sub: Subparsers) -> None:
+    p_params = _command(
+        sub,
         "parameters",
-        help="What the model chose for a probe's placeholders, per run",
+        help="The values a probe's placeholders were filled with, per run",
     )
     p_params.add_argument("probe", help="Probe id")
     p_params.add_argument("root", nargs="?", default=None, help="Project root")
-    p_params.add_argument("--limit", type=int, default=20)
+    p_params.add_argument(
+        "--limit", type=int, default=20, help="Runs to list (default: 20)"
+    )
     p_params.add_argument("--config", help="Path to .vibe-sentinel.toml")
 
-    # --- migrate ---
-    p_migrate = sub.add_parser(
-        "migrate", help="Update the history database to this build's schema"
+
+def _add_migrate(sub: Subparsers) -> None:
+    p_migrate = _command(
+        sub, "migrate", help="Update the history database to this build's schema"
     )
     p_migrate.add_argument("root", nargs="?", default=None, help="Project root")
     p_migrate.add_argument(
@@ -215,36 +242,46 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_migrate.add_argument("--config", help="Path to .vibe-sentinel.toml")
 
-    # --- backups ---
-    p_backups = sub.add_parser(
-        "backups", help="List database backups left by migrations"
+
+def _add_backups(sub: Subparsers) -> None:
+    p_backups = _command(
+        sub, "backups", help="List database backups left by migrations"
     )
     p_backups.add_argument("root", nargs="?", default=None, help="Project root")
     p_backups.add_argument("--config", help="Path to .vibe-sentinel.toml")
 
-    # --- db ---
-    p_db = sub.add_parser(
+
+def _add_db(sub: Subparsers) -> None:
+    p_db = _command(
+        sub,
         "db",
         help="Size, health, backup and retention for the history database",
     )
     db_sub = p_db.add_subparsers(dest="db_action")
 
-    p_dbstatus = db_sub.add_parser(
-        "status", help="What the database weighs, and when it was last checked"
+    p_dbstatus = _command(
+        db_sub, "status", help="What the database weighs, and when it was last checked"
     )
     p_dbstatus.add_argument("root", nargs="?", default=None, help="Project root")
     p_dbstatus.add_argument("--config", help="Path to .vibe-sentinel.toml")
 
-    p_dbcheck = db_sub.add_parser(
+    p_dbcheck = _command(
+        db_sub,
         "check",
         help="Run the health check now and record it. Exit 1 when something "
         "needs attention.",
     )
     p_dbcheck.add_argument("root", nargs="?", default=None, help="Project root")
-    p_dbcheck.add_argument("--format", choices=["terminal", "json"], default=None)
+    p_dbcheck.add_argument(
+        "--format",
+        choices=["terminal", "json"],
+        default=None,
+        help="Output format (default: terminal)",
+    )
     p_dbcheck.add_argument("--config", help="Path to .vibe-sentinel.toml")
 
-    p_dbbackup = db_sub.add_parser(
+    p_dbbackup = _command(
+        db_sub,
         "backup",
         help="Copy the database, safely, while it may be in use",
     )
@@ -258,7 +295,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_dbbackup.add_argument("--config", help="Path to .vibe-sentinel.toml")
 
-    p_dbprune = db_sub.add_parser(
+    p_dbprune = _command(
+        db_sub,
         "prune",
         help="Delete records older than a cutoff. Counts them unless --apply.",
     )
@@ -303,7 +341,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_dbprune.add_argument("--config", help="Path to .vibe-sentinel.toml")
 
-    p_dbvacuum = db_sub.add_parser(
+    p_dbvacuum = _command(
+        db_sub,
         "vacuum",
         help="Rewrite the file compactly to reclaim deleted pages, then "
         "refresh the query planner's statistics. Backs up first.",
@@ -311,16 +350,18 @@ def _build_parser() -> argparse.ArgumentParser:
     p_dbvacuum.add_argument("root", nargs="?", default=None, help="Project root")
     p_dbvacuum.add_argument("--config", help="Path to .vibe-sentinel.toml")
 
-    p_dbreindex = db_sub.add_parser(
-        "reindex", help="Recreate any declared index the database is missing"
+    p_dbreindex = _command(
+        db_sub, "reindex", help="Recreate any declared index the database is missing"
     )
     p_dbreindex.add_argument("root", nargs="?", default=None, help="Project root")
     p_dbreindex.add_argument("--config", help="Path to .vibe-sentinel.toml")
 
     p_db.add_argument("--config", help="Path to .vibe-sentinel.toml")
 
-    # --- hook ---
-    p_hook = sub.add_parser(
+
+def _add_hook(sub: Subparsers) -> None:
+    p_hook = _command(
+        sub,
         "hook",
         help="Record one Claude Code tool call read from stdin, or install "
         "the PreToolUse hook that sends them",
@@ -356,8 +397,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_hook.add_argument("--config", help="Path to .vibe-sentinel.toml")
 
-    # --- commands ---
-    p_commands = sub.add_parser(
+
+def _add_commands(sub: Subparsers) -> None:
+    p_commands = _command(
+        sub,
         "commands",
         help="What the coding agent ran, and which session or subagent ran it",
     )
@@ -406,12 +449,21 @@ def _build_parser() -> argparse.ArgumentParser:
         help="The commands recorded between run N-1 and run N — what the "
         "agent was doing while that scan's drift appeared",
     )
-    p_commands.add_argument("--limit", type=int, default=50)
-    p_commands.add_argument("--format", choices=["terminal", "json"], default=None)
+    p_commands.add_argument(
+        "--limit", type=int, default=50, help="Rows to list (default: 50)"
+    )
+    p_commands.add_argument(
+        "--format",
+        choices=["terminal", "json"],
+        default=None,
+        help="Output format (default: terminal)",
+    )
     p_commands.add_argument("--config", help="Path to .vibe-sentinel.toml")
 
-    # --- licenses ---
-    p_lic = sub.add_parser(
+
+def _add_licenses(sub: Subparsers) -> None:
+    p_lic = _command(
+        sub,
         "licenses",
         help="Check dependency licences against security/license-policy.toml",
     )
@@ -437,18 +489,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "draft pin. Diagnostic: it reports the same verdict the gate would.",
     )
     p_lic.add_argument(
-        "--no-model",
-        action="store_true",
-        dest="no_model",
-        help="Skip the model when explaining. The chain itself never uses one.",
-    )
-    p_lic.add_argument(
         "-v", "--verbose", action="store_true", help="List every resolved package"
     )
     p_lic.add_argument("--config", help="Path to .vibe-sentinel.toml")
 
-    # --- packages ---
-    p_pkg = sub.add_parser(
+
+def _add_packages(sub: Subparsers) -> None:
+    p_pkg = _command(
+        sub,
         "packages",
         help="Check dependency provenance: imports that resolve to nothing, "
         "packages nobody declared, names one edit apart",
@@ -465,14 +513,6 @@ def _build_parser() -> argparse.ArgumentParser:
         "publicly are sent.",
     )
     p_pkg.add_argument(
-        "--no-model",
-        action="store_true",
-        help="Skip the one question this gate asks: whether two installed "
-        "names an edit apart are two real packages or one misspelling. "
-        "Every other check is mechanical, and without this step a "
-        "near-miss stands rather than being settled — this is the CI path.",
-    )
-    p_pkg.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -480,20 +520,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_pkg.add_argument("--config", help="Path to .vibe-sentinel.toml")
 
-    # --- credentials ---
-    p_cred = sub.add_parser(
+
+def _add_credentials(sub: Subparsers) -> None:
+    p_cred = _command(
+        sub,
         "credentials",
         help="Check for passwords and keys sitting at rest: the files whose "
         "purpose is holding them, and the ones hardcoded into source",
     )
     p_cred.add_argument("root", nargs="?", default=None, help="Project root")
     p_cred.add_argument("--policy", default=None, help="Path to credential-policy.toml")
-    p_cred.add_argument(
-        "--no-model",
-        action="store_true",
-        help="Stop after the pattern match. Lists the candidates without "
-        "adjudicating any of them, and says so — this is the CI path.",
-    )
     p_cred.add_argument(
         "--home",
         action="store_true",
@@ -510,8 +546,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_cred.add_argument("--config", help="Path to .vibe-sentinel.toml")
 
-    # --- safety ---
-    p_safety = sub.add_parser(
+
+def _add_safety(sub: Subparsers) -> None:
+    p_safety = _command(
+        sub,
         "safety",
         help="Recorded verdicts on the agent's commands, or try the gate on one",
     )
@@ -550,35 +588,33 @@ def _build_parser() -> argparse.ArgumentParser:
         help="With --check, print exactly what the model is asked",
     )
     p_safety.add_argument(
-        "--no-model",
-        action="store_true",
-        dest="no_model",
-        help="With --check, stop after triage",
-    )
-    p_safety.add_argument(
         "--verdict",
         choices=["safe", "unclear", "unsafe", "unreviewed"],
         default=None,
         help="List only verdicts of this kind",
     )
     p_safety.add_argument("--session", default=None, help="Claude Code session id")
-    p_safety.add_argument("--limit", type=int, default=50)
+    p_safety.add_argument(
+        "--limit", type=int, default=50, help="Verdicts to list (default: 50)"
+    )
     p_safety.add_argument("--config", help="Path to .vibe-sentinel.toml")
 
-    # --- backend ---
-    p_backend = sub.add_parser(
+
+def _add_backend(sub: Subparsers) -> None:
+    p_backend = _command(
+        sub,
         "backend",
         help="Start, stop, or check the model backend (any OpenAI-compatible server)",
     )
     backend_sub = p_backend.add_subparsers(dest="backend_action")
 
-    p_bstatus = backend_sub.add_parser(
-        "status", help="Check the endpoint and show what it serves"
+    p_bstatus = _command(
+        backend_sub, "status", help="Check the endpoint and show what it serves"
     )
     p_bstatus.add_argument("--config", help="Path to .vibe-sentinel.toml")
 
-    p_bstart = backend_sub.add_parser(
-        "start", help="Run [llm] start_command and wait for the endpoint"
+    p_bstart = _command(
+        backend_sub, "start", help="Run [llm] start_command and wait for the endpoint"
     )
     p_bstart.add_argument(
         "--no-wait",
@@ -589,9 +625,76 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_bstart.add_argument("--config", help="Path to .vibe-sentinel.toml")
 
-    p_bstop = backend_sub.add_parser("stop", help="Run [llm] stop_command")
+    p_bstop = _command(backend_sub, "stop", help="Run [llm] stop_command")
     p_bstop.add_argument("--config", help="Path to .vibe-sentinel.toml")
 
+    p_bmonitor = _command(
+        backend_sub,
+        "monitor",
+        help="Watch what the backend is doing — queue depth, KV cache, "
+        "prefix-cache hits, answers cut off at the token ceiling",
+    )
+    p_bmonitor.add_argument(
+        "--interval",
+        type=float,
+        default=2.0,
+        help="Seconds between ticks (default: 2.0)",
+    )
+    p_bmonitor.add_argument(
+        "--count",
+        type=int,
+        default=1,
+        help="Ticks to print, then stop (default: 1, a single snapshot). "
+        "The counters are cumulative, so two ticks tell you more than one; "
+        "give a large number and interrupt with Ctrl-C to watch a scan",
+    )
+    p_bmonitor.add_argument("--config", help="Path to .vibe-sentinel.toml")
+
+
+#: Every subcommand, in the order ``--help`` prints them. A command
+#: that is not here does not exist: there is one list, and adding to it
+#: is how a command is registered.
+COMMANDS: tuple[Callable[[Subparsers], None], ...] = (
+    _add_scan,
+    _add_history,
+    _add_trend,
+    _add_parameters,
+    _add_migrate,
+    _add_backups,
+    _add_db,
+    _add_hook,
+    _add_commands,
+    _add_licenses,
+    _add_packages,
+    _add_credentials,
+    _add_safety,
+    _add_backend,
+)
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    """The whole CLI surface, one builder per command.
+
+    Split because ``--help`` is the interface and 500 lines in one
+    function is where an option loses its ``help=`` unnoticed. The
+    order of :data:`COMMANDS` is the order ``vibe-sentinel --help``
+    lists them, so it is a decision rather than wherever a block
+    happened to be pasted.
+    """
+    parser = argparse.ArgumentParser(
+        prog="vibe-sentinel",
+        description=(
+            "Safeguards a codebase against the problems AI coding agents "
+            "introduce: structural drift, secrets at rest, unvetted "
+            "dependencies, and dangerous commands."
+        ),
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"vibe-sentinel {__version__}"
+    )
+    sub = parser.add_subparsers(dest="command")
+    for add in COMMANDS:
+        add(sub)
     return parser
 
 
@@ -616,23 +719,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(decision))
         return 0
 
-    from vibe_sentinel.cli import (
-        auto_check,
-        run_backend,
-        run_backups,
-        run_commands,
-        run_db,
-        run_history,
-        run_credentials,
-        run_licenses,
-        run_hook,
-        run_migrate,
-        run_packages,
-        run_parameters,
-        run_safety,
-        run_scan,
-        run_trend,
-    )
+    from vibe_sentinel.cli import auto_check, run_hook
 
     parser = _build_parser()
     args = parser.parse_args(arguments)
@@ -650,15 +737,53 @@ def main(argv: list[str] | None = None) -> int:
     # Imported here, not at module scope: `load_config` builds a pydantic
     # model, and the hook path above returns before ever needing one. That
     # import alone is ~30 ms of a hook invocation that does not use it.
-    from vibe_sentinel.config import load_config
+    from vibe_sentinel.cli import load_config_or_fail
+    from vibe_sentinel.exceptions import ConfigError
 
     config_arg = getattr(args, "config", None)
-    _setup_logging(load_config(Path(config_arg) if config_arg else None))
+    try:
+        _setup_logging(load_config_or_fail(Path(config_arg) if config_arg else None))
+    except ConfigError as e:
+        # No file sink yet — `_setup_logging` is the call that just failed —
+        # so this reaches loguru's default stderr handler and nothing else.
+        # Still the logger rather than `print`: stdout is the result channel,
+        # and an error is not a result.
+        logger.error(str(e))
+        return 2
 
     # Every command that is not itself about the database gets a health
     # check first — at most one a day, whatever the command. It writes to
     # stderr and cannot change what happens next: see cli.auto_check.
     auto_check(args)
+
+    # One catch for every handler's own `_load`. A command reads the config
+    # for the root it was pointed at, which is not the one read above — so
+    # `vibe-sentinel scan /other/project` finds the broken file here, and it
+    # is still a sentence naming the file rather than a traceback.
+    try:
+        return _dispatch(args, parser)
+    except ConfigError as e:
+        logger.error(str(e))
+        return 2
+
+
+def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """Route one parsed command to its handler."""
+    from vibe_sentinel.cli import (
+        run_backend,
+        run_backups,
+        run_commands,
+        run_credentials,
+        run_db,
+        run_history,
+        run_licenses,
+        run_migrate,
+        run_packages,
+        run_parameters,
+        run_safety,
+        run_scan,
+        run_trend,
+    )
 
     if args.command == "scan":
         return run_scan(args)

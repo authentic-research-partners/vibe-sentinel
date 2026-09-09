@@ -109,7 +109,7 @@ longer horizons, each against the newest run at least that old:
 ```
 No change since 2026-08-31T09:14:02+00:00.
 
-Also moved, over longer horizons  (mechanical comparison; no model rated
+Also moved, over longer horizons  (mechanical comparison; no lens rated
 these and none of them changes the exit code)
   1w   run 41, 8d ago — no movement
   1m   run 12, 31d ago — 2 change(s)
@@ -181,17 +181,39 @@ how near it is to where it pulled it.
 
 ## Custom probes
 
+A probe produces a number, and a number is not a finding: `dir:src/utils` going
+from 2 to 11 is a god-module being split up or a grab-bag taking over, and
+nothing in the measurement says which. So a probe is one of three things —
+the measurement, the [[lens]] that says what it means here, and the
+`[[lens.case]]` tables that check your local model can answer it.
+[Adding a probe](adding-a-probe.md) walks the whole loop; this section is the
+measurement half.
+
 A probe is a command with named parameters, each declared with the value it accepts. It may call a script in any language as long as the script prints the
 required JSON protocol:
 
 ```json
 {
   "observations": [
-    {"key": "src/db", "value": 12.0, "label": "src/db: 12 modules"}
+    {
+      "key": "src/db",
+      "value": 12.0,
+      "label": "src/db: 12 modules",
+      "attrs": {"files": "31", "share": "0.124"}
+    }
   ],
   "summary": "..."
 }
 ```
+
+`attrs` is optional and is the probe's own workings — the numbers behind the
+value. They are never diffed, because watching them would turn a probe's
+bookkeeping into drift, but the short ones are shown to the lens alongside the
+change. That matters when the question is about something the value is not: a
+lens asking whether a *share* is rising, handed only two counts, will believe
+the counts. Put the number your question needs in `attrs` and it is in front of
+the model. Anything longer than a couple of dozen characters is treated as
+prose for a person and left out of the prompt.
 
 Keys must remain stable between runs because they identify comparable
 observations. A key not seen in the baseline is automatically reported as a
@@ -241,7 +263,7 @@ measured whatever the root says.
 | `module-organization` | Modules, lines, and internal imports both ways | Directories growing past intent; a module reaching further, or more of the codebase coming to depend on it |
 | `silent-exceptions` | Handlers that discard the error, against how many handlers there are | Error handling quietly becoming error hiding, and the layer it started in |
 | `pattern-census` | ast-grep pattern occurrences | Constructs spreading into unexpected layers |
-| `file-length` | How long each file is, in categories you name | `CLAUDE.md` growing a section per session; the module everything gets appended to; docs outgrowing the code they describe |
+| `file-length` | How long each file is, in categories you name | `CLAUDE.md` growing a section per session; the module everything gets appended to; docs outgrowing the code they describe. With `UNIT = "bytes"` and an image glob, also the weight of what a site ships — the one unit defined for a file that is not text |
 | `dependency-versions` | The installed version of each distribution, and whether it came from an index | A package downgraded to make an error go away; a transitive version that moved with nothing in the project asking for it; a dependency that stopped coming from an index |
 
 ### Pointing one somewhere else
@@ -270,6 +292,51 @@ it, so name specific files before the globs that would swallow them — with
 it is empty. A category that matched nothing is named in the probe's summary
 rather than omitted, so a typo reads as a typo.
 
+### Measuring what a project ships
+
+`lines` is undefined for a PNG, and counting them would be inventing a number.
+`bytes` is not, so it is the one unit that measures a file which is not text —
+and the unit is part of the observation key, which means this is a *second*
+probe rather than a widening of the one counting your source:
+
+```toml
+[[probe]]
+id = "shipped-weight"
+title = "The weight of what is served"
+command = [
+    "python", "-m", "vibe_sentinel.probes.length",
+    "--root", "{SOURCE_ROOT}",
+    "--categories", "{CATEGORIES}",
+    "--unit", "{UNIT}",
+]
+timeout_s = 120.0
+tolerance = "15%"
+
+[[probe.placeholders]]
+name = "SOURCE_ROOT"
+default = "public"
+description = "The directory whose contents are served."
+
+[[probe.placeholders]]
+name = "CATEGORIES"
+default = "images=*.png,*.jpg,*.webp,*.avif; video=*.mp4; fonts=*.woff2"
+description = "What to weigh and what to call it."
+
+[[probe.placeholders]]
+name = "UNIT"
+default = "bytes"
+description = "The only unit defined for a file that is not text."
+```
+
+On a content-heavy site this is usually the larger number by some distance —
+ahead of any bundle — and it is the one nothing else records: an asset added
+at full camera resolution looks the same in a diff as one that was resized.
+A new key means a file became something the project serves.
+
+Under any other unit a binary is still skipped, and the probe says which
+files and why. Nothing changes for a project that does not declare one of
+these: the shipped categories match no binary.
+
 Redeclaring a `[[probe]]` replaces it wholesale, which freezes its command at whatever you copied; `[probes.parameters]` changes the value and leaves the rest
 to keep improving.
 
@@ -291,13 +358,20 @@ thin: route, validate, one call into a service.
 """
 ```
 
-Each lens is its own request, and the report is the shared prefix, so a batching server prefills it once and three questions cost nearly the same as one.
+Each lens is its own request, and the report is the shared prefix, so a batching server prefills it once — measured, at a 99% prefix-cache hit rate against 5% when every request is given a prefix of its own. Three questions do cost nearly the same as one, but the reason is the batching rather than the cache: generation dominates this workload, so reusing the prefill saved less than the spread between repeat runs, while widening the fan-out from one request at a time to eight took a sixteen-question pass from 208s to 31s. `benchmarks/` carries both numbers.
 `watch` names the probes a lens is about and is what keeps that true: a lens whose probes did not move, did not move over a horizon, and have no fitted trend gets skipped entirely, and is reported as not asked rather than as having found
 nothing. Set `[drift] concurrency = 1` on a backend that serialises.
 
 A lens can only rate changes the comparison already found, using the same boundary as the built-in analysis. `[drift] guidance` is a standing note placed in front of
 every question; `use`, `disable` and `use_builtins` select from the set the same
 way they do for probes and dangers.
+
+The question is a prompt, and it goes to whatever local model you run — so
+whether that model can answer it is an empirical question rather than an
+assumption. Declare `[[lens.case]]` tables under the lens and
+`python -m evals drift` scores its answers against the severities you would
+accept. [Adding a probe](adding-a-probe.md) is the whole loop: the measurement,
+the question that reads it, and the cases that keep the question honest.
 
 ## Reading the history
 
@@ -325,6 +399,7 @@ vibe-sentinel parameters <probe>
 
 ## See Also
 
+- [Adding a probe](adding-a-probe.md) — the measurement, the question that reads it, and the cases that keep the question honest
 - [Gates](gates.md) — the other half: what is true of the tree right now
 - [Use of the local model](use-of-local-model.md) — what the model rates here, and what it cannot
 - [History database](database.md) — where observations live, and how to trim them

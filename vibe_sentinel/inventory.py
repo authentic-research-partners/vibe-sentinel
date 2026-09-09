@@ -127,6 +127,7 @@ def compare(
                     kind="appeared",
                     after=obs.value,
                     label=obs.label or key,
+                    attrs=obs.attrs,
                     severity="medium",
                 )
             )
@@ -139,6 +140,7 @@ def compare(
                     kind="disappeared",
                     before=obs.value,
                     label=obs.label or key,
+                    attrs=obs.attrs,
                     severity="medium",
                 )
             )
@@ -161,6 +163,7 @@ def compare(
                         before_state=was.state,
                         after_state=now.state,
                         label=now.label or key,
+                        attrs=now.attrs,
                         severity="medium",
                     )
                 )
@@ -176,6 +179,7 @@ def compare(
                     before=old,
                     after=new,
                     label=now.label or key,
+                    attrs=now.attrs,
                     severity="low",
                 )
             )

@@ -20,6 +20,7 @@ import pytest
 from vibe_sentinel import backend as backend_mod
 from vibe_sentinel.backend import _resolve, stop
 from vibe_sentinel.config import SentinelConfig
+from vibe_sentinel.schemas import BackendMetrics
 
 # `status` and `start` are async: nothing in this package opens an event
 # loop except the command that runs it, so a test is the loop here. The
@@ -165,3 +166,112 @@ def test_a_dollar_sign_is_left_alone() -> None:
     """An argument containing one is likelier to mean something to the
     program than to be an environment variable."""
     assert _resolve(["--served-model-name=$MODEL"]) == ["--served-model-name=$MODEL"]
+
+
+# --- The metrics reader and the monitor -------------------------------------
+#
+# The rule under all of these is the one the tool keeps everywhere: a thing
+# nobody could see must not render as a thing that was not happening. Most
+# backends this tool supports publish no metrics at all, so "unavailable" is
+# the common case rather than the error case, and it has to stay legible.
+
+
+_VLLM_SAMPLE = """
+# HELP vllm:num_requests_running Number of requests in model execution batches.
+# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running{engine="0",model_name="qwen3-8b-fp8"} 3.0
+vllm:num_requests_waiting{engine="0",model_name="qwen3-8b-fp8"} 2.0
+vllm:kv_cache_usage_perc{engine="0",model_name="qwen3-8b-fp8"} 0.0742
+vllm:prefix_cache_queries_total{engine="0",model_name="qwen3-8b-fp8"} 1000.0
+vllm:prefix_cache_hits_total{engine="0",model_name="qwen3-8b-fp8"} 910.0
+vllm:num_preemptions_total{engine="0",model_name="qwen3-8b-fp8"} 0.0
+vllm:request_success_total{engine="0",finished_reason="stop",model_name="q"} 282.0
+vllm:request_success_total{engine="0",finished_reason="length",model_name="q"} 138.0
+vllm:request_success_total{engine="0",finished_reason="abort",model_name="q"} 0.0
+"""
+
+
+def test_parse_metrics_reads_a_real_exposition_body() -> None:
+    m = backend_mod.parse_metrics(_VLLM_SAMPLE)
+    assert m.running == 3.0
+    assert m.waiting == 2.0
+    assert m.kv_cache_used == pytest.approx(0.0742)
+    assert m.finished == 420.0
+    assert m.truncated == 138.0
+    assert m.prefix_hit_rate == pytest.approx(0.91)
+
+
+def test_parse_metrics_accepts_the_older_spellings() -> None:
+    """A reader pinned to one release's names reports a live server as silent."""
+    older = (
+        'vllm:gpu_cache_usage_perc{engine="0"} 0.5\n'
+        'vllm:gpu_prefix_cache_hits_total{engine="0"} 5.0\n'
+        'vllm:gpu_prefix_cache_queries_total{engine="0"} 10.0\n'
+    )
+    m = backend_mod.parse_metrics(older)
+    assert m.kv_cache_used == 0.5
+    assert m.prefix_hit_rate == 0.5
+
+
+def test_parse_metrics_leaves_what_it_did_not_see_as_none() -> None:
+    """Absent is not zero — the whole point of the model's optional fields."""
+    m = backend_mod.parse_metrics('vllm:num_requests_running{engine="0"} 1.0\n')
+    assert m.running == 1.0
+    assert m.waiting is None
+    assert m.kv_cache_used is None
+    assert m.truncated is None, "no request_success_total means no count, not 0"
+    assert m.prefix_hit_rate is None
+
+
+def test_parse_metrics_survives_junk() -> None:
+    m = backend_mod.parse_metrics("garbage\n\n# comment\nvllm:num_requests_running x\n")
+    assert not m.anything
+
+
+def test_a_zero_denominator_is_not_a_rate() -> None:
+    m = BackendMetrics(prefix_hits=0.0, prefix_queries=0.0)
+    assert m.prefix_hit_rate is None
+
+
+def test_no_metrics_endpoint_does_not_render_as_an_idle_server() -> None:
+    lines = backend_mod.render_metrics(None)
+    body = " ".join(lines)
+    assert "publishes no /metrics" in body
+    assert "not zero" in body
+    assert "0" not in body.replace("/metrics", ""), (
+        "no zeroed rows for an unseen server"
+    )
+
+
+def test_an_unrecognised_body_is_its_own_state() -> None:
+    """Answered-with-nothing-we-know is not the same as has-no-endpoint."""
+    lines = backend_mod.render_metrics(BackendMetrics())
+    body = " ".join(lines)
+    assert "nothing this reader knows" in body
+    assert "publishes no /metrics" not in body
+
+
+def test_unavailable_fields_say_so_beside_ones_that_answered() -> None:
+    lines = backend_mod.render_metrics(BackendMetrics(running=2.0))
+    body = "\n".join(lines)
+    assert "requests running    2" in body
+    assert "unavailable" in body
+
+
+def test_a_queue_and_a_truncation_are_called_out() -> None:
+    """Both are the reader's cue that a setting is wrong, so both are named."""
+    lines = backend_mod.render_metrics(
+        BackendMetrics(waiting=4.0, truncated=7.0, finished=10.0)
+    )
+    body = "\n".join(lines)
+    assert "wider than the server will batch" in body
+    assert "retry at double the budget" in body
+
+
+def test_nothing_is_called_out_when_there_is_nothing_to_call_out() -> None:
+    lines = backend_mod.render_metrics(
+        BackendMetrics(waiting=0.0, truncated=0.0, finished=10.0)
+    )
+    body = "\n".join(lines)
+    assert "wider than the server" not in body
+    assert "retry at double" not in body

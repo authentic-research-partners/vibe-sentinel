@@ -99,18 +99,31 @@ def parse_categories(spec: str) -> list[tuple[str, str]]:
     return entries
 
 
-def measure(raw: bytes) -> dict[str, int] | None:
-    """Every length of one file's bytes, or None if it is not text.
+def measure(raw: bytes, unit: str) -> dict[str, int] | None:
+    """Every length of one file's bytes that is defined for it, or None.
 
-    All three are computed whatever ``--unit`` says. They cost one pass
-    each over a string already in memory, and the two that are not the
-    unit are what makes a report line readable — "412 lines, 3,100 words"
-    answers "is this prose or is this code" without a second run.
+    For text, all three are computed whatever ``--unit`` says. They cost
+    one pass each over a string already in memory, and the two that are
+    not the unit are what makes a report line readable — "412 lines,
+    3,100 words" answers "is this prose or is this code" without a second
+    run.
+
+    A binary file is the exception, and the reason ``unit`` is a
+    parameter here. A PNG has a size; it does not have lines or words,
+    and counting either would be inventing a number. So ``bytes`` is the
+    one unit that measures one, and under any other unit a binary is
+    still not text and is still skipped.
+
+    That is what makes images measurable without widening anything.
+    ``unit`` is part of the observation key, so a project watching what
+    it ships declares a second, ``bytes``-unit probe with an image glob;
+    the run that counts its source in lines is untouched, and no existing
+    baseline gains a key — the shipped categories match no binary.
     """
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
-        return None
+        return {"bytes": len(raw)} if unit == "bytes" else None
     return {
         "lines": len(text.splitlines()),
         "words": len(text.split()),
@@ -205,9 +218,13 @@ def main(argv: list[str] | None = None) -> int:
             skipped.append(path.as_posix())
             skipped_in[claimed[path]] += 1
             continue
-        sizes = measure(raw)
+        sizes = measure(raw, unit)
         if sizes is None:
-            print(f"skipped {path}: not UTF-8 text", file=sys.stderr)
+            print(
+                f"skipped {path}: not UTF-8 text, so it has no {unit}. "
+                f"Measure binary files with --unit bytes.",
+                file=sys.stderr,
+            )
             skipped.append(path.as_posix())
             skipped_in[claimed[path]] += 1
             continue
@@ -228,11 +245,12 @@ def main(argv: list[str] | None = None) -> int:
                 "key": f"{unit}:{path.as_posix()}",
                 "value": float(value),
                 "label": f"{path.as_posix()} [{category}]: {value} {unit}",
+                # Only the lengths defined for this file: a binary
+                # carries `bytes` alone, so a reader is never handed a
+                # line count that was never counted.
                 "attrs": {
                     "category": category,
-                    "lines": str(sizes["lines"]),
-                    "words": str(sizes["words"]),
-                    "bytes": str(sizes["bytes"]),
+                    **{name: str(size) for name, size in sizes.items()},
                 },
             }
         )

@@ -49,8 +49,11 @@ def save_run(
                 snapshot.generated_at,
                 snapshot.root,
                 snapshot.model,
-                int(snapshot.used_model),
-                int(report.analyzed),
+                # Historical columns. A run has used a model since it became
+                # mandatory; the columns stay because earlier rows say
+                # otherwise truthfully and the history is never rewritten.
+                1,
+                1,
                 0,  # set below, after any previous baseline is cleared
                 len(snapshot.probes),
                 sum(len(p.observations) for p in snapshot.probes.values()),
@@ -417,7 +420,7 @@ def series(
 def parameter_history(
     conn: sqlite3.Connection, probe_id: str, limit: int = 20
 ) -> list[tuple[int, str, str]]:
-    """What the model chose for one probe's placeholders, per run.
+    """What one probe's placeholders were filled with, per run.
 
     Returns ``(run_id, started_at, parameters_json)`` newest first. Worth
     checking when drift looks implausible: a model that picked a different

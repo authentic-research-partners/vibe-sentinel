@@ -12,6 +12,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from vibe_sentinel import schemas
 from vibe_sentinel.json_schema import (
     clip_to_bounds,
     inline_schema,
@@ -173,3 +174,78 @@ def test_the_pydantic_defaults_survive() -> None:
     the default is what stands in for an answer that never arrived at all.
     """
     assert Outer(inner=Inner(name="a")).note == ""
+
+
+# --- The advertised bound versus the enforced one ---------------------------
+#
+# The bounds are stripped from the wire and enforced after it, which leaves
+# the prompt as the only thing telling the model how much room it has. These
+# pin the rule that governs that number: what a prompt asks for is half what
+# the clipping allows, because the model counts words approximately while it
+# writes and the clipping counts characters exactly afterwards. Landing an
+# approximate count on an exact edge costs a truncation, and a truncation
+# costs a whole retry at double the budget.
+
+
+def test_the_advertised_limit_is_a_margin_below_the_enforced_one() -> None:
+    """Below, always — and a hedge rather than a squeeze.
+
+    The range is asserted instead of the constant, because the constant is
+    the thing that gets tuned and a test that restates it cannot fail. What
+    must hold whatever it is set to: never at or above the cap, or the
+    approximate count lands on the exact edge; and never so far below that a
+    field which has to justify a verdict has no room.
+
+    Neither bound comes from the corpus, and that is deliberate: three runs
+    per arm could not tell a halved limit from an unhalved one, because
+    ``severity-band`` spans twelve points across runs of identical code. A
+    constant fitted to a number that noisy would be fitted to noise.
+    """
+    for chars in (100, 240, 400, 700, 2000):
+        advertised = schemas.chars_to_words(chars)
+        enforced = chars / schemas._CHARS_PER_WORD
+        assert advertised < enforced, (
+            f"{chars} chars advertised as {advertised} words against an "
+            f"enforced {enforced:.0f} — there is no margin at all"
+        )
+        assert advertised > enforced / 2, (
+            f"{chars} chars advertised as {advertised} words is under half "
+            f"the enforced {enforced:.0f}; that squeeze was measured and cost "
+            f"drift accuracy"
+        )
+
+
+def test_the_advertised_limit_rounds_down() -> None:
+    """Rounding up hands back the margin the share exists to create."""
+    for chars in (100, 240, 400, 700, 2000):
+        ceiling = chars / schemas._CHARS_PER_WORD * schemas._ADVERTISED_SHARE
+        assert schemas.chars_to_words(chars) <= ceiling
+
+
+def test_a_bound_of_zero_advertises_nothing_negative() -> None:
+    assert schemas.chars_to_words(0) == 0
+    assert schemas.chars_to_words(-10) == 0
+
+
+def test_the_advertised_limit_still_leaves_room_to_say_something() -> None:
+    """Headroom must not collapse a real bound into a useless one."""
+    assert schemas.chars_to_words(schemas.REASON_CHARS) >= 15
+    assert schemas.chars_to_words(schemas.ASSESSMENT_CHARS) >= 30
+
+
+def test_brevity_quotes_the_advertised_number_not_the_enforced_one() -> None:
+    """One number, generated. A hand-typed word count is a second answer."""
+    advertised = schemas.chars_to_words(schemas.REASON_CHARS)
+    assert f"under {advertised} words" in schemas.BREVITY
+    naive = schemas.REASON_CHARS // schemas._CHARS_PER_WORD
+    assert f"under {naive} words" not in schemas.BREVITY
+
+
+def test_every_prompt_that_states_a_word_limit_goes_through_the_helper() -> None:
+    """A prompt with its own arithmetic drifts from the cap it describes."""
+    from vibe_sentinel import analyze
+
+    for prompt in (analyze.ANALYZE_SYSTEM_PROMPT, schemas.BREVITY):
+        for chars in (schemas.NOTE_CHARS, schemas.ASSESSMENT_CHARS):
+            naive = f"under {chars // schemas._CHARS_PER_WORD} words"
+            assert naive not in prompt, f"{naive} looks like an unhalved cap"

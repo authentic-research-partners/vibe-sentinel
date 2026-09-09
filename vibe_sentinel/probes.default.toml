@@ -312,7 +312,7 @@ default = "agent=CLAUDE.md,AGENTS.md,.cursorrules; docs=*.md; code=*.py"
 
 [[probe.placeholders]]
 name = "UNIT"
-description = "What length means here: lines, words or bytes. Part of the observation key, so changing it starts a new series instead of redefining the recorded one. The tolerance is a proportion, so it carries over unchanged."
+description = "What length means here: lines, words or bytes. Part of the observation key, so changing it starts a new series instead of redefining the recorded one. The tolerance is a proportion, so it carries over unchanged. `bytes` is also the only unit that measures a file that is not text: an image has a size and does not have lines, so a second probe declared with `bytes` and an image glob tracks the weight of what a project ships, while this one goes on counting source in lines."
 pattern = "^(lines|words|bytes)$"
 default = "lines"
 

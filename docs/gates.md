@@ -7,11 +7,15 @@ two-hundredth scan as on the first, so a gate reports every run, exits non-zero,
 and `scan --update` does not settle it. Only a pin does.
 
 All three run inside `vibe-sentinel scan` and also stand alone, with the same
-exit codes — `0` clean, `1` findings, `2` error — and all three take
-`--no-model`. Their rules layer the same way: a table with a new `id` adds a
+exit codes — `0` clean, `1` findings, `2` error. Their rules layer the same way: a table with a new `id` adds a
 rule, one reusing a built-in `id` overrides it, `disable` drops one, `use` keeps
 only what it names, `use_builtins = false` starts from nothing, and `rule_files`
-shares a set across repos. A `verdict =` on any rule settles it without asking
+shares a set across repos — the same four settings `[probes]` and `[drift]`
+take, so one `rules/` directory can hold every rule a project declares, and a
+single file in it can carry a probe and the lens that reads it.
+`safety --print-dangers` and `credentials --print-rules` name the file each
+declared rule came from, so "did my rule file load" has an answer that is not
+an error message. A `verdict =` on any rule settles it without asking
 the model — no call, no latency, and it still holds with the backend down.
 
 Every key, with commentary: `vibe-sentinel scan --print-example`.
@@ -45,18 +49,28 @@ flowchart TB
 
 ```bash
 vibe-sentinel credentials              # 0 clean, 1 findings, 2 error
-vibe-sentinel credentials --no-model   # candidates only, adjudicated by nobody
 vibe-sentinel credentials --home       # the stores in ~ no .gitignore ever covered
 vibe-sentinel credentials --print-rules
 ```
 
-Two questions arise. **Files whose purpose is holding credentials**, where the name is
+Three questions arise. **Files whose purpose is holding credentials**, where the name is
 the signal: `.env*`, private keys and keystores, cloud credential files, registry
 and git tokens, `terraform.tfstate` and `*.tfvars`, database and cluster configs,
-shell history. And **credentials hardcoded into files that should hold none**,
+shell history. **Credentials hardcoded into files that should hold none**,
 where the content reveals: PEM blocks, `AKIA…`/`AIza…`, vendor prefixes (`ghp_`,
 `glpat-`, `sk-ant-`, `sk_live_`), JWTs, URLs with an inline password, and a name
 meaning secret assigned a literal.
+
+And **a value that looks like a credential whatever it is called**, because the two
+above both need a name or a vendor to recognise, and `DB = "p4ssw0rd-prod"` offers
+neither. `minted-token` reads a value that looks generated — 32 characters or more,
+mixed case, 4.3 bits per character or denser. `password-shape` reads one that looks
+typed: a short single token with digits or symbols glued into the letters, which is
+how a password is written and not how code is, since code joins words with a
+separator. That second signal is weak on purpose. `qwen3-8b` is the same shape as
+`hunter22` and nothing structural separates them, so the rule nominates both and the
+model settles it — which is the whole reason a nomination is cheap and a pin is a
+decision.
 
 **Why a model decides rather than a regex.** `AKIAIOSFODNN7EXAMPLE`
 appears in every AWS tutorial ever written. No pattern tells it from the key
@@ -125,8 +139,17 @@ typosquat and a rewrite shipped under a new name identically, and the rule had
 already grown a hand-written exception for digit suffixes (`httpx`/`httpx2` are
 both legitimate). So that pair, and nothing else here, goes to the local model
 with what each package says it does and whether anything asked for it: `distinct`
-settles it, `typosquat` and `unclear` stand. `--no-model` leaves every near-miss
-standing — this gate does not weaken when the model is off.
+settles it, `typosquat` and `unclear` stand. A pair the model does not settle
+also stands: this finding failed on its own before the question was asked, so an
+unanswered question leaves it exactly as the audit made it. That is the one place
+the model's absence is not a failure — everywhere else it is.
+
+`[packages] guidance` is your standing note about your own names, put in front
+of that question — the same shape as `[licenses] guidance` and `[drift]
+guidance`, and it rides in the shared context so a prefix cache prefills it once
+however many pairs there are. `httpx` and `httpx2` are two real packages and
+nothing outside your ecosystem knows it; a pin records that after the finding,
+and this says it before the question is asked.
 
 It compares your environment against **itself**, never against a shipped list of
 popular names: a published list of "names close to real ones" is a published
@@ -264,6 +287,55 @@ title = "Installing a package that nothing in the project declares"
 applies_to = "undeclared-install"
 verdict = "unsafe"
 ```
+
+### When a danger applies to some trees and not others
+
+A danger may name a file that must sit at the project root for it to apply:
+
+```toml
+[[danger]]
+id = "cargo-publish"
+pattern = 'cargo\s+publish'
+question = "Is this releasing a crate, and did anyone ask for a release?"
+requires = "Cargo.toml"
+```
+
+Where that file is absent the danger is not in the set at all — not merely
+unmatched. `safety --print-dangers` does not list it, and nothing it could
+have matched is checked.
+
+The distinction is for whoever reads the list. A denylist is audited by
+people, and its value is that every line in it earns a place; eight entries
+that cannot fire in this repository are worse than eight that are absent,
+because matching nothing and being absent look identical from the outside and
+are not the same fact.
+
+That is how the JavaScript dangers ship. All of them carry
+`requires = "package.json"`:
+
+| Danger | What it asks about |
+|---|---|
+| `publishing-a-package` | `npm`/`yarn`/`pnpm`/`bun publish` — public immediately, and the version number is spent either way |
+| `deploying-to-production` | `vercel --prod`, `netlify deploy --prod`, `firebase deploy`, `wrangler deploy`, `gh-pages` — replacing what the public is being served |
+| `forcing-a-dependency-resolution` | `--force`, `--legacy-peer-deps` — proceeding past an incompatibility rather than resolving it, into a tree nothing declared and nothing tested |
+| `exposing-a-dev-server` | a bare `--host`, or one bound to `0.0.0.0` — serving source maps and unminified source to the network |
+| `lockfile`, `dependency-tree` | context only. `deleting-files` already escalates an `rm`; these ride along to say *what* is being deleted |
+
+The last row is the rule those two follow rather than an exception to it.
+`rm -rf node_modules` is routine, `deleting-files` already asks about it, and
+a second danger on the same command would mean the model is asked twice — the
+shape of gate somebody switches off. A signal attaches the fact without
+raising an event, the same way `home-directory` and `unexpanded-variable` do.
+
+`requires` is resolved last, after `use` and `disable`. So naming an npm
+danger in either is never an error in a repository that has no
+`package.json` — the id exists, it simply does not apply — and one shared
+`rule_files` set works across repositories in different languages.
+
+There is deliberately no danger on `npx`. The question worth asking is whether
+the package it runs is one any manifest declares, which is
+`undeclared-install`'s question and needs the manifest read; a pattern alone
+would fire on `npx tsc` and `npx prettier`, which is ordinary work.
 
 ---
 

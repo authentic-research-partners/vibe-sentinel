@@ -609,7 +609,7 @@ def _adjudicate(findings: list[pk.Finding], **kw: Any) -> pk.Adjudication:
 def test_distinct_settles_the_pair(monkeypatch: pytest.MonkeyPatch) -> None:
     _answer(monkeypatch, {"verdict": "distinct", "suspect": "", "reason": "both real"})
     out = _adjudicate([_pair()])
-    assert out.reviewed is True
+    assert [j.verdict for j in out.judgements] == ["distinct"]
     assert out.failing() == ()
 
 
@@ -621,30 +621,18 @@ def test_typosquat_and_unclear_both_stand(monkeypatch: pytest.MonkeyPatch) -> No
         assert [f.name for f in out.failing()] == ["reqests"], verdict
 
 
-def test_no_model_leaves_every_pair_standing(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The gate must not get weaker when the GPU is off.
-
-    Unlike the credentials gate, where an unadjudicated pattern hit on a
-    string is weak evidence, this finding failed on its own before any model
-    existed. `--no-model` leaves its verdict byte-identical.
-    """
-
-    async def explode(*_a: Any, **_kw: Any) -> Any:
-        raise AssertionError("the model was asked with use_model=False")
-
-    monkeypatch.setattr("vibe_sentinel.llm.llm_query", explode)
-    out = _adjudicate([_pair()], use_model=False)
-    assert out.reviewed is False
-    assert [f.name for f in out.failing()] == ["reqests"]
-    assert "adjudicated by nobody" in out.note
-
-
 def test_a_model_that_does_not_answer_leaves_the_pair_standing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Unlike the credentials gate, an unanswered question here does not
+    fail the run: the finding failed on its own before any model existed,
+    so leaving it standing is the same verdict the audit already made. The
+    model is here to settle a finding, never to be the reason one goes
+    unreported.
+    """
     _answer(monkeypatch, None)
     out = _adjudicate([_pair()])
-    assert out.reviewed is False
+    assert [j.verdict for j in out.judgements] == ["standing"]
     assert [f.name for f in out.failing()] == ["reqests"]
 
 
@@ -701,6 +689,38 @@ def test_the_context_carries_what_an_edit_distance_cannot(
     context = pk.build_near_miss_context(_near_miss_env(), [_pair()])
     assert "Python HTTP for Humans." in context
     assert "NOTHING declares it and NOTHING requires it" in context
+
+
+def test_a_project_can_phrase_the_near_miss_question_itself() -> None:
+    """The one model-facing question a project could not phrase.
+
+    Every other one is declared — a `[[lens]]`, a `[[danger]]` and a
+    `[[secret]]` each carry theirs, and the licence and drift passes take
+    a `guidance` string — while this one was written into the source. That
+    is the shipped-list mistake: `httpx` and `httpx2` are two real
+    packages, and nothing outside your ecosystem knows it.
+
+    In the context rather than the question, because it is the same note
+    for every pair and the context is what a prefix cache prefills once.
+    """
+    guidance = "Anything matching acme-* is ours and the names are deliberate."
+    context = pk.build_near_miss_context(_near_miss_env(), [_pair()], guidance)
+    assert f"<HOUSE_NOTES>\n{guidance}\n</HOUSE_NOTES>" in context
+    assert context.index("</HOUSE_NOTES>") < context.index("Environment:")
+
+    plain = pk.build_near_miss_context(_near_miss_env(), [_pair()])
+    # The closing tag, not the name: the system prompt names <HOUSE_NOTES> to
+    # mark it as the one block in the context that IS instruction, so the bare
+    # name appears whether or not a block was written. A block that was
+    # actually emitted is the thing this guards, and it always closes.
+    assert "</HOUSE_NOTES>" not in plain, "no empty block when nothing is declared"
+
+
+def test_guidance_is_read_from_the_packages_table(tmp_path: Path) -> None:
+    (tmp_path / ".vibe-sentinel.toml").write_text(
+        '[packages]\nguidance = "acme-* are ours."\n', encoding="utf-8"
+    )
+    assert pk.load_policy(None, root=tmp_path).guidance == "acme-* are ours."
 
 
 def test_the_findings_key_never_moves_with_an_opinion(
@@ -841,3 +861,28 @@ def test_a_dist_info_with_no_direct_url_did_come_from_an_index(
     installed = pk.installed_distributions()["thing"]
     assert installed.direct_url == ""
     assert installed.provenance_recorded is True
+
+
+# --- an unreachable endpoint is one fact, not one per request --------------
+#
+# Every fan-out here is `asyncio.gather(..., return_exceptions=True)`, so one
+# bad answer does not lose the rest. A dead backend is not one bad answer:
+# each request discovers the same fact, so it arrives once per item, and
+# folding it into the per-item "no answer" path turns a total outage into an
+# ordinary shortfall. `llm.raise_if_unreachable` owns the distinction; these
+# are what fails without it at each caller.
+
+
+def test_a_dead_backend_fails_the_near_miss_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """It was recorded as "the model did not settle this pair", which is
+    what an ambiguous pair looks like and not what an outage is."""
+    from vibe_sentinel.exceptions import LLMConnectionError
+
+    async def dead(*_a: Any, **_kw: Any) -> Any:
+        raise LLMConnectionError("Model endpoint unreachable after 3 attempts")
+
+    monkeypatch.setattr("vibe_sentinel.llm.llm_query", dead)
+    with pytest.raises(LLMConnectionError, match="unreachable"):
+        _adjudicate([_pair()])

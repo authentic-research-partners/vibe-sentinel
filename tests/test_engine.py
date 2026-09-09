@@ -6,9 +6,10 @@ the history is the product; and ``--update`` controls only which run
 later scans compare *against*, so a scan that finds drift never quietly
 becomes the baseline it just failed.
 
-No model is involved anywhere here. ``use_model=False`` is the CI path
-and it has to work with nothing running, which also makes the whole
-pipeline testable without a GPU.
+No model is involved anywhere here, and none is reached: measuring is
+mechanical, and the analysis pass has nothing to ask when no lens is
+declared. That is what keeps the whole pipeline testable without a GPU,
+now that the model is no longer optional at the command line.
 """
 
 from __future__ import annotations
@@ -45,19 +46,18 @@ def _broken(probe_id: str = "bad") -> Probe:
 
 
 def _run(probes: list[Probe], root: Path, **kw: Any):
-    return asyncio.run(scan_and_compare(probes, root, use_model=False, **kw))
+    return asyncio.run(scan_and_compare(probes, root, **kw))
 
 
 # --- the scan itself -------------------------------------------------------
 
 
 def test_a_scan_collects_each_probe_s_observations(tmp_path: Path) -> None:
-    snapshot = scan([_probe()], tmp_path, use_model=False)
+    snapshot = scan([_probe()], tmp_path)
     result = snapshot.probes["p"]
     assert result.ok is True
     assert [o.key for o in result.observations] == ["a"]
     assert result.title == "t"
-    assert snapshot.used_model is False
 
 
 def test_measuring_never_reaches_the_model(tmp_path: Path) -> None:
@@ -70,7 +70,7 @@ def test_measuring_never_reaches_the_model(tmp_path: Path) -> None:
     import inspect
 
     assert not inspect.iscoroutinefunction(scan)
-    snapshot = scan([_probe()], tmp_path, use_model=False)
+    snapshot = scan([_probe()], tmp_path)
     assert snapshot.probes["p"].ok is True
     # No model, so no model name to record — and nothing may read as one.
     assert snapshot.model == ""
@@ -83,14 +83,14 @@ def test_a_probe_runs_with_the_values_its_config_declares(tmp_path: Path) -> Non
         command=["python", "-c", 'print(\'{"observations": [], "summary": "{X}"}\')'],
         placeholders=[Placeholder(name="X", description="a word", default="fallback")],
     )
-    snapshot = scan([probe], tmp_path, use_model=False)
+    snapshot = scan([probe], tmp_path)
     assert snapshot.probes["p"].filled == {"X": "fallback"}
 
 
 def test_a_failed_probe_is_recorded_not_raised(tmp_path: Path) -> None:
     """One broken template must not lose the other probes' measurements,
     and a silently missing probe reads as 'nothing changed' next time."""
-    snapshot = scan([_probe(), _broken()], tmp_path, use_model=False)
+    snapshot = scan([_probe(), _broken()], tmp_path)
     assert snapshot.probes["p"].ok is True
     assert snapshot.probes["bad"].ok is False
     assert "exit 3" in snapshot.probes["bad"].error
@@ -157,16 +157,17 @@ def test_drift_is_measured_against_the_baseline_not_the_previous_run(
     assert (report.changes[0].before, report.changes[0].after) == (1.0, 9.0)
 
 
-def test_a_run_without_a_model_is_recorded_as_unanalyzed(tmp_path: Path) -> None:
-    """``runs.analyzed`` is what stops a later reader claiming these
-    severities were reviewed."""
-    _, report, run_id = _run([_probe(value=1.0)], tmp_path)
-    _, report, run_id = _run([_probe(value=9.0)], tmp_path)
-    assert report.analyzed is False
+def test_a_run_records_that_it_had_a_model(tmp_path: Path) -> None:
+    """``runs.used_model`` and ``runs.analyzed`` are historical columns now:
+    a run cannot happen without a model, so both are true from here on. They
+    stay because rows written before that say otherwise truthfully, and the
+    history is never rewritten."""
+    _run([_probe(value=1.0)], tmp_path)
+    _, _, run_id = _run([_probe(value=9.0)], tmp_path)
     with get_db(tmp_path) as conn:
         (record,) = [r for r in db_store.list_runs(conn) if r.id == run_id]
-    assert record.analyzed is False
-    assert record.used_model is False
+    assert record.analyzed is True
+    assert record.used_model is True
 
 
 # --- horizons: drift too slow for any single comparison ---------------------
@@ -306,7 +307,7 @@ def test_two_horizons_landing_on_one_run_read_it_once(
         return real(conn, run_id)
 
     monkeypatch.setattr(db_store, "load_snapshot", counted)
-    current = scan([_probe(value=2.0)], tmp_path, use_model=False)
+    current = scan([_probe(value=2.0)], tmp_path)
     with get_db(tmp_path) as conn:
         horizons = drift_over_horizons(conn, current, [_probe()], ["1w", "2w"])
 

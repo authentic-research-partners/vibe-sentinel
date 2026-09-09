@@ -7,7 +7,7 @@
               └─compare──▶  newest run at least 1w old   ┐  declared
               └─compare──▶  newest run at least 1m old   ┘  horizons
                                   │
-                          model rates the changes   (skippable)
+                          model rates the changes
                                   │
                       persist run + parameters + observations + changes
                                   │
@@ -53,22 +53,19 @@ def scan(
     probes: list[Probe],
     root: Path,
     config: SentinelConfig | None = None,
-    use_model: bool = True,
 ) -> Snapshot:
     """Run every probe and return the resulting structural snapshot.
 
     Synchronous, because measuring reaches nothing but the filesystem.
     Each probe runs with the values its ``[[probe.placeholders]]`` tables
-    declare; ``use_model`` no longer changes what is measured and is kept
-    only so the snapshot records whether the run had a model at all —
-    which is what lets the drift report refuse to claim a review.
+    declare. The model rates what this finds; it never chooses what is
+    measured, which is why nothing here reaches for one.
     """
     filled = [dict(p.defaults()) for p in probes]
 
     snapshot = Snapshot(
         root=root.as_posix(),
-        model=(config.llm_model if config and use_model else ""),
-        used_model=use_model,
+        model=(config.llm_model if config else ""),
     )
     for probe, values in zip(probes, filled, strict=True):
         started = time.monotonic()
@@ -197,7 +194,6 @@ async def scan_and_compare(
     probes: list[Probe],
     root: Path,
     config: SentinelConfig | None = None,
-    use_model: bool = True,
     update: bool = False,
     horizons: list[str] | None = None,
     trend_runs: int = 0,
@@ -225,7 +221,7 @@ async def scan_and_compare(
 
     Returns ``(snapshot, report, run_id)``.
     """
-    snapshot = scan(probes, root, config, use_model)
+    snapshot = scan(probes, root, config)
 
     with get_db(root) as conn:
         baseline_record = db_store.baseline_run(conn)
@@ -253,7 +249,7 @@ async def scan_and_compare(
         # baseline is exactly the run where a month-long direction is the
         # only thing there is to say. analyze_drift decides whether there
         # is anything to ask about.
-        if use_model and not report.first_run:
+        if not report.first_run:
             report = await analyze_drift(
                 report, snapshot, config, lenses=lenses, root=root
             )
@@ -275,7 +271,6 @@ async def scan_and_compare(
 async def run_gates(
     root: Path,
     config: SentinelConfig | None = None,
-    use_model: bool = True,
     run_id: int | None = None,
 ) -> GateState:
     """Run the deterministic gates over ``root`` and record what they found.
@@ -298,12 +293,12 @@ async def run_gates(
     ``asyncio.run`` itself, and the gate that broke was the only one
     whose answer costs a model call.
 
-    Model use is the same bargain as everywhere else: the collect stage
-    is mechanical and always runs, and ``use_model=False`` only skips
-    adjudication — the credentials gate then reports its candidates
-    marked as adjudicated by nobody.
+    The collect stage is mechanical and the adjudication is not, and
+    both always run: the local model is part of this tool rather than an
+    enhancement to it, so a gate that could not reach one fails instead
+    of reporting what it managed without it.
     """
-    state = await collect_all(root, config, use_model=use_model)
+    state = await collect_all(root, config)
     with get_db(root) as conn:
         gate_store.save_gate_state(conn, state, root=root.as_posix(), run_id=run_id)
     logger.info(

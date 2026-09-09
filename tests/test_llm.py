@@ -201,7 +201,7 @@ def test_connection_error_raises_with_remediation(
         _ask(handler)
     message = str(exc.value)
     assert "backend status" in message
-    assert "--no-model" in message
+    assert "not optional" in message
 
 
 def test_empty_content_is_retried_then_none(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -377,6 +377,55 @@ def test_check_endpoint_lists_served_models(monkeypatch: pytest.MonkeyPatch) -> 
     assert "qwen3-8b-fp8" in detail
 
 
+def test_check_endpoint_reads_a_null_model_list_as_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ollama with nothing pulled answers ``data: null``, not ``data: []``.
+
+    The key is present and null, so ``.get("data", [])`` returns None and
+    iterating it raises — which used to render as "an unexpected shape".
+    That is the documented first-run state on the macOS path, where the
+    next instruction is to pull a model, and the message sent the reader
+    looking for a protocol fault instead of at an empty backend.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"object": "list", "data": None})
+
+    _patch_async_client(monkeypatch, handler)
+    reachable, detail = asyncio.run(check_endpoint(SentinelConfig()))
+    assert reachable, "a server that answered is reachable, empty or not"
+    assert "serving no models" in detail
+    assert "unexpected shape" not in detail
+    assert "[llm] model" in detail, "an empty backend has a remediation"
+
+
+def test_check_endpoint_reads_an_empty_model_list_the_same_way(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``[]`` and ``null`` are one state: a list endpoint listing nothing."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"object": "list", "data": []})
+
+    _patch_async_client(monkeypatch, handler)
+    _, detail = asyncio.run(check_endpoint(SentinelConfig()))
+    assert "serving no models" in detail
+
+
+def test_check_endpoint_still_refuses_a_genuinely_broken_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Widening the empty case must not swallow a real protocol fault."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": [{"name": "no-id-field"}]})
+
+    _patch_async_client(monkeypatch, handler)
+    _, detail = asyncio.run(check_endpoint(SentinelConfig()))
+    assert "unexpected shape" in detail
+
+
 def test_check_endpoint_reports_unreachable(monkeypatch: pytest.MonkeyPatch) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("refused")
@@ -385,3 +434,146 @@ def test_check_endpoint_reports_unreachable(monkeypatch: pytest.MonkeyPatch) -> 
     reachable, detail = asyncio.run(check_endpoint(SentinelConfig()))
     assert not reachable
     assert "ConnectError" in detail
+
+
+def test_an_unreachable_backend_fails_fast_rather_than_hanging(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`llm_timeout` is how long the model may think, not how long a socket
+    may take to open. It defaults to 300s, and applied to the connect phase
+    that made an unreachable backend hang for five minutes per attempt,
+    three attempts deep, before printing the error that names the fix.
+
+    With the model no longer optional, that is the failure path a first run
+    hits — so it is the one that has to be quick.
+    """
+    monkeypatch.setattr(llm_mod, "_RETRY_BACKOFF_S", 0.0)
+    seen: dict[str, object] = {}
+    real = httpx.AsyncClient
+
+    def spy(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        seen["timeout"] = kwargs.get("timeout")
+        # A transport that refuses at once, so the assertion is about the
+        # configured bound rather than about waiting for a real one.
+        return real(transport=httpx.MockTransport(_refuse))
+
+    def _refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused")
+
+    monkeypatch.setattr(llm_mod.httpx, "AsyncClient", spy)
+
+    config = SentinelConfig(llm_timeout=300.0)
+    with pytest.raises(LLMConnectionError):
+        asyncio.run(llm_query("sys", "user", SCHEMA, "test", config=config))
+
+    timeout = seen["timeout"]
+    assert isinstance(timeout, httpx.Timeout)
+    assert timeout.connect is not None and timeout.connect <= 15.0
+    assert timeout.read == 300.0, "the model still gets its full budget to think"
+
+
+# --- Who owns the answer budget ---------------------------------------------
+#
+# `[llm] max_tokens` is a ceiling, not a reservation: lowering it never makes
+# an answer shorter, it only decides when a long one is cut off — and a cut-off
+# answer is retried at double the budget, so one over-run costs two prefills
+# and two generations for a single answer. Brevity is asked for in the prompt,
+# where a model can act on it.
+#
+# `answer_budget` states the rule the other way round: the configured value is
+# a *floor*, because a reasoning model spends tokens before the answer starts,
+# so whoever raised it for that reason keeps what they set. Three gates used to
+# clamp it to 512 regardless, which broke that silently.
+
+
+def test_no_gate_clamps_the_configured_answer_budget() -> None:
+    import inspect
+    import re
+
+    from vibe_sentinel import credentials, packages, safety
+
+    for module in (credentials, packages, safety):
+        source = inspect.getsource(module)
+        hits = re.findall(r'"max_tokens":\s*(\d+)', source)
+        assert not hits, (
+            f"{module.__name__} pins max_tokens to {hits} instead of taking "
+            f"the configured value. A ceiling below the config silently "
+            f"overrides a user who raised it for a reasoning model, and pays "
+            f"a retry every time an answer runs past it."
+        )
+
+
+def test_the_drift_pass_may_raise_it_because_it_computes_one() -> None:
+    """The one call site allowed to move it, and it only ever moves up."""
+    from vibe_sentinel.analyze import answer_budget
+
+    for floor in (512, 2048, 8192):
+        assert answer_budget(1, floor) >= floor
+        assert answer_budget(200, floor) >= floor
+
+
+def test_the_credentials_gate_asks_at_the_configured_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The behaviour behind the source check above."""
+    from vibe_sentinel import credentials as creds
+    from vibe_sentinel import llm as llm_mod
+
+    seen: list[int] = []
+
+    async def capture(
+        system: object,
+        user: object,
+        schema: object,
+        schema_name: str,
+        config: SentinelConfig | None = None,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        assert config is not None
+        seen.append(config.max_tokens)
+        return {"verdict": "placeholder", "reason": "test"}
+
+    monkeypatch.setattr(llm_mod, "llm_query", capture)
+
+    secrets = creds.builtin_secrets()
+    rule = secrets[0]
+    candidate = creds.Candidate(
+        rule=rule.id,
+        title=rule.title,
+        path="config.py",
+        exposure="tracked",
+        local_excerpt="TOKEN = 'x'",
+    )
+    config = SentinelConfig(max_tokens=4096)
+    asyncio.run(creds.review((candidate,), secrets, config, creds.Policy()))
+    assert seen == [4096], (
+        f"the gate asked at {seen}, not the configured 4096 — a budget below "
+        f"the config is a clamp on a user who raised it deliberately"
+    )
+
+
+# --- an unreachable endpoint is one fact, not one per request --------------
+#
+# Every fan-out here is `asyncio.gather(..., return_exceptions=True)`, so one
+# bad answer does not lose the rest. A dead backend is not one bad answer:
+# each request discovers the same fact, so it arrives once per item, and
+# folding it into the per-item "no answer" path turns a total outage into an
+# ordinary shortfall. `llm.raise_if_unreachable` owns the distinction; these
+# are what fails without it at each caller.
+
+
+def test_raise_if_unreachable_reraises_the_connection_error() -> None:
+    from vibe_sentinel.exceptions import LLMConnectionError
+    from vibe_sentinel.llm import raise_if_unreachable
+
+    boom = LLMConnectionError("endpoint unreachable after 3 attempts")
+    with pytest.raises(LLMConnectionError, match="unreachable"):
+        raise_if_unreachable([("a", {}), boom, ValueError("a different failure")])
+
+
+def test_raise_if_unreachable_leaves_an_ordinary_failure_alone() -> None:
+    """One bad answer stays one bad answer. Raising on those would lose
+    the other items, which is the reason for `return_exceptions=True`."""
+    from vibe_sentinel.llm import raise_if_unreachable
+
+    raise_if_unreachable([("a", {}), ValueError("one bad answer"), None])

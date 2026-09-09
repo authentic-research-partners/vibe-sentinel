@@ -86,21 +86,20 @@ def test_change_describes_itself_by_kind() -> None:
 
 
 def test_agent_render_states_the_drift_and_the_ask() -> None:
-    text = render_agent(_report(analyzed=True))
+    text = render_agent(_report())
     assert text.startswith("VIBE SENTINEL: STRUCTURAL DRIFT DETECTED")
     assert "src/helpers" in text
     assert "a directory that did not exist before" in text
     assert "scan --update" in text
 
 
-def test_agent_render_does_not_claim_a_review_that_did_not_happen() -> None:
-    """With --no-model the severities are mechanical; saying a model
-    reviewed them would be a false claim about provenance."""
-    reviewed = render_agent(_report(analyzed=True))
-    unreviewed = render_agent(_report(analyzed=False))
-    assert "reviewed by an independent local model" in reviewed
-    assert "reviewed by an independent local model" not in unreviewed
-    assert "mechanical comparison only" in unreviewed
+def test_agent_render_names_who_rated_the_severities() -> None:
+    """Where the severities came from is a claim about provenance, so it
+    is stated rather than assumed. There is only one answer now — a run
+    whose model did not answer raises long before a report is rendered —
+    and it still has to be said, because a `[high]` a reader cannot trace
+    is a `[high]` a reader has to take on faith."""
+    assert "reviewed by an independent local model" in render_agent(_report())
 
 
 def test_agent_render_omits_info_changes() -> None:
@@ -172,29 +171,21 @@ def test_terminal_render_says_when_nothing_moved(
     assert "No change since" in capsys.readouterr().out
 
 
-def test_terminal_render_does_not_claim_a_review_that_did_not_happen(
+def test_terminal_render_names_who_rated_the_severities(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """The same rule render_agent keeps, in the renderer a person actually
-    reads. It printed `[high]` under --no-model with nothing saying the
-    severity came from the comparison rather than from a model."""
-    render_terminal(_snapshot(), _report(analyzed=False))
-    unreviewed = capsys.readouterr().out
-    render_terminal(_snapshot(), _report(analyzed=True))
-    reviewed = capsys.readouterr().out
-
-    assert "mechanical comparison only" in unreviewed
-    assert "reviewed by an independent local model" not in unreviewed
-    assert "reviewed by an independent local model" in reviewed
+    """The same rule render_agent keeps, in the renderer a person reads."""
+    render_terminal(_snapshot(), _report())
+    assert "reviewed by an independent local model" in capsys.readouterr().out
 
 
 def test_terminal_render_says_it_before_the_severities(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """It is what they mean, so it is read first."""
-    render_terminal(_snapshot(), _report(analyzed=False))
+    render_terminal(_snapshot(), _report())
     out = capsys.readouterr().out
-    assert out.index("mechanical comparison only") < out.index("[high]")
+    assert out.index("reviewed by an independent local model") < out.index("[high]")
 
 
 def _review(**kw) -> ReviewRecord:

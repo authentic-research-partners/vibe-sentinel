@@ -25,5 +25,15 @@ class VibeSentinelError(Exception):
     """Base for all vibe-sentinel domain errors."""
 
 
+class ConfigError(VibeSentinelError):
+    """``.vibe-sentinel.toml`` could not be read, parsed, or validated.
+
+    Raised in place of the underlying ``TOMLDecodeError`` or pydantic
+    ``ValidationError`` so that the one thing a person needs — which file,
+    and what it said — survives to the command line instead of arriving as
+    a traceback from four frames down.
+    """
+
+
 class LLMConnectionError(VibeSentinelError):
     """Judge model unreachable — at startup, during batch, or mid-request."""

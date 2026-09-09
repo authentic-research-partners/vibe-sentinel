@@ -21,7 +21,13 @@ import pytest
 
 from vibe_sentinel import analyze as analyze_mod
 from vibe_sentinel.analyze import analyze_drift
-from vibe_sentinel.schemas import Change, DriftReport, ProbeResult, Snapshot
+from vibe_sentinel.schemas import (
+    Change,
+    DriftReport,
+    Observation,
+    ProbeResult,
+    Snapshot,
+)
 
 
 def _report(*changes: Change, **kw: Any) -> DriftReport:
@@ -177,12 +183,11 @@ def test_a_model_that_does_not_answer_leaves_the_severities_alone(
     than no scan, so this degrades rather than raises — but it must not
     then claim the changes were reviewed."""
     report = _analyze(_report(_change("p", "k")), None, monkeypatch)
-    assert report.analyzed is False
     assert report.changes[0].severity == "low"
     assert report.assessment == ""
 
 
-def test_analyzed_is_set_only_when_the_model_answered(
+def test_an_assessment_is_kept_only_when_the_model_answered(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     report = _analyze(
@@ -190,7 +195,6 @@ def test_analyzed_is_set_only_when_the_model_answered(
         {"assessment": "read as ordinary growth", "changes": []},
         monkeypatch,
     )
-    assert report.analyzed is True
     assert report.assessment == "read as ordinary growth"
 
 
@@ -205,7 +209,7 @@ def test_a_first_run_is_never_sent_to_the_model(
 
     monkeypatch.setattr(analyze_mod, "llm_query", explode)
     report = asyncio.run(analyze_drift(_report(first_run=True), _snapshot()))
-    assert report.analyzed is False
+    assert report.assessment == ""
 
 
 def test_no_changes_means_no_call(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -213,10 +217,52 @@ def test_no_changes_means_no_call(monkeypatch: pytest.MonkeyPatch) -> None:
         raise AssertionError("the model was asked to rate an empty list")
 
     monkeypatch.setattr(analyze_mod, "llm_query", explode)
-    assert asyncio.run(analyze_drift(_report(), _snapshot())).analyzed is False
+    assert asyncio.run(analyze_drift(_report(), _snapshot())).assessment == ""
 
 
 # --- the prompt ------------------------------------------------------------
+
+
+def test_the_prompt_carries_the_probes_own_short_facts() -> None:
+    """`Observation.attrs` says it is carried for a reader. This is one.
+
+    Without it a lens asking about a *share* gets two counts and a
+    sentence, and is asked to overrule the counts — which it declines to
+    do whatever the question says. Long attrs stay out: the change list is
+    a shared prefix paid once per lens, and a sentence is prose for a
+    person reading the database.
+    """
+    change = _change("silent-exceptions", "silent-in:pkg")
+    change.attrs = {
+        "share": "0.263",
+        "handlers": "118",
+        "where": "a sentence naming every file and line the probe found",
+    }
+    report = _report(change)
+    prompt = analyze_mod.build_context(report, _snapshot())
+    assert "share=0.263" in prompt
+    assert "handlers=118" in prompt
+    assert "where=" not in prompt
+
+
+def test_an_attr_never_becomes_a_change() -> None:
+    """Carried for the reader, and still not diffed."""
+    from vibe_sentinel.inventory import compare
+
+    def snapshot(share: str) -> Snapshot:
+        return Snapshot(
+            probes={
+                "p": ProbeResult(
+                    probe_id="p",
+                    observations=[
+                        Observation(key="k", value=1.0, attrs={"share": share})
+                    ],
+                )
+            }
+        )
+
+    report = compare(snapshot("0.1"), snapshot("0.9"), ())
+    assert report.changes == []
 
 
 def test_the_prompt_names_both_the_key_and_the_probe() -> None:
@@ -226,3 +272,30 @@ def test_the_prompt_names_both_the_key_and_the_probe() -> None:
     )
     assert "key='vibe_sentinel/db'" in prompt
     assert "probe=commentary-ratio" in prompt
+
+
+# --- an unreachable endpoint is one fact, not one per request --------------
+#
+# Every fan-out here is `asyncio.gather(..., return_exceptions=True)`, so one
+# bad answer does not lose the rest. A dead backend is not one bad answer:
+# each request discovers the same fact, so it arrives once per item, and
+# folding it into the per-item "no answer" path turns a total outage into an
+# ordinary shortfall. `llm.raise_if_unreachable` owns the distinction; these
+# are what fails without it at each caller.
+
+
+def test_a_dead_backend_fails_the_drift_pass(monkeypatch: pytest.MonkeyPatch) -> None:
+    """It was swallowed as "a lens failed" and the report came back normally.
+
+    `report.py` prints "reviewed by an independent local model" on the drift
+    header unconditionally, so a scan whose every lens died on a dead backend
+    rendered as a reviewed report and exited 0 or 1.
+    """
+    from vibe_sentinel.exceptions import LLMConnectionError
+
+    async def dead(*_args: Any, **_kw: Any) -> dict[str, Any]:
+        raise LLMConnectionError("Model endpoint unreachable after 3 attempts")
+
+    monkeypatch.setattr(analyze_mod, "llm_query", dead)
+    with pytest.raises(LLMConnectionError, match="unreachable"):
+        asyncio.run(analyze_drift(_report(_change("p", "real")), _snapshot()))

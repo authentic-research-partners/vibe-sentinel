@@ -18,6 +18,7 @@ import pytest
 
 from vibe_sentinel import credentials as creds
 from vibe_sentinel.config import SentinelConfig
+from vibe_sentinel.exceptions import LLMConnectionError
 
 
 @pytest.fixture
@@ -28,7 +29,7 @@ def project(tmp_path: Path) -> Path:
 
 def scan(root: Path, **policy_kwargs: object) -> creds.Scan:
     policy = creds.Policy(**policy_kwargs)  # type: ignore[arg-type]
-    return creds.collect(root, creds.load_secrets(root), policy)
+    return creds.search(root, creds.load_secrets(root), policy)
 
 
 def rules_fired(root: Path) -> set[str]:
@@ -198,7 +199,7 @@ def test_the_local_model_sees_a_prefix_and_never_more_than_half(
     policy = creds.Policy(reveal_chars=8)
     candidate = next(
         c
-        for c in creds.collect(project, creds.load_secrets(project), policy).candidates
+        for c in creds.search(project, creds.load_secrets(project), policy).candidates
         if c.rule == "provider-token"
     )
     assert "sk-ant-a" in candidate.local_excerpt
@@ -212,7 +213,7 @@ def test_reveal_chars_zero_sends_only_the_shape(project: Path) -> None:
     policy = creds.Policy(reveal_chars=0)
     candidate = next(
         c
-        for c in creds.collect(project, creds.load_secrets(project), policy).candidates
+        for c in creds.search(project, creds.load_secrets(project), policy).candidates
         if c.rule == "provider-token"
     )
     assert "sk-ant" not in candidate.local_excerpt
@@ -274,11 +275,14 @@ def test_without_git_nothing_is_called_ignored(project: Path) -> None:
 # --- the gitignore rule, which is the optional one -------------------------
 
 
-def judge(root: Path, policy: creds.Policy) -> creds.Findings:
+def judge(root: Path, policy: creds.Policy) -> creds.Adjudication:
     secrets = creds.load_secrets(root)
     return asyncio.run(
         creds.adjudicate(
-            creds.collect(root, secrets, policy), secrets, policy, use_model=False
+            creds.search(root, secrets, policy),
+            secrets,
+            policy,
+            SentinelConfig(),
         )
     )
 
@@ -344,16 +348,25 @@ def test_a_declared_verdict_settles_it_without_a_model(project: Path) -> None:
         j for j in findings.judgements if j.candidate.rule == "our-service-keys"
     )
     assert declared.verdict == "real"
-    assert declared.reviewed is False
-    assert not findings.reviewed
 
 
-def test_no_model_never_reads_as_a_review(project: Path) -> None:
+def test_a_candidate_nobody_judged_fails_the_run(project: Path) -> None:
+    """There is no verdict meaning "nobody looked". Deciding which pattern
+    hits are real is half of this gate, so a run that could not ask is a
+    failed run rather than a shorter answer — the alternative is a listing
+    that reads like a clean tree because the backend was down."""
     (project / "app.py").write_text('password = "abcdef0123"\n', encoding="utf-8")
-    findings = judge(project, creds.Policy())
-    assert findings.reviewed is False
-    assert all(not j.reviewed for j in findings.judgements)
-    assert "adjudicated by nobody" in findings.note
+
+    async def silent(*_a: object, **_kw: object) -> None:
+        return None
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr("vibe_sentinel.llm.llm_query", silent)
+    try:
+        with pytest.raises(LLMConnectionError, match="did not come back"):
+            judge(project, creds.Policy())
+    finally:
+        monkeypatch.undo()
 
 
 # --- the network boundary --------------------------------------------------
@@ -396,17 +409,16 @@ def test_nothing_is_sent_to_a_remote_endpoint(project: Path) -> None:
     )
     policy = creds.Policy()
     secrets = creds.load_secrets(project)
-    findings = asyncio.run(
-        creds.adjudicate(
-            creds.collect(project, secrets, policy),
-            secrets,
-            policy,
-            SentinelConfig(llm_endpoint="https://api.example.com/v1"),
+    with pytest.raises(LLMConnectionError, match="allow_remote_model") as exc:
+        asyncio.run(
+            creds.adjudicate(
+                creds.search(project, secrets, policy),
+                secrets,
+                policy,
+                SentinelConfig(llm_endpoint="https://api.example.com/v1"),
+            )
         )
-    )
-    assert findings.reviewed is False
-    assert "allow_remote_model" in findings.note
-    assert all(j.verdict == "unclear" for j in findings.judgements)
+    assert "Not sending anything" in str(exc.value)
 
 
 # --- the rule set layers like every other one ------------------------------
@@ -503,7 +515,7 @@ def test_excluded_paths_and_skip_dirs_are_not_read(project: Path) -> None:
     (project / "docs").mkdir()
     (project / "docs" / ".env").write_text("K=abcdef0123456789ab\n", "utf-8")
     policy = creds.Policy(exclude=("docs/*",))
-    result = creds.collect(project, creds.load_secrets(project), policy)
+    result = creds.search(project, creds.load_secrets(project), policy)
     assert result.candidates == ()
 
 
@@ -517,7 +529,7 @@ def test_a_binary_credential_file_is_flagged_on_its_name(project: Path) -> None:
 
 def test_an_oversized_file_is_flagged_without_being_read(project: Path) -> None:
     (project / ".env").write_text("K=" + "a" * 5000 + "\n", encoding="utf-8")
-    result = creds.collect(
+    result = creds.search(
         project, creds.load_secrets(project), creds.Policy(max_file_kb=1)
     )
     assert any(c.rule == "dotenv-file" for c in result.candidates)
@@ -527,7 +539,7 @@ def test_an_oversized_file_is_flagged_without_being_read(project: Path) -> None:
 def test_a_truncated_walk_says_so(project: Path) -> None:
     for index in range(10):
         (project / f"f{index}.py").write_text("x = 1\n", encoding="utf-8")
-    result = creds.collect(
+    result = creds.search(
         project, creds.load_secrets(project), creds.Policy(max_files=3)
     )
     assert result.truncated
@@ -678,3 +690,232 @@ def test_the_name_still_does_not_match_inside_a_word(project: Path, line: str) -
     match this whole file exists to avoid."""
     (project / "settings.py").write_text(line + "\n", encoding="utf-8")
     assert "assigned-secret" not in rules_fired(project)
+
+
+# --- the shape rules: the value is the signal, not the name ----------------
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        'unrelated = "hunter22"',
+        'DB = "p4ssw0rd"',
+        'value: "s3cret!"',
+        'x = "admin123"',
+        'thing = "Passw0rd"',
+    ],
+)
+def test_a_typed_password_is_found_though_nothing_names_it(
+    project: Path, line: str
+) -> None:
+    """The gap every other rule leaves. `unrelated = "hunter22"` has a name
+    that means nothing, no vendor prefix, no URL and no PEM block, and is
+    far too short and too low in entropy to look generated. What is left is
+    the value's shape: code joins words with a separator and a person typing
+    a password glues them.
+
+    That first line is deliberately the one
+    `test_the_name_still_does_not_match_inside_a_word` asserts is *not* an
+    `assigned-secret`. Both are right — it is not a name that means secret,
+    and it is a string somebody could authenticate with.
+    """
+    (project / "settings.py").write_text(line + "\n", encoding="utf-8")
+    assert "password-shape" in rules_fired(project)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        'build = "setuptools.build_meta"',  # a dotted name
+        'probe = "commentary-ratio"',  # kebab-case, no digits
+        'model = "a_very_ordinary_identifier_name"',  # snake_case, no digits
+        'pattern = "^(all|declared)$"',  # a regex, not a value
+        'tag = "v${VERSION}"',  # interpolated at run time
+        'host = "db.internal.example.com"',  # separators: a hostname
+        'note = "bert-base-uncased"',  # words, no glue
+    ],
+)
+def test_what_the_shape_rule_declines_to_ask_about(project: Path, line: str) -> None:
+    """The rule is deliberately generous, which only works because the
+    obvious non-values are gone before anything is asked. A regex and a
+    template are structurally incapable of being a credential; a dotted or
+    separated name is code."""
+    (project / "settings.py").write_text(line + "\n", encoding="utf-8")
+    assert "password-shape" not in rules_fired(project)
+
+
+def test_a_generated_key_is_found_though_nothing_names_it(project: Path) -> None:
+    """Long, dense, mixed case, assigned to a name that says nothing."""
+    line = 'value = "aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY2zA4bC6d"'
+    (project / "settings.py").write_text(line + "\n", encoding="utf-8")
+    assert "minted-token" in rules_fired(project)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "a_very_long_but_entirely_ordinary_identifier_name",  # 49 chars of words
+        "0123456789abcdef0123456789abcdef",  # a hex digest
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",  # one repeated char
+    ],
+)
+def test_length_alone_does_not_make_a_value_look_minted(
+    project: Path, value: str
+) -> None:
+    """Length and mixed classes without the entropy floor select long
+    identifiers; the floor without the classes selects prose. Both are
+    needed, and neither is a detector on its own."""
+    (project / "settings.py").write_text(f'value = "{value}"\n', encoding="utf-8")
+    assert "minted-token" not in rules_fired(project)
+
+
+def test_entropy_is_what_separates_prose_from_a_key() -> None:
+    """The measurement behind `_MINTED_ENTROPY`. English runs about 4.1 bits
+    per character, which is why a 4.0 floor nominated the CITATION.cff
+    abstract; a generated key runs near 5."""
+    assert creds.entropy("Documentation growing faster than the code") < 4.3
+    assert creds.entropy("aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY") >= 4.3
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        'DB_PWD = "s3cr3t-real"',
+        'PAT = "abcdefghijkl"',
+        'BEARER = "abcdefghijkl"',
+        'DSN = "abcdefghijkl"',
+        'salt = "abcdefghijkl"',
+        'SIGNING_KEY = "abcdefghijkl"',
+        'SESSION_KEY = "abcdefghijkl"',
+        'ENCRYPTION_KEY = "abcdefghijkl"',
+        'MASTER_KEY = "abcdefghijkl"',
+    ],
+)
+def test_the_widened_name_list_is_matched(project: Path, line: str) -> None:
+    (project / "settings.py").write_text(line + "\n", encoding="utf-8")
+    assert "assigned-secret" in rules_fired(project)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        'path = "/usr/local/bin/env"',  # `pat` must not match inside `path`
+        'pattern = "^[a-z]+$"',  # nor inside `pattern`
+        'salted_hash = "abcdefghijkl"',  # nor `salt` inside `salted`
+    ],
+)
+def test_the_widened_names_still_do_not_match_inside_a_word(
+    project: Path, line: str
+) -> None:
+    """`pat` and `salt` are short, so widening the list is exactly where the
+    substring discipline is most likely to be lost."""
+    (project / "settings.py").write_text(line + "\n", encoding="utf-8")
+    assert "assigned-secret" not in rules_fired(project)
+
+
+def test_a_shape_rule_still_redacts_what_it_found(project: Path) -> None:
+    """The rules are new; the guarantee is not. A password-shaped value
+    reaches the excerpt as its shape and never as itself."""
+    (project / "settings.py").write_text('x = "hunter22"\n', encoding="utf-8")
+    found = [c for c in scan(project).candidates if c.rule == "password-shape"]
+    assert found and "hunter22" not in found[0].excerpt
+    assert "8 chars" in found[0].excerpt
+
+
+# --- the shapes three content rules were blind to ---------------------------
+
+
+def _matches(rule_id: str, line: str) -> bool:
+    """Whether one shipped rule's pattern fires on one line."""
+    import re
+
+    rule = next(s for s in creds.builtin_secrets() if s.id == rule_id)
+    return bool(re.search(rule.pattern, line))
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        'password = "hunter22"',  # python
+        "password: 'hunter22'",  # yaml, bare key
+        'password: "hunter22"',  # yaml, quoted value
+        '"password": "hunter22"',  # json, quoted key
+        '{"api_key": "abcdef123456"}',  # json, inline
+        '  "client_secret" : "s3cr3tvalue"',  # json, spaced
+    ],
+)
+def test_a_quoted_key_is_still_an_assignment(line: str) -> None:
+    """JSON and YAML quote the name, which put a `"` before the colon.
+
+    `authorization-header` had always allowed it and the other three had
+    not, so every credential in a JSON config was invisible to them — the
+    single most common config format there is.
+    """
+    assert _matches("assigned-secret", line)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "$(cat /run/secrets/api_token)",
+        "`cat /run/secrets/api_token`",
+        "sha512-V8AVnmPIICiWpGfm6GLzCR/W5FXLchHop40W4nXBmdlEceh16rCN8O8LNW==",
+        "sha256-abc123XYZ+/=",
+    ],
+)
+def test_a_value_that_cannot_be_a_credential_is_dropped(value: str) -> None:
+    """Read at run time, or a published digest of a public artifact.
+
+    `${VAR}` was already here and `$(...)` was not, so the shape this tool
+    *recommends* — fetch the secret at process start — was raised as a
+    candidate. An integrity hash is the other half: a lockfile holds
+    thousands, every one of them published, and none authenticates
+    anything.
+    """
+    assert not creds._is_a_literal(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "9Fh2Kd8Lm4Qp7Xs1Bv6Nz3Rt5Wy0CjEa7Gu",
+        "ghp_7Kd2Lm9Qp4Xs1Bv6Nz3Rt5Wy0CjEa8Gu2Hn",
+        "hunter22",
+    ],
+)
+def test_a_value_that_could_open_something_is_kept(value: str) -> None:
+    """The other side of the same filter, so it cannot quietly widen."""
+    assert creds._is_a_literal(value)
+
+
+def test_a_dead_backend_fails_the_credentials_gate(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one caller that always re-raised, now covered like the others.
+
+    It carried the loop and the argument for it in a comment, and no test,
+    so the behaviour survived on attention rather than on a gate. When the
+    loop became `llm.raise_if_unreachable` and the other two fan-outs
+    started calling it too, nothing would have noticed the call being
+    dropped from this one.
+    """
+    (project / "app.py").write_text('password = "abcdef0123"\n', encoding="utf-8")
+
+    async def dead(*_a: object, **_kw: object) -> object:
+        raise LLMConnectionError("Model endpoint unreachable after 3 attempts")
+
+    monkeypatch.setattr("vibe_sentinel.llm.llm_query", dead)
+    with pytest.raises(LLMConnectionError) as caught:
+        judge(project, creds.Policy())
+
+    # Asserting the *shape*, because both paths raise and only one is right.
+    # Without the guard the gate still fails, but as "put N candidate(s) to
+    # the model and N did not come back: <the same connection error, once
+    # per candidate>" — the aggregate the guard exists to avoid, with the
+    # remediation buried N deep. Matching "unreachable" alone passes either
+    # way, which is a test that cannot fail.
+    message = str(caught.value)
+    assert "did not come back" not in message, (
+        f"the outage was reported as a shortfall of answers: {message}"
+    )
+    assert "unreachable" in message

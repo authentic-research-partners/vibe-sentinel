@@ -15,10 +15,13 @@ from loguru import logger
 if TYPE_CHECKING:  # pragma: no cover - kept out of the hook's import cost
     import importlib.metadata as md
 
+    from vibe_sentinel.analyze import Lens
     from vibe_sentinel.licenses import Policy
-    from vibe_sentinel.schemas import GateReport
+    from vibe_sentinel.schemas import DriftReport, GateReport, GateState, Snapshot
+    from vibe_sentinel.templates import Probe
 
 from vibe_sentinel.config import SentinelConfig, load_config
+from vibe_sentinel.exceptions import ConfigError
 from vibe_sentinel.db import SchemaMismatchError, db_path, get_db
 from vibe_sentinel.db import journal_store
 from vibe_sentinel.db import store as db_store
@@ -40,6 +43,7 @@ from vibe_sentinel.report import (
     render_credentials,
     render_dangers,
     render_gate_state,
+    render_lens_set,
     render_json,
     render_observed_fields,
     render_pattern_match,
@@ -66,21 +70,52 @@ def _load(args: argparse.Namespace) -> tuple[SentinelConfig, Path]:
     root_arg = getattr(args, "root", None)
 
     if config_arg:
-        config = load_config(Path(config_arg))
+        chosen: Path | None = Path(config_arg)
     elif root_arg:
         candidate = Path(root_arg) / CONFIG_FILENAME
-        config = load_config(candidate if candidate.is_file() else None)
+        chosen = candidate if candidate.is_file() else None
     else:
-        config = load_config()
+        chosen = None
 
+    config = load_config_or_fail(chosen)
     root = Path(root_arg or config.project_dir or ".").resolve()
     return config, root
+
+
+def load_config_or_fail(path: Path | None) -> SentinelConfig:
+    """``load_config``, with an unreadable file named rather than raised.
+
+    Pydantic validates on assignment, so a value it refuses surfaces as a
+    ``ValidationError`` from inside ``load_config`` with no idea which file
+    produced it — and a stray comma surfaces as a ``TOMLDecodeError``. Both
+    reach a person as a traceback unless something turns them into a
+    sentence naming the file. ``ValidationError`` is a ``ValueError``,
+    which is why pydantic is not imported here to catch it.
+    """
+    import tomllib
+
+    from vibe_sentinel.config import find_config
+    from vibe_sentinel.paths import CONFIG_FILENAME
+
+    try:
+        return load_config(path)
+    except (OSError, tomllib.TOMLDecodeError, ValueError) as e:
+        named = path or find_config() or Path(CONFIG_FILENAME)
+        raise ConfigError(f"{named} could not be loaded: {e}") from e
 
 
 #: Commands that are themselves about the database's condition. The
 #: automatic check is skipped for these — `db check` would run it twice,
 #: and `migrate` is the remedy the check would be recommending.
 _NO_AUTO_CHECK = frozenset({"db", "migrate", "backups", "hook"})
+
+#: Flags that make a command describe its configuration rather than do its
+#: work: `scan --print-probes`, `--print-config`, `safety --print-dangers`.
+#: Each returns before anything opens the database, so a warning about the
+#: database's condition is the first thing printed by a command that could
+#: not have been affected by it — and it lands on the reader who was
+#: asking what the tool checks for, not on the one running a scan.
+_DESCRIBE_ONLY = ("print_probes", "print_config", "print_dangers")
 
 
 def auto_check(args: argparse.Namespace) -> None:
@@ -96,6 +131,8 @@ def auto_check(args: argparse.Namespace) -> None:
     scan somebody actually asked for.
     """
     if getattr(args, "command", None) in _NO_AUTO_CHECK:
+        return
+    if any(getattr(args, flag, False) for flag in _DESCRIBE_ONLY):
         return
     try:
         from vibe_sentinel.db import maintenance
@@ -114,8 +151,145 @@ def auto_check(args: argparse.Namespace) -> None:
             logger.warning("database:   fix with: {}", finding.remediation)
 
 
+def _print_probe_set(pool: list[Probe]) -> None:
+    """The active probe set with the values it will run with.
+
+    The values, not just the names. They are declared now, so this is the
+    whole of what the next scan will run — there is nothing left for a
+    model to decide and therefore nothing to preview separately.
+    """
+    declared = [p for p in pool if p.source not in ("", "built-in")]
+    for probe in pool:
+        print(f"{probe.id}  {probe.title}")
+        values = probe.defaults()
+        if values:
+            shown = ", ".join(f"{k}={v}" for k, v in sorted(values.items()))
+            print(f"    parameters:   {shown}")
+        # shlex.join, not " ".join: a declared value can legitimately
+        # hold a space or a semicolon — `docs=*.md; code=*.py` is one
+        # argument — and printing it bare turns the preview into two
+        # shell commands. The run is unaffected either way; the argv
+        # never goes near a shell. This is about the line being
+        # readable as the single command it describes.
+        print(f"    command:      {shlex.join(probe.fill(values))}")
+        if probe.source not in ("", "built-in"):
+            print(f"    from:         {probe.source}")
+
+    print(f"\n{len(pool)} probe(s) active, {len(declared)} declared here.")
+
+
+def _selected_probes(args: argparse.Namespace, pool: list[Probe]) -> list[Probe]:
+    """The probes this run measures. Raises ``ValueError`` if that is none."""
+    from vibe_sentinel.templates import select_probes
+
+    ids_raw = getattr(args, "probes", None)
+    probes = select_probes(
+        [s.strip() for s in ids_raw.split(",") if s.strip()] if ids_raw else None,
+        pool=pool,
+    )
+    if not probes:
+        raise ValueError("vibe-sentinel: no probes to run.")
+    return probes
+
+
+def _checked_declarations(root: Path, pool: list[Probe]) -> tuple[Lens, ...]:
+    """Everything this project declared that a scan can validate up front.
+
+    Before the probes rather than during: a malformed ``[[lens]]`` is a
+    question this project asked and did not get, and finding that out
+    after every probe has run costs the measurements.
+
+    The safety gate's tables are read here for a sharper version of the
+    same reason. The alternative place to find out is the hook, which
+    runs in front of a tool call, where the only honest answer to "this
+    table will not parse" is to refuse the command. A scan is where
+    somebody can read the error and fix the line.
+    """
+    from vibe_sentinel.analyze import load_lenses, unknown_watches
+    from vibe_sentinel.safety import configured_mode, load_dangers
+
+    lenses = load_lenses(root)
+
+    # Watches are checked against the whole declared pool rather than this
+    # run's selection — `--probes` narrows one run, it does not make a lens
+    # stale.
+    stale = unknown_watches(lenses, {p.id for p in pool})
+    if stale:
+        raise ValueError(
+            f"vibe-sentinel: {'; '.join(stale)} — no such probe. A lens "
+            f"watching a probe that does not exist is never asked, which "
+            f"reads as a lens that found nothing, so it is an error rather "
+            f"than a quiet report. Declared probes: "
+            f"{', '.join(sorted(p.id for p in pool))}"
+        )
+
+    configured_mode(root)
+    load_dangers(root)
+    return lenses
+
+
+def _horizons_for(args: argparse.Namespace, config: SentinelConfig) -> list[str]:
+    """The horizons this run compares against, validated.
+
+    ``--since`` replaces the declared set rather than adding to it, and
+    the empty string is therefore how one run asks for no horizons at
+    all. ``getattr(...) is None`` distinguishes that from "not given",
+    which a truthiness test would fold together.
+    """
+    from vibe_sentinel.horizons import parse_horizon
+
+    since = getattr(args, "since", None)
+    horizons = (
+        [w.strip() for w in since.split(",") if w.strip()]
+        if since is not None
+        else list(config.drift_horizons)
+    )
+    for horizon in horizons:
+        parse_horizon(horizon)
+    return horizons
+
+
+def _trend_runs_for(args: argparse.Namespace, config: SentinelConfig) -> int:
+    """How many runs back the fits look, from ``--fit`` or the config."""
+    fit_over = getattr(args, "fit", None)
+    runs = int(config.drift_trend_runs if fit_over is None else fit_over)
+    if runs < 0:
+        raise ValueError(
+            "--fit takes a number of runs to look back over, or 0 for none."
+        )
+    return runs
+
+
+def _scan_exit_code(snapshot: Snapshot, report: DriftReport, gates: GateState) -> int:
+    """0 clean, 1 something to read, 2 something did not finish.
+
+    A probe that failed and a gate that could not complete are both 2:
+    neither produced the measurement it was asked for, and a run missing
+    one of those is not a run that found nothing.
+
+    Drift and standing findings both fail, and they fail for different
+    reasons: one says the shape moved, the other says something is true
+    of this tree that nobody has settled. A pin clears the second; a new
+    baseline never does.
+    """
+    failed = [p for p, r in snapshot.probes.items() if not r.ok]
+    if failed:
+        logger.error("probe(s) failed: {}", ", ".join(sorted(failed)))
+        return 2
+    broken = gates.broken
+    if broken:
+        logger.error("gate(s) did not complete: {}", ", ".join(r.gate for r in broken))
+        return 2
+    return 1 if report.drifted or gates.failing else 0
+
+
 def run_scan(args: argparse.Namespace) -> int:
     """Scan and report drift. 0 = no drift, 1 = drift, 2 = error.
+
+    The stages, in order: what to print instead of scanning, what to
+    measure, what this project declared, what to compare against, the one
+    event loop, and what any of it means for the exit code. Each is its
+    own function above; this one is the order they happen in.
 
     The scan pipeline is imported here rather than at module scope: it
     reaches the model client and httpx, and ``vibe-sentinel hook`` — which
@@ -124,16 +298,12 @@ def run_scan(args: argparse.Namespace) -> int:
     """
     import asyncio
 
-    from vibe_sentinel.analyze import load_lenses, unknown_watches
     from vibe_sentinel.engine import run_gates, scan_and_compare
     from vibe_sentinel.exceptions import LLMConnectionError
-    from vibe_sentinel.horizons import parse_horizon
-    from vibe_sentinel.schemas import DriftReport, GateState, Snapshot
     from vibe_sentinel.templates import (
         default_probes_path,
         load_probes,
         packaged_example_path,
-        select_probes,
     )
 
     if getattr(args, "print_example", False):
@@ -156,89 +326,40 @@ def run_scan(args: argparse.Namespace) -> int:
         return 2
 
     if getattr(args, "list_probes", False):
-        # The values, not just the names. They are declared now, so this is
-        # the whole of what the next scan will run — there is nothing left
-        # for a model to decide and therefore nothing to preview separately.
-        for p in pool:
-            print(f"{p.id}  {p.title}")
-            values = p.defaults()
-            if values:
-                shown = ", ".join(f"{k}={v}" for k, v in sorted(values.items()))
-                print(f"    parameters:   {shown}")
-            # shlex.join, not " ".join: a declared value can legitimately
-            # hold a space or a semicolon — `docs=*.md; code=*.py` is one
-            # argument — and printing it bare turns the preview into two
-            # shell commands. The run is unaffected either way; the argv
-            # never goes near a shell. This is about the line being
-            # readable as the single command it describes.
-            print(f"    command:      {shlex.join(p.fill(values))}")
+        _print_probe_set(pool)
         return 0
 
-    ids_raw = getattr(args, "probes", None)
+    if getattr(args, "list_lenses", False):
+        # Loaded and printed rather than validated against the pool: this
+        # is the command somebody runs to find out *why* a lens is not
+        # being asked, so it must work while the answer is still wrong.
+        from vibe_sentinel.analyze import load_lenses
+
+        try:
+            render_lens_set(load_lenses(root))
+        except ValueError as e:
+            logger.error(str(e))
+            return 2
+        return 0
+
+    # One exit for every way the declared set can be wrong. Each raises
+    # with the sentence somebody has to act on, so the handler has nothing
+    # to add — and adding a stage here is one line rather than another
+    # try/except with its own return.
     try:
-        probes = select_probes(
-            [s.strip() for s in ids_raw.split(",") if s.strip()] if ids_raw else None,
-            pool=pool,
-        )
+        probes = _selected_probes(args, pool)
+        lenses = _checked_declarations(root, pool)
+        horizons = _horizons_for(args, config)
+        trend_runs = _trend_runs_for(args, config)
     except ValueError as e:
         logger.error(str(e))
         return 2
 
-    if not probes:
-        logger.error("vibe-sentinel: no probes to run.")
-        return 2
-
-    # Loaded here rather than inside the scan: a malformed [[lens]] is a
-    # question this project asked and did not get, and finding that out
-    # after every probe has run costs the measurements. Watches are checked
-    # against the whole declared pool rather than this run's selection —
-    # `--probes` narrows one run, it does not make a lens stale.
-    try:
-        lenses = load_lenses(root)
-    except ValueError as e:
-        logger.error(str(e))
-        return 2
-    stale = unknown_watches(lenses, {p.id for p in pool})
-    if stale:
-        logger.error(
-            "vibe-sentinel: {} — no such probe. A lens watching a probe that "
-            "does not exist is never asked, which reads as a lens that found "
-            "nothing, so it is an error rather than a quiet report. Declared "
-            "probes: {}",
-            "; ".join(stale),
-            ", ".join(sorted(p.id for p in pool)),
-        )
-        return 2
-
-    # `--since` replaces the declared set rather than adding to it, and
-    # the empty string is therefore how one run asks for no horizons at
-    # all. `getattr(...) is None` distinguishes that from "not given",
-    # which a truthiness test would fold together.
-    since = getattr(args, "since", None)
-    horizons = (
-        [w.strip() for w in since.split(",") if w.strip()]
-        if since is not None
-        else list(config.drift_horizons)
-    )
-    try:
-        for horizon in horizons:
-            parse_horizon(horizon)
-    except ValueError as e:
-        logger.error(str(e))
-        return 2
-
-    fit_over = getattr(args, "fit", None)
-    trend_runs = int(config.drift_trend_runs if fit_over is None else fit_over)
-    if trend_runs < 0:
-        logger.error("--fit takes a number of runs to look back over, or 0 for none.")
-        return 2
-
-    use_model = not getattr(args, "no_model", False)
     logger.info(
         "vibe-sentinel: scanning {} with {} probe(s) (model={})",
         root,
         len(probes),
-        config.llm_model if use_model else "disabled",
+        config.llm_model,
     )
 
     async def everything() -> tuple[Snapshot, DriftReport, int, GateState]:
@@ -255,13 +376,12 @@ def run_scan(args: argparse.Namespace) -> int:
             probes,
             root,
             config=config,
-            use_model=use_model,
             update=bool(getattr(args, "update", False)),
             horizons=horizons,
             trend_runs=trend_runs,
             lenses=lenses,
         )
-        gates = await run_gates(root, config=config, use_model=use_model, run_id=run_id)
+        gates = await run_gates(root, config=config, run_id=run_id)
         return snapshot, report, run_id, gates
 
     try:
@@ -285,20 +405,7 @@ def run_scan(args: argparse.Namespace) -> int:
         render_gate_state(gates)
         print(f"\nrecorded as run {run_id} in {db_path(root)}")
 
-    failed = [p for p, r in snapshot.probes.items() if not r.ok]
-    if failed:
-        logger.error("probe(s) failed: {}", ", ".join(sorted(failed)))
-        return 2
-    broken = gates.broken
-    if broken:
-        logger.error("gate(s) did not complete: {}", ", ".join(r.gate for r in broken))
-        return 2
-
-    # Drift and standing findings both fail, and they fail for different
-    # reasons: one says the shape moved, the other says something is true
-    # of this tree that nobody has settled. A pin clears the second; a
-    # new baseline never does.
-    return 1 if report.drifted or gates.failing else 0
+    return _scan_exit_code(snapshot, report, gates)
 
 
 def run_history(args: argparse.Namespace) -> int:
@@ -523,9 +630,9 @@ def run_backups(args: argparse.Namespace) -> int:
 
 
 def run_parameters(args: argparse.Namespace) -> int:
-    """Show what the model chose for a probe's placeholders, per run.
+    """Show what a probe's placeholders were filled with, per run.
 
-    Worth checking when drift looks implausible: a model that picked a
+    Worth checking when drift looks implausible: a probe pointed at a
     different root this run manufactured the entire diff.
     """
     _, root = _load(args)
@@ -543,7 +650,7 @@ def run_parameters(args: argparse.Namespace) -> int:
         logger.error("No recorded runs for probe {!r}.", probe_id)
         return 2
 
-    print(f"Parameters chosen for {probe_id}, newest first")
+    print(f"Parameters for {probe_id}, newest first")
     previous: str | None = None
     for run_id, at, params_json in rows:
         params = json.loads(params_json)
@@ -590,7 +697,7 @@ def run_licenses(args: argparse.Namespace) -> int:
     from vibe_sentinel.gates import shape_licenses
     from vibe_sentinel.licenses import (
         CATEGORIES,
-        check,
+        audit,
         evaluate_expression,
         load_policy,
         project_license,
@@ -657,7 +764,7 @@ def run_licenses(args: argparse.Namespace) -> int:
             f"{', '.join(sorted({m.spdx for m in policy.markers}))}"
         )
 
-    ok, bad = check(list(md.distributions()), policy)
+    ok, bad = audit(list(md.distributions()), policy)
 
     # The codebase's own licences. A vendored file arrives with a header and
     # never touches pyproject.toml, so no dependency gate would ever see it.
@@ -777,7 +884,7 @@ def _explain_package(
     from vibe_sentinel.exceptions import LLMConnectionError
     from vibe_sentinel.llm import check_endpoint
     from vibe_sentinel.licenses import (
-        check,
+        audit,
         draft_explanation,
         draft_pin,
         explain,
@@ -824,8 +931,8 @@ def _explain_package(
         category = policy.category_of(resolved.spdx) or "uncategorised"
         print(f"resolved: {resolved.spdx}  ({category}, via {resolved.source})")
 
-    ok, bad = check([dist], policy)
-    pin = policy.pin_for(resolved.name)
+    ok, bad = audit([dist], policy)
+    pin = policy.pin_for(resolved.name, resolved.spdx)
     if ok and pin is not None:
         print(f"policy:   ACCEPTED by an existing pin in {policy_source}")
         print(
@@ -837,30 +944,26 @@ def _explain_package(
         print(f"policy:   REJECTED — {violation.why}")
 
     draft = None
-    if getattr(args, "no_model", False):
-        print("\nmodel:    skipped (--no-model)")
+    # Probe first. llm_timeout is 300s by default, which is right for a
+    # scan and wrong for a diagnostic someone is watching: a down backend
+    # would look like a hang. check_endpoint gives up in ten seconds.
+    reachable, detail = asyncio.run(check_endpoint(config))
+    if not reachable:
+        print(
+            f"\nmodel:    unreachable ({detail}) — start it with "
+            f"'vibe-sentinel backend start'. The resolution chain above is "
+            f"unaffected: it is mechanical and this command reports it either "
+            f"way. The draft is what needs the model."
+        )
     else:
-        # Probe first. llm_timeout is 300s by default, which is right for a
-        # scan and wrong for a diagnostic someone is watching: a down backend
-        # would look like a hang. check_endpoint gives up in ten seconds.
-        reachable, detail = asyncio.run(check_endpoint(config))
-        if not reachable:
-            print(
-                f"\nmodel:    unreachable ({detail}) — start it with "
-                f"'vibe-sentinel backend start'. Everything above is unaffected: "
-                f"the chain never uses a model."
+        try:
+            draft = asyncio.run(
+                draft_explanation(resolved, evidence, config, guidance=policy.guidance)
             )
-        else:
-            try:
-                draft = asyncio.run(
-                    draft_explanation(
-                        resolved, evidence, config, guidance=policy.guidance
-                    )
-                )
-            except LLMConnectionError as e:
-                logger.warning("model went away mid-request: {}", e)
-            if draft is None:
-                print("\nmodel:    no usable answer — the draft below is a blank")
+        except LLMConnectionError as e:
+            logger.warning("model went away mid-request: {}", e)
+        if draft is None:
+            print("\nmodel:    no usable answer — the draft below is a blank")
 
     if draft is not None:
         # Printed as a suggestion and nothing more. It did not produce the
@@ -913,8 +1016,8 @@ def run_packages(args: argparse.Namespace) -> int:
     Every check is mechanical bar one. Two installed names an edit apart
     is a typosquat and a rewrite shipped under a new name in the same
     shape, so that one pair — and nothing else here — is put to the model.
-    ``--no-model`` skips it, and every near-miss then stands exactly as it
-    did before the step existed.
+    A pair the model does not settle stands exactly as it did before the
+    step existed.
     """
     import asyncio
 
@@ -929,9 +1032,9 @@ def run_packages(args: argparse.Namespace) -> int:
         registry_facts,
         take_inventory,
     )
+    from vibe_sentinel.exceptions import LLMConnectionError
 
     config, root = _load(args)
-    use_model = not getattr(args, "no_model", False)
     policy_arg = getattr(args, "policy", None)
 
     try:
@@ -951,6 +1054,12 @@ def run_packages(args: argparse.Namespace) -> int:
     # a check silently run against the wrong env is worse than no check.
     print(f"environment: {env.label} — Python {env.python} at {env.prefix}")
     print(f"policy: {policy.source}")
+    if policy.guidance:
+        # The licence gate's rule, and the stronger case for it: a note that
+        # steers a drafted sentence is worth disclosing, and one that steers
+        # a verdict able to clear a finding is worth disclosing more. Nobody
+        # should have to wonder why a pair came back `distinct`.
+        print(f"        house guidance applied, from {policy.source}")
     print(
         f"{len(inventory.installed)} package(s) installed, "
         f"{len(inventory.direct)} declared, "
@@ -972,9 +1081,11 @@ def run_packages(args: argparse.Namespace) -> int:
     print()
 
     findings = by_severity(findings)
-    adjudged = asyncio.run(
-        adjudicate(inventory, findings, policy, config, use_model=use_model)
-    )
+    try:
+        adjudged = asyncio.run(adjudicate(inventory, findings, policy, config))
+    except LLMConnectionError as e:
+        logger.error(str(e))
+        return 2
     _record_gate(
         root,
         shape_packages(inventory, findings, online=online, adjudication=adjudged),
@@ -1005,7 +1116,7 @@ def run_packages(args: argparse.Namespace) -> int:
         for item in finding.evidence[:8]:
             print(f"      · {item}")
         judgement = judged.get(finding.name)
-        if judgement is not None and judgement.verdict != "unreviewed":
+        if judgement is not None and judgement.verdict != "standing":
             # Said as a verdict rather than folded into the detail: which
             # of the two names is the imposter is the model's opinion, and
             # a reader has to be able to see that it is one.
@@ -1015,8 +1126,6 @@ def run_packages(args: argparse.Namespace) -> int:
             print(f"      model: not adjudicated — {judgement.reason or 'not asked'}")
         print(f"      -> {finding.remediation}")
 
-    if adjudged.note:
-        print(f"\n{adjudged.note}")
     print(
         "\nRecord a decision you have actually made as a [[packages.pin]] in "
         ".vibe-sentinel.toml,\nnaming the finding kinds it accepts. A pin is "
@@ -1030,13 +1139,14 @@ def run_credentials(args: argparse.Namespace) -> int:
     """Check for credentials at rest. 0 = clean, 1 = findings, 2 = error.
 
     Two stages: a pattern match over paths and content, then the local
-    model on what it flagged. ``--no-model`` stops after the first, which
-    is the CI path — the candidates are listed, plainly marked as
-    adjudicated by nobody.
+    model on what it flagged. Both always run: which candidates are real
+    is half of this check, so a run that could not ask exits 2 rather
+    than printing a list nobody judged.
     """
     import asyncio
 
     from vibe_sentinel import credentials as creds
+    from vibe_sentinel.exceptions import LLMConnectionError
     from vibe_sentinel.gates import shape_credentials
 
     config, root = _load(args)
@@ -1067,17 +1177,15 @@ def run_credentials(args: argparse.Namespace) -> int:
             "including the home-directory credential stores. Nothing there was "
             "ever\ncovered by a .gitignore, and an agent reads it with `cat`.\n"
         )
-    scan = creds.collect(root, secrets, policy, home=home)
+    scan = creds.search(root, secrets, policy, home=home)
 
-    findings = asyncio.run(
-        creds.adjudicate(
-            scan,
-            secrets,
-            policy,
-            config,
-            use_model=not getattr(args, "no_model", False),
-        )
-    )
+    try:
+        findings = asyncio.run(creds.adjudicate(scan, secrets, policy, config))
+    except LLMConnectionError as e:
+        # Deciding which pattern hits are real is half of this gate, so a
+        # run that could not ask is a failed run and not a shorter answer.
+        logger.error(str(e))
+        return 2
     _record_gate(root, shape_credentials(scan, findings, policy))
     render_credentials(findings, policy)
     return 1 if findings.failing(policy) else 0
@@ -1291,6 +1399,14 @@ def run_backend(args: argparse.Namespace) -> int:
         )
     if action == "stop":
         return backend.stop(config)
+    if action == "monitor":
+        count = max(1, int(getattr(args, "count", 1)))
+        interval = float(getattr(args, "interval", 2.0))
+        try:
+            return asyncio.run(backend.monitor(config, interval, count))
+        except KeyboardInterrupt:
+            # Watching is the point, so stopping watching is not a failure.
+            return 0
 
     logger.error("vibe-sentinel backend: no action given. Try 'backend status'.")
     return 2
@@ -1528,10 +1644,6 @@ def run_safety(args: argparse.Namespace) -> int:
                     print(f"  reason:  {reason}")
                     _record_finding(root, command, signals, verdict, reason, "", False)
                     return 1 if verdict == "unsafe" else 0
-
-                if getattr(args, "no_model", False):
-                    print("  --no-model: not asking for a verdict.")
-                    return 0
 
                 opinion = asyncio.run(
                     safety.review(

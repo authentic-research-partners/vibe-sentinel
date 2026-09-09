@@ -1,0 +1,300 @@
+# The danger set vibe-sentinel ships with.
+#
+# What the safety gate stops to think about, and what it asks the model when it
+# does. Layered exactly like `probes.default.toml`: a `[[danger]]` in your own
+# `.vibe-sentinel.toml` with a new `id` adds one, one reusing an id here
+# overrides it, `[safety] disable` removes one, `[safety] use` keeps only what
+# it names, and `use_builtins = false` starts from nothing.
+#
+# This file is data, not a default buried in Python, for the reason the whole
+# table is declarable in the first place: a shipped list of verbs cannot know
+# which of your database hosts is production. Read it, disagree with it, and
+# override the entry rather than the mechanism.
+#
+# `pattern` is the cheap stage — a regex over the command text, deciding
+# whether this is worth a model call at all. `question` is what the model is
+# then asked, one request per matched danger. Two entries carry no pattern
+# because what they ask is a fact about the tree rather than about the text:
+# `writing-outside-the-project` and `installing-undeclared-dependency`.
+#
+# `vibe-sentinel safety --print-dangers` prints the set as it resolves here.
+
+[[danger]]
+id = 'deleting-files'
+title = 'Deleting files or directories'
+question = """\
+    What exactly will this delete, once variables and globs are resolved \
+    from the history? Is every path it touches inside the work, and \
+    recoverable if this turns out to be a mistake?"""
+pattern = '\b(?:rm|rmdir|unlink|shred|srm)\b'
+
+[[danger]]
+id = 'overwriting-data'
+title = 'Writing over a device or an existing file'
+question = """\
+    What does this write over, and were the previous contents recoverable \
+    from anywhere else?"""
+pattern = '\b(?:dd|mkfs(?:\.\w+)?|truncate)\b|>\s*/'
+
+[[danger]]
+id = 'changing-permissions'
+title = 'Changing ownership or permissions'
+question = """\
+    Whose permissions does this change, and does anything it touches sit \
+    outside the project?"""
+pattern = '\b(?:chmod|chown|chgrp)\b'
+
+[[danger]]
+id = 'running-as-root'
+title = 'Running with elevated privileges'
+question = """\
+    Why does this need root, and does what it does reach outside the \
+    project?"""
+pattern = '\b(?:sudo|doas)\b'
+
+[[danger]]
+id = 'running-unseen-code'
+title = 'Executing code that arrives at run time'
+question = """\
+    Where does the code being executed come from, and is any of it visible \
+    here? Code fetched at run time can do anything, so what it will act on \
+    is in neither the command nor the history."""
+pattern = '''\|\s*(?:sudo\s+)?(?:ba|z|k|da)?sh\b|(?:^|[;&|(]\s*)eval\b|-[a-z]*c\s*["'`]\s*eval\b|[$<]\(\s*(?:sudo\s+)?(?:curl|wget)\b'''
+
+[[danger]]
+id = 'discarding-work'
+title = 'Discarding work that may not exist anywhere else'
+question = """\
+    Does this discard anything that is not recoverable — uncommitted \
+    changes, or commits that exist nowhere but here? Resetting a branch \
+    the agent itself just made is ordinary."""
+pattern = '\bgit\b[^|;&]*?\b(?:reset\s+--hard|clean\s+-[a-zA-Z]*f|push\b[^|;&]*--force|filter-branch|branch\s+-D)'
+
+[[danger]]
+id = 'reverting-changes'
+title = 'Undoing changes that were never committed'
+question = '''Whose changes does this undo, and where else do they exist? The history shows what this agent edited itself, and reverting that is ordinary. Edits that were already in the tree when it started are not: uncommitted work thrown away here is in no commit and no reflog, so nothing can bring it back. Say so if the agent is undoing changes it did not make, and never asked about.
+
+`git checkout NAME` is two commands wearing one name, so decide which one this is before anything else. If NAME is a branch it switches branches, touches no file, and is safe. If NAME is a path it throws that file's edits away: safe only where the history shows this agent made those edits itself, and unclear wherever the history does not say — including when it does not even settle whether NAME is a branch or a file.'''
+pattern = '\bgit\s+(?:-[cC]\s+\S+\s+|--[\w-]+\s+)*(?:restore\b|revert\b|stash\b(?!\s+(?:list|show|pop|apply))|checkout\b(?!\s+(?:-b|-B|--orphan|--track)\b)|switch\s+[^|;&]*?(?:-f\b|--force\b|--discard-changes\b))'
+
+[[danger]]
+id = 'rewriting-history'
+title = 'Rewriting or expiring commits that already exist'
+question = '''Which commits does this rewrite or drop, and does any of it exist anywhere else — pushed to a remote, or in another clone? Amending or rebasing commits the agent just made is ordinary. Expiring the reflog or pruning unreachable objects is not: that is the only copy of everything a rewrite left behind.
+
+For a reset, name the commits that stop being on the branch. A soft or mixed reset leaves every file exactly as it is and the reflog still holds what it moved past, so a reset over commits this agent made itself is ordinary. Unsafe needs a commit you can name that exists nowhere else; where the history does not show who made them, the answer is unclear.'''
+
+# Every reset that names something other than plain HEAD: `--hard` is
+# discarding-work's, but `reset HEAD~3` drops three commits just as quietly and
+# matched nothing at all. Bare `git reset` and `git reset HEAD -- path` only
+# unstage.
+pattern = '\bgit\s+(?:-[cC]\s+\S+\s+|--[\w-]+\s+)*(?:commit\s+[^|;&]*--amend|reset\b\s+(?!HEAD(?:\s+--)?(?:\s|$))\S|rebase\b(?!\s+--(?:abort|continue|skip))|reflog\s+(?:expire|delete)|gc\b[^|;&]*--prune|filter-repo\b|update-ref\s+-d)'
+
+[[danger]]
+id = 'acting-on-many-files'
+title = 'Running something over everything a search matches'
+question = """\
+    What set of files will this match, and what happens to each of them? \
+    Is the search rooted inside the work?"""
+pattern = '\bfind\b[^|;&]*\s-(?:delete|exec)\b'
+
+[[danger]]
+id = 'removing-infrastructure'
+title = 'Removing containers, images or cluster resources'
+question = """\
+    What does this remove or stop, and could anyone else be relying on it? \
+    A prune with --all reaches past this project."""
+pattern = '\b(?:docker|podman|kubectl)\b[^|;&]*\b(?:rm|rmi|prune|delete|down)\b'
+
+[[danger]]
+id = 'changing-a-database'
+title = 'Dropping or emptying database contents'
+question = """\
+    Which database does this act on, and does it hold real data? Name the \
+    host or connection string if the history shows one."""
+pattern = '\b(?:drop\s+(?:table|database|schema)|truncate\s+table|delete\s+from)\b'
+
+[[danger]]
+id = 'killing-processes'
+title = 'Killing processes by name or signal'
+question = """\
+    What will this kill, and is all of it something this agent started?"""
+pattern = '\b(?:pkill|killall)\b|\bkill\s+-9\b'
+
+[[danger]]
+id = 'writing-outside-the-project'
+title = 'Writing to a path outside the project'
+question = """\
+    This writes outside the project directory. Is that destination \
+    something this work should be modifying at all?"""
+applies_to = 'outside-project'
+
+[[danger]]
+id = 'installing-undeclared-dependency'
+title = 'Installing a package that nothing in the project declares'
+question = '''This installs one or more package names that no manifest in the tree declares; they are named above. Judge the names, not the command.
+
+Read the verdicts this way, because nothing here is about destroying anything:
+
+- safe:    the history shows why this name is wanted and what it is for, and it is a library you can identify.
+- unclear: the name arrived without a reason anyone can point at. Nothing asked for it, nothing imports it yet, and the history does not say where it came from.
+- unsafe:  the name looks like one thing wearing another's clothes — one edit from a package that is already installed, or a plausible-looking name for a library that may not exist.
+
+A model that does not know a library invents one, with a plausible name and a plausible import. Those invented names repeat, which makes them worth registering to somebody, so the install is the step that turns a guess into code that runs.
+
+Installing what the project already declares is ordinary and is not what you are being shown: these names are the ones nobody wrote down.'''
+applies_to = 'undeclared-install'
+
+
+# --- JavaScript toolchain ----------------------------------------------------
+# `requires` keeps every one of these out of a Python repository's danger set
+# entirely. What they have in common is that the command reaches something
+# outside the working tree and does not come back: a published version, a live
+# site, a resolved dependency graph. The rest of this list is mostly about
+# losing local work, which is the kind of loss a repository can absorb.
+
+[[danger]]
+id = 'publishing-a-package'
+title = 'Publishing a package to a registry'
+question = """\
+    A published version is public immediately and cannot be replaced — an \
+    unpublish window is narrow where it exists at all, and the version \
+    number is spent either way. Does the history show anyone asking for a \
+    release, and does this carry --dry-run?"""
+pattern = '\b(?:npm|yarn|pnpm|bun)\s+publish\b'
+requires = 'package.json'
+
+[[danger]]
+id = 'deploying-to-production'
+title = 'Deploying to a live environment'
+question = """\
+    This replaces what the public is currently being served. Does the \
+    history show the build and the tests that produced what is about to go \
+    out, and was a deploy what was being asked for — or is it a step the \
+    agent added to finish the job?"""
+pattern = '\bvercel\b[^|;&]*\s--prod\b|\bnetlify\s+deploy\b[^|;&]*\s--prod|\bfirebase\s+deploy\b|\bwrangler\s+(?:deploy|publish)\b|\bgh-pages\b'
+requires = 'package.json'
+
+[[danger]]
+id = 'forcing-a-dependency-resolution'
+title = 'Overriding the resolver to make an install succeed'
+question = """\
+    These flags do not fix an incompatibility, they proceed past one: the \
+    tree that results is a combination nothing declared and nothing \
+    tested. Does the history show the conflict this is silencing, and was \
+    resolving it the actual task?"""
+pattern = '\b(?:npm|pnpm|yarn|bun)\b[^|;&]*\s--(?:force|legacy-peer-deps)\b'
+requires = 'package.json'
+
+[[danger]]
+id = 'exposing-a-dev-server'
+title = 'Binding a development server to every interface'
+question = """\
+    A bare --host, or one bound to 0.0.0.0, serves this machine's \
+    development build to the whole network — including source maps, \
+    unminified source and whatever is in the environment. Is this running \
+    somewhere that is only ever a trusted network?"""
+
+# Two shapes, because a bound address and a bare flag are different things.
+# `--host 0.0.0.0` says it outright; a bare `--host` is Vite's spelling of the
+# same thing and is only bare if what follows is another flag or the end of the
+# command. Without that second half, `--host localhost` — which is the safe
+# form — matches, and the first person to hit that turns this gate off.
+pattern = '(?<![\w-])--host[=\s]+(?:0\.0\.0\.0|::)(?![\w.])|(?<![\w-])--host(?=\s*(?:$|[|;&]|-))'
+requires = 'package.json'
+
+
+# =============================================================================
+# Context signals
+# =============================================================================
+# Never a reason to escalate on their own, always worth attaching once
+# something else has — which is what `escalates = false` means. Declared here
+# as dangers rather than in a parallel list so they can be overridden,
+# disabled and added to like any other.
+
+[[danger]]
+id = 'filesystem-root'
+title = 'The filesystem root'
+question = ''
+pattern = '(?<![\w.~])/(?:\s|$|\*)'
+escalates = false
+
+[[danger]]
+id = 'home-directory'
+title = "The user's home directory"
+question = ''
+pattern = '(?<![\w.])~(?:/|\s|$)|\$HOME\b'
+escalates = false
+
+[[danger]]
+id = 'parent-escape'
+title = 'A path climbing out of the directory'
+question = ''
+pattern = '\.\./'
+escalates = false
+
+[[danger]]
+id = 'no-preserve-root'
+title = 'The guard against rm -rf / switched off'
+question = ''
+pattern = '--no-preserve-root'
+escalates = false
+
+[[danger]]
+id = 'unexpanded-variable'
+title = 'A variable that is still a variable'
+question = ''
+pattern = '\$\{?[A-Za-z_][A-Za-z0-9_]*\}?'
+escalates = false
+
+[[danger]]
+id = 'wildcard'
+title = 'A glob'
+question = ''
+pattern = '(?<!\w)\*'
+escalates = false
+
+[[danger]]
+id = 'recursive'
+title = 'A recursive flag'
+question = ''
+pattern = '(?<![\w-])-{1,2}[a-zA-Z-]*\b(?:r|R|rf|fr|recursive)\b'
+escalates = false
+
+[[danger]]
+id = 'force'
+title = 'A force flag'
+question = ''
+pattern = '(?<![\w-])-{1,2}[a-zA-Z-]*\b(?:f|force|yes)\b'
+escalates = false
+
+[[danger]]
+id = 'chained'
+title = 'Several commands in one'
+question = ''
+pattern = '(?:&&|\|\||;)'
+escalates = false
+
+
+# Both of these are reached by `deleting-files`, which already escalates an
+# `rm`. Declared as signals rather than as dangers of their own so the model is
+# asked once and told what is being deleted, instead of being asked twice about
+# one command — `rm -rf node_modules` is routine, and a gate that interrogates
+# it twice is the gate somebody switches off.
+
+[[danger]]
+id = 'lockfile'
+title = 'A lock file'
+question = ''
+pattern = '\b(?:package-lock\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?)\b'
+escalates = false
+requires = 'package.json'
+
+[[danger]]
+id = 'dependency-tree'
+title = 'The installed dependency tree'
+question = ''
+pattern = '\bnode_modules\b'
+escalates = false
+requires = 'package.json'

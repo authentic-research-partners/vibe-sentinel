@@ -302,6 +302,30 @@ def test_a_recent_backup_silences_the_backup_finding(project: Path) -> None:
     assert not any(f.code == "backup" for f in report.findings)
 
 
+def test_an_unreadable_timestamp_is_reported_not_measured_as_zero(
+    project: Path,
+) -> None:
+    """No fallbacks. A stored stamp that cannot be parsed used to stand in
+    as `now`, which measures zero days of history — indistinguishable from
+    a database created this morning, and it silenced the one finding that
+    should have fired: months of irreplaceable history with no backup.
+
+    The replaced value was plausible, which is the whole problem. Nothing
+    in the output said the number was made up.
+    """
+    _scan(project, days_ago=120)
+    with get_db(project) as conn:
+        conn.execute("UPDATE runs SET started_at = 'not a timestamp'")
+        conn.commit()
+        report = maintenance.check(
+            conn, project, SentinelConfig(db_backup_max_age_days=30)
+        )
+    finding = next(f for f in report.findings if f.code == "backup")
+    assert finding.severity == "warning"
+    assert "cannot read" in finding.message
+    assert "did not run" in finding.message, "it says which check it could not do"
+
+
 def test_declared_retention_reports_what_is_over_it(project: Path) -> None:
     _journal(project, [("old", 120), ("new", 1)])
     with get_db(project) as conn:

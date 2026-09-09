@@ -19,7 +19,7 @@ two places at once:
     mentioned again.
   - Accepting drift means making it the baseline, which records nobody's
     name, no reason and no date. Accepting one of these findings means
-    writing a pin, which :mod:`vibe_sentinel.pins` refuses to let you
+    writing a pin, which :mod:`vibe_sentinel.policy` refuses to let you
     write without all three.
 
 So a gate reports every run, at its own severity, and only a pin clears
@@ -27,6 +27,33 @@ it. What this module adds is one shape — :class:`GateFinding` — so the
 scan can record and render all three without knowing what a licence
 expression or a git exposure is, and one place where each gate's own
 vocabulary is translated into it.
+
+Three gates, one shape — and the names are the same wherever the stage
+is. Read down a column to see what a gate does; read across a row to see
+why two of the cells are empty::
+
+                  gather                audit           adjudicate
+    licenses      --                    audit()         --
+    packages      take_inventory()      audit()         adjudicate()
+    credentials   search()              --              adjudicate()
+
+*gather* reads the world and judges none of it. *audit* is the
+mechanical judgement against the policy — no model, reproducible, the
+same answer twice. *adjudicate* is where the model settles what the
+mechanism could not, and only that.
+
+The two gaps are the shape of the questions, not stages anybody forgot.
+The licence gate has nothing to gather, because installed package
+metadata already *is* the inventory, and nothing to adjudicate, because
+an SPDX expression against an allow-list has one answer and it is not an
+opinion. The credentials gate has no separate audit because its pattern
+match is the audit, done in the same walk — which is exactly why what
+comes out of ``search`` is a ``Candidate`` and not yet a finding.
+
+Where each policy comes from is not a fourth stage and is not here
+either: :func:`vibe_sentinel.policy.declared_layers` answers it once for
+all three, and each ``load_policy`` says in one line whether it merges
+those layers or takes the most specific.
 
 Nothing here judges. Each function calls the gate's own collector, which
 is the same call ``vibe-sentinel licenses`` / ``packages`` /
@@ -47,6 +74,7 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 
 from vibe_sentinel.schemas import GateFinding, GateReport, GateState
+from vibe_sentinel.exceptions import LLMConnectionError
 
 if TYPE_CHECKING:
     from vibe_sentinel.config import SentinelConfig
@@ -90,8 +118,8 @@ def shape_licenses(
     ``source:<path>``.
     """
     findings: list[GateFinding] = []
-    for violation in bad:
-        resolved = violation.resolved
+    for finding in bad:
+        resolved = finding.resolved
         findings.append(
             GateFinding(
                 gate="licenses",
@@ -99,7 +127,7 @@ def shape_licenses(
                 kind="dependency",
                 subject=f"{resolved.name}:{resolved.version}",
                 label=f"{resolved.name} {resolved.version} — {resolved.spdx}",
-                detail=violation.why,
+                detail=finding.why,
                 verdict="not-accepted",
                 failing=True,
                 attrs={
@@ -169,7 +197,7 @@ def collect_licenses(root: Path, policy_path: Path | None = None) -> GateReport:
     import importlib.metadata as md
 
     from vibe_sentinel.licenses import (
-        check,
+        audit,
         evaluate_expression,
         load_policy,
         project_license,
@@ -183,7 +211,7 @@ def collect_licenses(root: Path, policy_path: Path | None = None) -> GateReport:
     except (KeyError, ValueError) as e:
         return _failed("licenses", str(e), started)
 
-    ok, bad = check(list(md.distributions()), policy)
+    ok, bad = audit(list(md.distributions()), policy)
     own = project_license(root, policy.all_markers())
     return shape_licenses(
         ok_count=len(ok),
@@ -240,7 +268,10 @@ def shape_packages(
                 verdict=judgement.verdict if judgement is not None else finding.kind,
                 failing=judgement.failing if judgement is not None else True,
                 pinned=judgement is not None and judgement.verdict == "pinned",
-                adjudicated=judgement is not None and judgement.reviewed,
+                adjudicated=(
+                    judgement is not None
+                    and judgement.verdict not in ("pinned", "standing")
+                ),
                 reason=(
                     judgement.reason
                     if judgement is not None and judgement.reason
@@ -251,10 +282,9 @@ def shape_packages(
         )
     env = inventory.environment
     failing = sum(1 for f in shaped if f.failing)
-    reviewed = adjudication is not None and adjudication.reviewed
     return GateReport(
         gate="packages",
-        adjudicated=reviewed,
+        adjudicated=any(f.adjudicated for f in shaped),
         findings=tuple(shaped),
         summary=(
             f"{len(inventory.installed)} installed, {len(inventory.direct)} declared "
@@ -269,7 +299,6 @@ async def collect_packages(
     root: Path,
     config: SentinelConfig | None = None,
     policy_path: Path | None = None,
-    use_model: bool = True,
 ) -> GateReport:
     """Run the provenance gate's collect stage over ``root``.
 
@@ -317,9 +346,7 @@ async def collect_packages(
         )
 
     findings = by_severity(audit(inventory, policy))
-    adjudged = await adjudicate(
-        inventory, findings, policy, config, use_model=use_model
-    )
+    adjudged = await adjudicate(inventory, findings, policy, config)
     return shape_packages(
         inventory,
         findings,
@@ -355,7 +382,7 @@ def shape_credentials(
             verdict=j.verdict,
             failing=id(j) in failing,
             pinned=j.verdict == "pinned",
-            adjudicated=j.reviewed,
+            adjudicated=j.verdict != "pinned",
             reason=j.reason,
             attrs={
                 "matches": str(len(j.candidate.lines)),
@@ -366,12 +393,11 @@ def shape_credentials(
     ]
     return GateReport(
         gate="credentials",
-        adjudicated=found.reviewed,
+        adjudicated=any(f.adjudicated for f in findings),
         findings=tuple(findings),
         summary=(
             f"{scan.files_read} file(s) read, {len(scan.candidates)} candidate(s), "
             f"{len(failing)} failing"
-            + ("" if found.reviewed else " — NOT adjudicated, verdicts are mechanical")
         ),
         duration_ms=duration_ms,
     )
@@ -381,7 +407,6 @@ async def collect_credentials(
     root: Path,
     config: SentinelConfig | None = None,
     policy_path: Path | None = None,
-    use_model: bool = True,
 ) -> GateReport:
     """Run the credentials gate over ``root``.
 
@@ -398,7 +423,7 @@ async def collect_credentials(
     except (FileNotFoundError, KeyError, ValueError) as e:
         return _failed("credentials", str(e), started)
 
-    scan = creds.collect(root, secrets, policy)
+    scan = creds.search(root, secrets, policy)
     if scan.truncated:
         return _failed(
             "credentials",
@@ -408,7 +433,14 @@ async def collect_credentials(
             started,
         )
 
-    found = await creds.adjudicate(scan, secrets, policy, config, use_model=use_model)
+    try:
+        found = await creds.adjudicate(scan, secrets, policy, config)
+    except LLMConnectionError as e:
+        # Deciding which pattern hits are real is half of this gate, so a
+        # run that could not ask has not completed. Reported as the gate's
+        # own failure rather than allowed out, like every other way this
+        # one can stop short.
+        return _failed("credentials", str(e), started)
     return shape_credentials(
         scan, found, policy, duration_ms=int((time.monotonic() - started) * 1000)
     )
@@ -417,7 +449,6 @@ async def collect_credentials(
 async def collect_all(
     root: Path,
     config: SentinelConfig | None = None,
-    use_model: bool = True,
 ) -> GateState:
     """Run every gate's collect stage over ``root``.
 
@@ -437,13 +468,9 @@ async def collect_all(
             if gate == "licenses":
                 reports.append(collect_licenses(root))
             elif gate == "packages":
-                reports.append(
-                    await collect_packages(root, config, use_model=use_model)
-                )
+                reports.append(await collect_packages(root, config))
             else:
-                reports.append(
-                    await collect_credentials(root, config, use_model=use_model)
-                )
+                reports.append(await collect_credentials(root, config))
         except Exception as e:  # noqa: BLE001 - one gate must not lose the others
             reports.append(_failed(gate, f"{type(e).__name__}: {e}", started))
     return GateState(reports=tuple(reports))

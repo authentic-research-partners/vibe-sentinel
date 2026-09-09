@@ -281,6 +281,31 @@ def main(argv: list[str] | None = None) -> int:
             }
         )
 
+        # The same fact as a proportion, and a key of its own because a
+        # question about a *share* cannot be answered from a count. The
+        # lens that reads this probe asks whether the share is rising;
+        # handed `before=14 after=16` and the denominator only in prose,
+        # a small model believes the two numbers, which is measured and
+        # was not fixed by three rewordings of the question. So the ratio
+        # is a value: when the share falls while the count rises, the
+        # report says `shrank` beside `grew` and the answer is visible
+        # rather than argued for.
+        observations.append(
+            {
+                "key": f"silent-share:{directory}",
+                "value": round(t.silent / t.handlers, 4),
+                "label": (
+                    f"{directory}: {t.silent / t.handlers:.1%} of handlers "
+                    f"discard the error ({t.silent} of {t.handlers})"
+                ),
+                "attrs": {
+                    "silent": str(t.silent),
+                    "handlers": str(t.handlers),
+                    "in_files": str(len(t.files)),
+                },
+            }
+        )
+
     # Tree-wide, and reported even at zero: the per-directory keys come
     # and go, so this is the series that is continuous enough to trend.
     observations.append(
@@ -304,7 +329,31 @@ def main(argv: list[str] | None = None) -> int:
 
     # Counted before the gap observation is appended: this is how many
     # directories carry a `silent-in:` key, not how long the list is.
-    reporting_dirs = len(observations) - 1
+    observations.append(
+        {
+            "key": "silent-share-total",
+            "value": round(total_silent / total_handlers, 4) if total_handlers else 0.0,
+            "label": (
+                f"{(total_silent / total_handlers if total_handlers else 0):.1%} of "
+                f"handlers tree-wide discard the error "
+                f"({total_silent} of {total_handlers})"
+            ),
+            "attrs": {
+                "silent": str(total_silent),
+                "handlers": str(total_handlers),
+            },
+        }
+    )
+
+    # Derived from the keys themselves rather than from how long the list
+    # is. It was `len(observations) - 1` while a directory contributed one
+    # entry and the tree-wide total was the only other; `silent-share:<dir>`
+    # and `silent-share-total` made that arithmetic silently wrong, and it
+    # printed "across 7 of 3 directories". A count of a thing is counted
+    # from the thing.
+    reporting_dirs = sum(
+        1 for o in observations if str(o["key"]).startswith("silent-in:")
+    )
     gaps = not_measured(skipped, unreadable_dirs(root))
     observations.append(gaps)
 

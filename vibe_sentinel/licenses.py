@@ -52,18 +52,16 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from vibe_sentinel.paths import CONFIG_FILENAME
-from vibe_sentinel.pins import check_pins as pin_check
+from vibe_sentinel.probes import EXCLUDED_DIRS
+from vibe_sentinel.policy import PROJECT_CONFIG, declared_layers
+from vibe_sentinel.policy import check_pins as pin_check
+from vibe_sentinel.policy import matching as pin_matching
 
 if TYPE_CHECKING:  # pragma: no cover - import-time cost is the whole point
     import httpx
 
     from vibe_sentinel.config import SentinelConfig
     from vibe_sentinel.schemas import LicenceDraft
-
-#: The project's own config file. A ``[licenses]`` table here is the normal
-#: place to put the policy — one config file for the whole tool.
-PROJECT_CONFIG = Path(CONFIG_FILENAME)
 
 #: Standalone policy file, checked when the project config has no
 #: ``[licenses]`` table. Useful when an organisation ships one policy across
@@ -649,7 +647,7 @@ def check_pins(data: Mapping[str, Any], where: str) -> None:
 
     ``reason`` and ``verified`` are required, not decorative. A pin without them
     is ``--ignore-packages`` with extra steps, which is the mechanism this module
-    was written to replace. The check itself lives in :mod:`vibe_sentinel.pins`
+    was written to replace. The check itself lives in :mod:`vibe_sentinel.policy`
     because the provenance and credentials gates make the same promise about
     their own pins, and for a while only this one kept it.
     """
@@ -1283,19 +1281,10 @@ def scan_source(
     no licence statement is not reported: in a single-licensed project that is
     every file, and listing them all would bury the handful that matter.
     """
-    skip = {
-        ".git",
-        ".venv",
-        "venv",
-        "__pycache__",
-        "node_modules",
-        ".mypy_cache",
-        ".ruff_cache",
-        ".pytest_cache",
-        "dist",
-        "build",
-        ".vibe-sentinel",
-    }
+    # EXCLUDED_DIRS, the one definition — this was an inline copy, and the
+    # shortest of the four: `site-packages` was not in it, so a licence
+    # header in a vendored dependency was read as this project's own.
+    skip = EXCLUDED_DIRS
     found: list[SourceLicense] = []
     for pattern in patterns:
         for path in sorted(root.rglob(pattern)):
@@ -1369,6 +1358,16 @@ def project_license(
 # --------------------------------------------------------------------------------------
 
 
+def _pin_accepts(pin: Mapping[str, Any], canonical_spdx: str) -> bool:
+    """Whether one pin's ``accept`` covers an already-canonicalised licence.
+
+    Not :func:`policy.accepts_value`: `MIT AND Apache-2.0` and
+    `Apache-2.0 AND MIT` are the same licence and different strings, so
+    the comparison here has to canonicalise both sides.
+    """
+    return canonical_spdx in {canonical_conjunction(a).lower() for a in pin["accept"]}
+
+
 class Policy(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -1398,13 +1397,34 @@ class Policy(BaseModel):
         """The built-in fingerprints followed by the config's own."""
         return MARKERS + self.markers
 
-    def pin_for(self, package: str) -> dict[str, Any] | None:
+    def pins_for(self, package: str) -> list[Mapping[str, Any]]:
+        """Every pin naming this package, in declaration order.
+
+        All of them: a package covered by an earlier pin used to be
+        unreachable from a later one, so a second entry recording a
+        second reading of the same licence settled nothing.
+        """
         low = package.lower().replace("_", "-")
-        for pin in self.pins:
-            for pattern in pin["packages"]:
-                if fnmatch.fnmatch(low, pattern.lower().replace("_", "-")):
-                    return pin
-        return None
+        return pin_matching(
+            self.pins,
+            subject="packages",
+            matches=lambda pattern: fnmatch.fnmatch(
+                low, pattern.lower().replace("_", "-")
+            ),
+        )
+
+    def pin_for(self, package: str, spdx: str = "") -> Mapping[str, Any] | None:
+        """The pin that accepts this licence, or the first naming the package.
+
+        Given an ``spdx``, the pin returned is the one whose ``accept``
+        actually covers it — the one whose recorded reason is the reason
+        this package passed.
+        """
+        found = self.pins_for(package)
+        if not spdx:
+            return found[0] if found else None
+        want = canonical_conjunction(spdx).lower()
+        return next((pin for pin in found if _pin_accepts(pin, want)), None)
 
 
 def policy_from_data(
@@ -1503,14 +1523,10 @@ def merge_policies(layers: Sequence[Policy]) -> Policy:
 def load_policy(path: Path | None = None, root: Path | None = None) -> Policy:
     """Resolve the licence policy for ``root``.
 
-    Two layers, base first — the same shape as the probe set:
+    The layers :func:`policy.declared_layers` finds, *merged* — this is
+    the one gate that merges them, so a project declaring a single pin
+    keeps everything the organisation-wide file said.
 
-      1. ``security/license-policy.toml`` — the organisation-wide policy,
-         shared across repos and usually owned by whoever reviews licences.
-      2. A ``[licenses]`` table in the project's ``.vibe-sentinel.toml`` —
-         this project, layered on top.
-
-    A project that declares only a pin keeps everything the shared file said.
     ``--policy PATH`` bypasses both and uses exactly that file, because a
     path typed on the command line is not an accident.
 
@@ -1524,16 +1540,9 @@ def load_policy(path: Path | None = None, root: Path | None = None) -> Policy:
             raise FileNotFoundError(f"No licence policy at {path}.")
         return policy_from_data(tomllib.loads(path.read_text()), str(path))
 
-    tables: list[tuple[dict[str, Any], str]] = []
+    tables = declared_layers(root, table="licenses", standalone=POLICY_PATH)
     standalone = root / POLICY_PATH
-    if standalone.exists():
-        tables.append((tomllib.loads(standalone.read_text()), str(standalone)))
-
     project = root / PROJECT_CONFIG
-    if project.exists():
-        data = tomllib.loads(project.read_text())
-        if "licenses" in data:
-            tables.append((data["licenses"], f"{project} [licenses]"))
 
     # Two passes, because a layer's allowed_categories may name a category the
     # OTHER layer defines -- an organisation defining "internal" and a project
@@ -1562,7 +1571,7 @@ def load_policy(path: Path | None = None, root: Path | None = None) -> Policy:
     return policy
 
 
-class Violation(BaseModel):
+class Finding(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     resolved: Resolved
@@ -1610,35 +1619,36 @@ def _why_rejected(spdx: str, policy: Policy) -> str:
     )
 
 
-def check(
+def audit(
     dists: list[md.Distribution], policy: Policy
-) -> tuple[list[Resolved], list[Violation]]:
+) -> tuple[list[Resolved], list[Finding]]:
     ok: list[Resolved] = []
-    bad: list[Violation] = []
+    bad: list[Finding] = []
     for dist in dists:
         if not (dist.metadata and dist.metadata.get("Name")):
             continue
         res = resolve(dist, policy.all_markers())
-        pin = policy.pin_for(res.name)
-        if pin is not None:
+        pins = policy.pins_for(res.name)
+        if pins:
             # A pin records the license we verified by hand. If upstream relicenses,
             # the resolved value stops matching and the gate fails -- which is exactly
             # what --ignore-packages could never do.
-            accepted = {canonical_conjunction(a).lower() for a in pin["accept"]}
-            if canonical_conjunction(res.spdx).lower() in accepted:
+            want = canonical_conjunction(res.spdx).lower()
+            if any(_pin_accepts(pin, want) for pin in pins):
                 ok.append(res)
             else:
+                every = sorted({str(a) for pin in pins for a in pin["accept"]})
                 bad.append(
-                    Violation(
+                    Finding(
                         resolved=res,
-                        why=f"pinned to {pin['accept']} but resolved to {res.spdx!r} "
+                        why=f"pinned to {every} but resolved to {res.spdx!r} "
                         f"-- upstream license may have changed; re-verify and update the pin",
                     )
                 )
             continue
         if res.spdx == UNIDENTIFIED:
             bad.append(
-                Violation(
+                Finding(
                     resolved=res,
                     why="no license metadata and no identifiable license file",
                 )
@@ -1647,5 +1657,5 @@ def check(
         if evaluate_expression(res.spdx, policy.allowed, policy.exceptions):
             ok.append(res)
         else:
-            bad.append(Violation(resolved=res, why=_why_rejected(res.spdx, policy)))
+            bad.append(Finding(resolved=res, why=_why_rejected(res.spdx, policy)))
     return ok, bad

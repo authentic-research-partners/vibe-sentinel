@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vibe-sentinel"
-version = "0.2.0"
-description = "Guards structural expectations about how a codebase is organized, and reports drift."
+version = "0.3.0"
+description = "Safeguards a codebase against the problems AI coding agents introduce: structural drift, secrets at rest, unvetted dependencies, and dangerous commands."
 requires-python = ">=3.13,<3.14"
 license = "MIT"
 authors = [{ name = "Sergey Samsonau" }]
@@ -69,16 +69,22 @@ vibe-sentinel = "vibe_sentinel.__main__:main"
 include = ["vibe_sentinel*"]
 
 [tool.setuptools.package-data]
-"vibe_sentinel" = ["example.vibe-sentinel.toml", "probes.default.toml"]
+"vibe_sentinel" = [
+    "example.vibe-sentinel.toml",
+    "probes.default.toml",
+    "dangers.default.toml",
+    "secrets.default.toml",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
 # No `markers` table: nothing is marked. Every test here runs without a
-# GPU and without a model, which is the whole point of `--no-model` being
-# a first-class path — so a declared `integration` marker that no test
-# carried was describing a suite this project does not have. Declare one
-# again in the same commit that marks a test with it.
+# GPU, because an autouse fixture in conftest.py stubs `llm_query` rather
+# than because the package has a model-free path — it does not. So a
+# declared `integration` marker that no test carried was describing a
+# suite this project does not have. Declare one again in the same commit
+# that marks a test with it.
 addopts = "-n auto -p no:cacheprovider"
 
 [tool.bandit]
@@ -157,6 +163,13 @@ select = [
 # every tool call, so the danger set has to load without building a
 # pydantic model. Its docstring carries the justification.
 "vibe_sentinel/safety.py" = ["TID251"]
+# The eval CLI, same reason as the tool's own: its report IS stdout.
+# Everything else under evals/ logs through loguru like the package does.
+"evals/__main__.py" = ["T201"]
+# The benchmark CLI, for the third time: a table of durations is the
+# output, not a diagnostic about it. Everything else under benchmarks/
+# returns strings or logs, so this is the only file that needs it.
+"benchmarks/__main__.py" = ["T201"]
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
 "logging".msg = "Use loguru — 'from loguru import logger'."

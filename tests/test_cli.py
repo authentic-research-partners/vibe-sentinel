@@ -179,7 +179,7 @@ def test_scan_records_a_run_and_reports_no_drift(
     tmp_path: Path, capfd: pytest.CaptureFixture[str]
 ) -> None:
     _one_probe(tmp_path)
-    assert main(["scan", str(tmp_path), "--no-model"]) == 0
+    assert main(["scan", str(tmp_path)]) == 0
     out = capfd.readouterr().out
     assert "recorded as run 1" in out
 
@@ -188,25 +188,45 @@ def test_scan_exits_one_on_drift(
     tmp_path: Path, capfd: pytest.CaptureFixture[str]
 ) -> None:
     _one_probe(tmp_path, value=1.0)
-    main(["scan", str(tmp_path), "--no-model"])
+    main(["scan", str(tmp_path)])
     _one_probe(tmp_path, value=9.0)
-    assert main(["scan", str(tmp_path), "--no-model"]) == 1
+    assert main(["scan", str(tmp_path)]) == 1
     assert "Drift since" in capfd.readouterr().out
 
 
-def test_scan_does_not_claim_a_review_that_did_not_happen(
+@pytest.mark.parametrize(
+    "body",
+    [
+        '[[danger]]\nid = "a"\nquestion = "y"\npattern = "([unclosed"\n',
+        '[safety]\nmode = "enfroce"\n',
+    ],
+)
+def test_a_scan_refuses_a_safety_config_it_cannot_read(
+    tmp_path: Path, body: str
+) -> None:
+    """The scan is where somebody can read the error and fix the line. The
+    other place to find out is the hook, which runs in front of a tool call
+    — where the only honest answer to "this will not parse" is to refuse the
+    command. Same rule as a lens watching a probe that does not exist."""
+    _one_probe(tmp_path)
+    with (tmp_path / ".vibe-sentinel.toml").open("a", encoding="utf-8") as f:
+        f.write("\n" + body)
+
+    assert main(["scan", str(tmp_path)]) == 2
+
+
+def test_scan_names_who_rated_the_severities(
     tmp_path: Path, capfd: pytest.CaptureFixture[str]
 ) -> None:
-    """The terminal renderer is the one a person actually reads, and it
-    used to print `[medium]` under --no-model with nothing saying the
-    severities came from the comparison rather than from a model."""
+    """The terminal renderer is the one a person actually reads, and a
+    `[medium]` a reader cannot trace is one they have to take on faith.
+    It used to print that with nothing saying where it came from."""
     _one_probe(tmp_path, value=1.0)
-    main(["scan", str(tmp_path), "--no-model"])
+    main(["scan", str(tmp_path)])
     _one_probe(tmp_path, value=9.0)
-    main(["scan", str(tmp_path), "--no-model"])
+    main(["scan", str(tmp_path)])
     out = capfd.readouterr().out
-    assert "mechanical comparison only" in out
-    assert "reviewed by an independent local model" not in out
+    assert "reviewed by an independent local model" in out
 
 
 def test_scan_json_stays_parseable(
@@ -214,7 +234,7 @@ def test_scan_json_stays_parseable(
 ) -> None:
     """A scan piped into another tool must not have prose in it."""
     _one_probe(tmp_path)
-    main(["scan", str(tmp_path), "--no-model", "--format", "json"])
+    main(["scan", str(tmp_path), "--format", "json"])
     payload = json.loads(capfd.readouterr().out)
     assert payload["snapshot"]["probes"]["tiny"]["summary"] == "ok"
 
@@ -223,7 +243,7 @@ def test_scan_agent_format_is_the_constraint_block(
     tmp_path: Path, capfd: pytest.CaptureFixture[str]
 ) -> None:
     _one_probe(tmp_path)
-    main(["scan", str(tmp_path), "--no-model", "--format", "agent"])
+    main(["scan", str(tmp_path), "--format", "agent"])
     assert "VIBE SENTINEL: BASELINE RECORDED" in capfd.readouterr().out
 
 
@@ -231,7 +251,7 @@ def test_an_unknown_probe_id_is_an_error_not_an_empty_run(
     tmp_path: Path, logged: list[str]
 ) -> None:
     _one_probe(tmp_path)
-    assert main(["scan", str(tmp_path), "--no-model", "--probes", "nope"]) == 2
+    assert main(["scan", str(tmp_path), "--probes", "nope"]) == 2
     assert "Unknown probe id" in "".join(logged)
 
 
@@ -289,9 +309,9 @@ def test_scan_reports_the_declared_horizons_without_being_asked(
     """The shipped set is 1w and 1m, and a flag nobody types catches
     nothing — which is why they are not a flag."""
     _one_probe(tmp_path)
-    main(["scan", str(tmp_path), "--no-model"])
+    main(["scan", str(tmp_path)])
     capfd.readouterr()
-    main(["scan", str(tmp_path), "--no-model"])
+    main(["scan", str(tmp_path)])
     out = capfd.readouterr().out
     assert "Also moved, over longer horizons" in out
     assert "1w" in out and "1m" in out
@@ -301,9 +321,9 @@ def test_since_replaces_the_declared_horizons_for_one_run(
     tmp_path: Path, capfd: pytest.CaptureFixture[str]
 ) -> None:
     _one_probe(tmp_path)
-    main(["scan", str(tmp_path), "--no-model"])
+    main(["scan", str(tmp_path)])
     capfd.readouterr()
-    main(["scan", str(tmp_path), "--no-model", "--since", "2y,3y"])
+    main(["scan", str(tmp_path), "--since", "2y,3y"])
     out = capfd.readouterr().out
     assert "2y" in out and "3y" in out
     assert "1w" not in out
@@ -315,9 +335,9 @@ def test_an_empty_since_turns_horizons_off_for_one_run(
     """Distinguished from "not given" by the empty string, which a
     truthiness test would fold into the default."""
     _one_probe(tmp_path)
-    main(["scan", str(tmp_path), "--no-model"])
+    main(["scan", str(tmp_path)])
     capfd.readouterr()
-    main(["scan", str(tmp_path), "--no-model", "--since", ""])
+    main(["scan", str(tmp_path), "--since", ""])
     assert "longer horizons" not in capfd.readouterr().out
 
 
@@ -325,7 +345,7 @@ def test_a_horizon_that_is_not_one_stops_the_scan_and_names_the_units(
     tmp_path: Path, logged: list[str]
 ) -> None:
     _one_probe(tmp_path)
-    assert main(["scan", str(tmp_path), "--no-model", "--since", "1 week"]) == 2
+    assert main(["scan", str(tmp_path), "--since", "1 week"]) == 2
     assert "w (weeks)" in "".join(logged)
 
 
@@ -337,14 +357,14 @@ def test_a_horizon_reports_what_the_baseline_cannot_and_still_exits_zero(
     finding there would fail every scan until it aged out, with nothing
     anyone could do to clear it."""
     _one_probe(tmp_path, value=1.0)
-    main(["scan", str(tmp_path), "--no-model"])
+    main(["scan", str(tmp_path)])
     _backdate(tmp_path, 1, days=2)
 
     _one_probe(tmp_path, value=9.0)
-    main(["scan", str(tmp_path), "--no-model", "--update"])
+    main(["scan", str(tmp_path), "--update"])
     capfd.readouterr()
 
-    assert main(["scan", str(tmp_path), "--no-model", "--since", "1d"]) == 0
+    assert main(["scan", str(tmp_path), "--since", "1d"]) == 0
     out = capfd.readouterr().out
     assert "No change since" in out
     assert "1d" in out
@@ -360,7 +380,7 @@ def test_a_failed_probe_makes_the_scan_exit_two(
         '[[probe]]\nid = "broken"\ntitle = "t"\n'
         'command = ["python", "-c", "raise SystemExit(3)"]\n',
     )
-    assert main(["scan", str(tmp_path), "--no-model"]) == 2
+    assert main(["scan", str(tmp_path)]) == 2
     assert "probe(s) failed" in "".join(logged)
 
 
@@ -406,7 +426,7 @@ def test_history_lists_the_run_it_compares_against(
     tmp_path: Path, capfd: pytest.CaptureFixture[str]
 ) -> None:
     _one_probe(tmp_path)
-    main(["scan", str(tmp_path), "--no-model"])
+    main(["scan", str(tmp_path)])
     assert main(["history", str(tmp_path)]) == 0
     assert "*baseline" in capfd.readouterr().out
 
@@ -508,6 +528,60 @@ def test_print_dangers_shows_what_is_asked(
     assert "context signal" in out
 
 
+def test_a_multi_paragraph_question_stays_under_its_label(
+    project: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """Column zero is where the danger *ids* are.
+
+    A continuation line printed there reads as commentary on the whole
+    list rather than as part of the entry above it, which is what makes
+    the list unscannable once it is long.
+    """
+    _config(
+        project,
+        '[[danger]]\nid = "multi"\npattern = "x"\n'
+        'question = """First line.\n\nSecond paragraph."""\n',
+    )
+    assert main(["safety", str(project), "--print-dangers"]) == 0
+    lines = capfd.readouterr().out.splitlines()
+
+    (head,) = [ln for ln in lines if "First line." in ln]
+    (rest,) = [ln for ln in lines if "Second paragraph." in ln]
+    assert head.startswith("  asks:     ")
+    assert rest.startswith(" " * len("  asks:     ") + "Second")
+    assert "" in lines, "the blank line between paragraphs is not padded"
+
+
+def test_describing_the_configuration_never_opens_the_database(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--print-dangers` returns before anything opens the database, so a
+    warning about its condition would land on the reader who asked what
+    the tool checks for — about a thing that could not have affected
+    them.
+
+    Asserted against the call rather than against the log: a healthy
+    database has nothing to warn about, so an assertion on the output
+    would pass whether or not the check ran.
+    """
+    from vibe_sentinel.db import maintenance
+
+    checked: list[Path] = []
+    monkeypatch.setattr(
+        maintenance, "maybe_check", lambda root, config: checked.append(root)
+    )
+
+    assert main(["safety", str(project), "--print-dangers"]) == 0
+    assert checked == []
+
+    # The control: a command that does read the database still gets the
+    # check. Its own exit code is beside the point — `history` on an
+    # empty database is an error, and `auto_check` runs before either
+    # way.
+    main(["history", str(project)])
+    assert checked, "the check must still run where the database is used"
+
+
 def test_a_broken_danger_set_is_an_error_with_the_file_named(
     project: Path, logged: list[str]
 ) -> None:
@@ -530,16 +604,15 @@ def test_match_measures_a_pattern_against_real_history(
 # --- the gates -------------------------------------------------------------
 
 
-def test_credentials_no_model_says_nobody_judged(
+def test_credentials_says_which_model_judged(
     tmp_path: Path, capfd: pytest.CaptureFixture[str]
 ) -> None:
-    """The CI path. Listing candidates is fine; letting the listing read
-    as a verdict is not."""
+    """Who decided is part of the finding. There is no listing that is not
+    a verdict any more — a run that could not ask exits 2 instead."""
     (tmp_path / ".env").write_text('AWS_SECRET_ACCESS_KEY="notarealkeyatall"\n')
-    assert main(["credentials", str(tmp_path), "--no-model"]) == 1
+    assert main(["credentials", str(tmp_path)]) == 1
     out = capfd.readouterr().out
-    assert "NOT adjudicated" in out
-    assert "adjudicated by nobody" in out
+    assert "adjudicated by" in out
 
 
 def test_credentials_redacts_what_it_prints(
@@ -549,7 +622,7 @@ def test_credentials_redacts_what_it_prints(
     that nothing else can make for it."""
     secret = "sk-ant-" + "a1B2c3D4" * 6
     (tmp_path / "settings.py").write_text(f'API_KEY = "{secret}"\n')
-    main(["credentials", str(tmp_path), "--no-model"])
+    main(["credentials", str(tmp_path)])
     out = capfd.readouterr().out
     assert secret not in out
     assert "redacted" in out
@@ -572,7 +645,7 @@ def test_a_pin_missing_its_reason_is_an_error(
         "[credentials]\n\n[[credentials.pin]]\n"
         'paths = ["x/*.pem"]\naccept = ["private-key-file"]\n',
     )
-    assert main(["credentials", str(tmp_path), "--no-model"]) == 2
+    assert main(["credentials", str(tmp_path)]) == 2
     assert "is missing reason, verified" in "".join(logged)
 
 
@@ -607,7 +680,7 @@ def test_the_automatic_check_cannot_change_an_exit_code(
 
     monkeypatch.setattr(maintenance, "maybe_check", explode)
     _one_probe(tmp_path)
-    assert main(["scan", str(tmp_path), "--no-model"]) == 0
+    assert main(["scan", str(tmp_path)]) == 0
 
 
 def test_the_automatic_check_never_writes_to_stdout(
@@ -621,7 +694,7 @@ def test_the_automatic_check_never_writes_to_stdout(
         (tmp_path / ".vibe-sentinel.toml").read_text()
         + "\n[database]\nmax_journal_commands = 1\nbackup_max_age_days = 1\n",
     )
-    main(["scan", str(tmp_path), "--no-model", "--format", "json"])
+    main(["scan", str(tmp_path), "--format", "json"])
     json.loads(capfd.readouterr().out)
 
 
@@ -688,7 +761,7 @@ def test_scan_fits_the_history_without_being_asked(
     # Same value the last run recorded, so the baseline comparison has
     # nothing to say and the section under test is the only one talking.
     _one_probe(tmp_path, value=23.0)
-    assert main(["scan", str(tmp_path), "--no-model"]) == 0
+    assert main(["scan", str(tmp_path)]) == 0
     out = capfd.readouterr().out
     assert "Sustained trends" in out
     assert "rising" in out
@@ -701,13 +774,13 @@ def test_fit_zero_turns_the_fits_off_for_one_run(
     # Same value the last run recorded, so the baseline comparison has
     # nothing to say and the section under test is the only one talking.
     _one_probe(tmp_path, value=23.0)
-    assert main(["scan", str(tmp_path), "--no-model", "--fit", "0"]) == 0
+    assert main(["scan", str(tmp_path), "--fit", "0"]) == 0
     assert "Sustained trends" not in capfd.readouterr().out
 
 
 def test_a_negative_fit_window_is_refused(tmp_path: Path, logged: list[str]) -> None:
     _one_probe(tmp_path)
-    assert main(["scan", str(tmp_path), "--no-model", "--fit", "-5"]) == 2
+    assert main(["scan", str(tmp_path), "--fit", "-5"]) == 2
     assert "number of runs" in "".join(logged)
 
 
@@ -720,7 +793,7 @@ def test_a_trend_does_not_change_the_exit_code(
     # Same value the last run recorded, so the baseline comparison has
     # nothing to say and the section under test is the only one talking.
     _one_probe(tmp_path, value=23.0)
-    assert main(["scan", str(tmp_path), "--no-model"]) == 0
+    assert main(["scan", str(tmp_path)]) == 0
     assert "rising" in capfd.readouterr().out
 
 
@@ -756,3 +829,48 @@ def test_trend_says_when_the_history_is_too_short_to_fit(
     logs = "".join(logged)
     assert "Not enough history" in logs
     assert "vibe-sentinel scan" in logs
+
+
+def test_list_lenses_reports_the_effective_set(
+    tmp_path: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """The lens set had no listing at all, which made it the one declarable
+    a project could not read without provoking an error in it."""
+    (tmp_path / ".vibe-sentinel.toml").write_text(
+        '[[lens]]\nid = "ours"\ntitle = "Our question"\n'
+        'watch = ["file-length"]\nquestion = "Did the docs keep up?"\n',
+        encoding="utf-8",
+    )
+    assert main(["scan", str(tmp_path), "--list-lenses"]) == 0
+
+    out = capfd.readouterr().out
+    assert "ours" in out
+    assert "organization" in out, "the shipped lens is part of the active set"
+    assert "file-length" in out, "what it watches is why it is or is not asked"
+    assert ".vibe-sentinel.toml" in out, "and which file declared it"
+
+
+def test_list_lenses_says_which_are_built_in(
+    tmp_path: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """A `from:` line for a declared lens and none for a built-in. The
+    column exists to answer "which of these are mine, and did my rule file
+    load" — repeating "built-in" for the majority buries that."""
+    (tmp_path / ".vibe-sentinel.toml").write_text("", encoding="utf-8")
+    assert main(["scan", str(tmp_path), "--list-lenses"]) == 0
+
+    out = capfd.readouterr().out
+    assert "organization" in out
+    assert "from:" not in out
+    assert "0 declared here" in out
+
+
+def test_list_lenses_reports_a_broken_lens_rather_than_scanning(
+    tmp_path: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """This is the command somebody runs to find out why a lens is not
+    being asked, so it has to name the fault rather than hide it."""
+    (tmp_path / ".vibe-sentinel.toml").write_text(
+        '[[lens]]\nid = "ours"\ntitle = "t"\n', encoding="utf-8"
+    )
+    assert main(["scan", str(tmp_path), "--list-lenses"]) == 2

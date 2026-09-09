@@ -58,7 +58,6 @@ from vibe_sentinel.log import logger
 
 from vibe_sentinel.paths import CONFIG_FILENAME
 from vibe_sentinel.safety import (
-    BUILTIN_DANGERS,
     configured_mode,
     declared_verdict,
     load_dangers,
@@ -241,6 +240,72 @@ def _deny(reason: str) -> dict[str, Any]:
     }
 
 
+def _unreadable_config(error: str) -> dict[str, Any]:
+    """What to do when the safety mode itself cannot be read.
+
+    Refuse. The gate cannot establish whether it is switched on, so it
+    cannot clear this command — and the alternative, treating an unreadable
+    setting as ``off``, is how a config with a stray comma silently
+    disabled enforcement while still saying ``enforce`` on the line above.
+
+    Blunt on purpose: with the file unreadable every flagged command is
+    refused, which is what makes it impossible to miss. The message carries
+    the parse error and the command that shows it.
+    """
+    logger.warning("safety: {}", error)
+    return _deny(
+        f"vibe-sentinel could not read its own configuration, so it cannot "
+        f"tell whether this command should be reviewed. {error}"
+    )
+
+
+def _unloadable_dangers(
+    root: Path, command_id: int, occurred_at: str, mode: str, error: str
+) -> dict[str, Any] | None:
+    """What to do when a project's ``[[danger]]`` set will not load.
+
+    Not the built-in set. Substituting one rule set for another produces a
+    verdict about a policy nobody declared, and it reads exactly like a
+    verdict about theirs — a shipped list cannot know which of your database
+    hosts is production, which is the whole reason the table is declared.
+
+    So the gate says what is true: it could not triage, and therefore cannot
+    clear the command. ``enforce`` refuses and names the file. ``observe``
+    never refuses — that is the mode's own meaning rather than a second path
+    — and records that nothing was judged, and why, so
+    ``vibe-sentinel safety --list`` shows the gap instead of a clean run.
+    """
+    logger.warning("safety: {}", error)
+    reason = f"the project's [[danger]] set could not be loaded: {error}"
+    try:
+        with get_db(root, JOURNAL_DURABILITY) as conn:
+            journal_store.save_review(
+                conn,
+                command_id=command_id,
+                reviewed_at=occurred_at,
+                signals="",
+                verdict="unreviewed",
+                reason=reason,
+                model="",
+                reviewed=False,
+                mode=mode,
+                enforced=mode == "enforce",
+                history_count=0,
+                duration_ms=0,
+            )
+    except (SchemaMismatchError, sqlite3.Error, OSError) as e:
+        logger.warning("safety: could not record the unloadable danger set ({})", e)
+
+    if mode != "enforce":
+        return None
+    return _deny(
+        f"vibe-sentinel refused this command because it could not tell whether "
+        f"the command is dangerous: {reason} Fix the file and check it with "
+        f"`vibe-sentinel safety --print-dangers`, or set safety.mode to "
+        f"'observe' in .vibe-sentinel.toml to record without acting."
+    )
+
+
 def gate(
     root: Path, event: HookEvent, command_id: int, occurred_at: str
 ) -> dict[str, Any] | None:
@@ -257,24 +322,27 @@ def gate(
     and the command proceeds.
     """
     try:
+        # The mode first, and before the danger set, for two reasons. It is
+        # the cheaper read, so the common case — a project that never turned
+        # this on — pays one `tomllib.load` and stops. And a project with the
+        # gate off must not be refused a command because a `[[danger]]` table
+        # it does not use will not parse.
+        try:
+            mode = configured_mode(root)
+        except ValueError as e:
+            return _unreadable_config(str(e))
+        if mode == "off":
+            return None
+
         try:
             dangers = load_dangers(root)
         except ValueError as e:
-            # A broken danger set must not leave the gate silently open,
-            # and must not stop the agent either. Fall back to the shipped
-            # set, loudly; `vibe-sentinel safety --print-dangers` shows the
-            # same error against the line that caused it.
-            logger.warning("safety: {} — falling back to the built-in danger set", e)
-            dangers = BUILTIN_DANGERS
+            return _unloadable_dangers(root, command_id, occurred_at, mode, str(e))
 
         signals = triage(
             event.tool_name, event.command_text(), event.target(), root, dangers
         )
         if not signals:
-            return None
-
-        mode = configured_mode(root)
-        if mode == "off":
             return None
 
         from vibe_sentinel.config import load_config
@@ -363,18 +431,18 @@ def gate(
         return None
 
 
-def handle(raw: str, *, fallback_cwd: Path | None = None) -> str:
+def handle(raw: str, *, default_cwd: Path | None = None) -> str:
     """Take one raw hook payload from stdin to a recorded row.
 
     Returns what happened: ``recorded``, ``duplicate``, ``spilled``,
     ``unparsed`` (not a usable payload), or ``unwatched`` (the working
     directory is not inside a project vibe-sentinel watches).
     """
-    return guard(raw, fallback_cwd=fallback_cwd)[0]
+    return guard(raw, default_cwd=default_cwd)[0]
 
 
 def guard(
-    raw: str, *, fallback_cwd: Path | None = None
+    raw: str, *, default_cwd: Path | None = None
 ) -> tuple[str, dict[str, Any] | None]:
     """Record one payload, then decide whether to let the command run.
 
@@ -386,7 +454,7 @@ def guard(
     if event is None:
         return ("unparsed", None)
 
-    start = Path(event.cwd) if event.cwd else (fallback_cwd or Path.cwd())
+    start = Path(event.cwd) if event.cwd else (default_cwd or Path.cwd())
     root = find_project_root(start)
     if root is None:
         logger.debug("hook: {} is not inside a watched project — ignoring", start)

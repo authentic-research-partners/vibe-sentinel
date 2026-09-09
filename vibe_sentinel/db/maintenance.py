@@ -284,12 +284,20 @@ def _oldest(conn: sqlite3.Connection, table: str, column: str) -> str | None:
     return str(row[0]) if row and row[0] is not None else None
 
 
-def _parse(stamp: str, fallback: datetime) -> datetime:
-    """An ISO timestamp from the database, as an aware datetime."""
+def _parse(stamp: str) -> datetime | None:
+    """An ISO timestamp from the database, as an aware datetime, or None.
+
+    None rather than a substitute. Every caller here measures an age, and
+    a stand-in for an unreadable stamp measures zero days — which is
+    exactly what a database created this morning measures. The warning
+    that a year of irreplaceable history has never been backed up was
+    therefore switched off by the one condition that should have raised
+    it, and nothing said so.
+    """
     try:
         parsed = datetime.fromisoformat(stamp)
     except ValueError:
-        return fallback
+        return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
@@ -456,9 +464,20 @@ def check(
         # database created this morning has nothing a backup would have
         # saved, and telling its owner otherwise on their first command
         # is how a check earns its way into the ignore pile.
-        history_days = (now - _parse(oldest_record, now)).days
+        oldest = _parse(oldest_record)
         backups = list_backups(db_path(root).parent / BACKUP_DIR_NAME)
-        if not backups:
+        newest = _parse(backups[0].created_at) if backups else None
+        if oldest is None:
+            add(
+                "backup",
+                "warning",
+                f"The oldest record carries a timestamp this cannot read "
+                f"({oldest_record!r}), so the age of this history is unknown "
+                f"and the backup check did not run.",
+                "vibe-sentinel db check",
+            )
+        elif not backups:
+            history_days = (now - oldest).days
             if history_days > backup_days:
                 add(
                     "backup",
@@ -468,8 +487,17 @@ def check(
                     f"regenerated.",
                     "vibe-sentinel db backup",
                 )
+        elif newest is None:
+            add(
+                "backup",
+                "warning",
+                f"The newest backup carries a timestamp this cannot read "
+                f"({backups[0].created_at!r}), so its age is unknown.",
+                "vibe-sentinel db backup",
+            )
         else:
-            age = (now - _parse(backups[0].created_at, now)).days
+            history_days = (now - oldest).days
+            age = (now - newest).days
             if age > backup_days and history_days > backup_days:
                 add(
                     "backup",

@@ -119,7 +119,6 @@ class Snapshot(BaseModel):
     )
     root: str = ""
     model: str = ""
-    used_model: bool = True
     probes: dict[str, ProbeResult] = Field(default_factory=dict)
 
     def probe_keys(self, probe_id: str) -> set[str]:
@@ -145,6 +144,24 @@ class Change(BaseModel):
     question. Empty for every other kind."""
 
     label: str = ""
+    attrs: dict[str, str] = Field(default_factory=dict)
+    """The measuring observation's own attrs, carried through to whoever
+    reads the change.
+
+    ``Observation.attrs`` says these are "carried for a reader", and until
+    this field existed the only reader was the database: the diff dropped
+    them, so the model rating a change never saw the numbers the probe had
+    already worked out. That is not academic. ``silent-exceptions`` records
+    ``share`` beside its count, and a lens asking whether the *share* of
+    discarding handlers is rising was being handed two counts and a
+    sentence, then asked to overrule the counts — which it declines to do,
+    measurably, whatever the question says.
+
+    Not diffed, for the reason the observation gives: watching an attr
+    would turn a probe's bookkeeping into drift. This is the value from the
+    run being reported — the ``after`` side, or ``before`` for something
+    that disappeared. Not stored either: the observations already hold
+    them, and a change is recomputed from those."""
     severity: Severity = "info"
     note: str = ""
     """Filled by the analysis pass — why this change matters, or doesn't."""
@@ -218,7 +235,7 @@ class LensResult(BaseModel):
     title: str = ""
     asked: bool = False
     """Whether a question was actually sent. False when nothing this lens
-    watches moved, and false for every lens under ``--no-model``."""
+    watches moved."""
     answered: bool = False
     """Whether the model came back with something usable."""
     assessment: str = ""
@@ -254,17 +271,14 @@ class DriftReport(BaseModel):
     """The analysis pass's read of the changes as a whole."""
     first_run: bool = False
     """True when there was no inventory to compare against yet."""
-    analyzed: bool = False
-    """True when the model rated these changes. False means the
-    severities are the mechanical ones from the comparison, and no
-    rendering may claim the drift was reviewed."""
     probes_run: int = 0
     """How many probes ran at all this scan."""
     unmeasured: list[str] = Field(default_factory=list)
     """Probe ids that ran and produced no measurement, sorted.
 
-    The measurement counterpart of :attr:`analyzed`, and it exists for
-    the same reason: a failed probe is recorded rather than raised, so a
+    The measurement counterpart of the model's own accounting, and it
+    exists for the same reason: a failed probe is recorded rather than
+    raised, so a
     scan completes with its numbers simply missing, and "nothing changed"
     is then the sentence a renderer reaches for. It is the wrong one. A
     comparison against measurements that were never taken has not found
@@ -296,7 +310,11 @@ class RunRecord(BaseModel):
     root: str
     model: str = ""
     used_model: bool = True
-    analyzed: bool = False
+    """Historical. Every run since the model became mandatory writes True;
+    the column and this field are kept because runs recorded before that
+    genuinely did not use one, and the history is never rewritten."""
+    analyzed: bool = True
+    """Historical, on the same terms as :attr:`used_model`."""
     is_baseline: bool = False
     probe_count: int = 0
     observation_count: int = 0
@@ -417,6 +435,37 @@ REASON_CHARS = 400
 #: to turn a character cap into something a model can actually count.
 _CHARS_PER_WORD = 8
 
+#: The advertised limit as a share of the enforced one. A margin, not a
+#: squeeze — and never 1.0, because the two numbers are not the same kind of
+#: number. Characters are counted exactly, by ``clip_to_bounds``, after the
+#: answer arrives. Words are counted approximately, by a model that cannot see
+#: its own token stream, while it is still writing — and ``_CHARS_PER_WORD`` is
+#: itself an average over English. Advertising the exact cap asks the model to
+#: land on an edge neither side can see precisely.
+#:
+#: It was 1/2 for a day. The failure that produced it — ``credentials`` saying
+#: "under 50 words" over a 400-character ``reason`` while the real path logged
+#: ``answer truncated at 512 tokens`` — turned out to have a different cause:
+#: the gate pinned ``max_tokens`` to 512 regardless of the configured value, so
+#: an over-run was inevitable and the advertised number was never what decided
+#: it. With that fixed the credentials gate truncates zero times at 25
+#: advertised words and zero times at 50, so the halving was preventing
+#: nothing that the budget had not already prevented.
+#:
+#: **Whether a tighter limit costs answer quality is not resolvable here, and
+#: that is the finding.** ``severity-band`` was scored three times per arm on
+#: the same 34 cases: 0.676 / 0.647 / 0.647 halved, against 0.618 / 0.647 /
+#: 0.735 unhalved. The unhalved arm's own runs span twelve points, so the two
+#: arms cannot be told apart, and a single run of either lands anywhere in
+#: that range — which is exactly how a first pass produced a confident
+#: five-point "cost" that three runs erased. Do not re-open this with n=1.
+#:
+#: So the value is a judgement rather than an optimum: keep a hedge against an
+#: approximate count meeting an exact edge, and do not squeeze a field that
+#: has to justify a verdict. The rounding below goes DOWN for the same reason
+#: — rounding up to the nearest five hands the margin back.
+_ADVERTISED_SHARE = 0.9
+
 
 def chars_to_words(chars: int) -> int:
     """A character cap, said as a word count a model can hold to.
@@ -426,10 +475,21 @@ def chars_to_words(chars: int) -> int:
     words, so the prompt quotes words and the schema keeps characters,
     and the conversion happens in one place rather than in each prompt.
 
-    Rounded up to the nearest five so the sentence reads as guidance
-    rather than as a checksum — "under 50 words", not "under 47".
+    The number returned is a share of the cap, per ``_ADVERTISED_SHARE``:
+    what a prompt asks for and what the clipping allows must never be the
+    same number, or an approximate count lands on an exact edge. One place
+    converts, so every prompt in the package and in ``benchmarks/`` inherits
+    the margin without restating it.
+
+    Rounded to the nearest five so the sentence reads as guidance rather
+    than as a checksum — "under 45 words", not "under 44" — and rounded
+    *down*, because rounding up would hand back the margin. Never below
+    five: an instruction to answer in zero words is not an instruction.
     """
-    return ((max(chars, 0) // _CHARS_PER_WORD) + 4) // 5 * 5
+    if chars <= 0:
+        return 0
+    words = int(chars / _CHARS_PER_WORD * _ADVERTISED_SHARE)
+    return max(words // 5 * 5, 5)
 
 
 #: Said to the model in every prompt that has a bounded reason, so the cap
@@ -537,6 +597,45 @@ class SafetyOpinion(BaseModel):
     cannot tell — which is itself worth recording."""
 
 
+class BackendMetrics(BaseModel):
+    """What a serving backend says about itself, where it says anything.
+
+    Read from a Prometheus ``/metrics`` endpoint beside the OpenAI-compatible
+    one. Every field is ``None`` when the backend did not publish it, and that
+    is load-bearing: a server with no queue is not the same thing as a server
+    that does not report its queue, and rendering the second as ``0`` would
+    turn "we cannot see" into "all clear" — the failure this project refuses
+    everywhere else. Whoever renders these must say *unavailable*, never zero.
+
+    Names move between vLLM releases (``gpu_cache_usage_perc`` became
+    ``kv_cache_usage_perc``), so the reader accepts the aliases it knows and
+    leaves the field ``None`` rather than guessing.
+    """
+
+    running: float | None = None
+    waiting: float | None = None
+    kv_cache_used: float | None = None
+    prefix_hits: float | None = None
+    prefix_queries: float | None = None
+    preemptions: float | None = None
+    finished: float | None = None
+    truncated: float | None = None
+
+    @property
+    def prefix_hit_rate(self) -> float | None:
+        """Share of prefix-cache queries that hit, or None if unmeasured."""
+        if self.prefix_queries is None or self.prefix_hits is None:
+            return None
+        return self.prefix_hits / self.prefix_queries if self.prefix_queries else None
+
+    @property
+    def anything(self) -> bool:
+        """Whether the backend published a single field we understand."""
+        return any(
+            getattr(self, name) is not None for name in self.__class__.model_fields
+        )
+
+
 class SecretOpinion(BaseModel):
     """The model's read of one candidate credential.
 
@@ -592,9 +691,9 @@ class GateFinding(BaseModel):
     package name for a licence. It is what lets the history answer "when
     did this start" without the finding itself being a diff.
 
-    ``adjudicated`` carries the same honesty as ``DriftReport.analyzed``
-    and ``command_reviews.reviewed``: false means the verdict is
-    mechanical and no rendering may call it a review.
+    ``adjudicated`` carries the same honesty as ``command_reviews.reviewed``:
+    false means the verdict is mechanical and no rendering may call it a
+    review.
     """
 
     gate: str

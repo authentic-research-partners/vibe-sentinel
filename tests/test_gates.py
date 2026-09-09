@@ -280,10 +280,12 @@ def test_no_credential_value_reaches_the_database(project: Path) -> None:
     (project / "config.py").write_text(f'AWS_ACCESS_KEY_ID = "{secret}"\n')
     secrets = creds.load_secrets(project)
     policy = creds.load_policy(None, root=project)
-    scan = creds.collect(project, secrets, policy)
+    scan = creds.search(project, secrets, policy)
     assert scan.candidates, "the fixture should trip a rule"
 
-    found = asyncio.run(creds.adjudicate(scan, secrets, policy, None, use_model=False))
+    from vibe_sentinel.config import SentinelConfig
+
+    found = asyncio.run(creds.adjudicate(scan, secrets, policy, SentinelConfig()))
     from vibe_sentinel.gates import shape_credentials
 
     report = shape_credentials(scan, found, policy)
@@ -304,21 +306,23 @@ def test_a_gate_that_cannot_load_its_policy_does_not_raise(tmp_path: Path) -> No
     (tmp_path / ".vibe-sentinel.toml").write_text(
         "[licenses]\nallowed_categories = 3\n"
     )
-    state = asyncio.run(collect_all(tmp_path, None, use_model=False))
+    state = asyncio.run(collect_all(tmp_path, None))
     assert [r.gate for r in state.reports] == ["licenses", "packages", "credentials"]
     assert any(not r.ok for r in state.reports)
 
 
-def test_the_gates_run_without_a_model(tmp_path: Path) -> None:
-    """The CI path. Collection is mechanical for all three; only the
-    credentials verdict needs a model, and it says when it had none."""
+def test_a_gate_that_could_not_ask_does_not_complete(tmp_path: Path) -> None:
+    """Collection is mechanical for all three gates; the credentials
+    verdict is not, and there is no shorter answer it can give. A gate
+    that reported its candidates unjudged would read as a survey of the
+    tree when it is a survey of what nobody looked at."""
     from vibe_sentinel.gates import collect_credentials
 
     (tmp_path / "config.py").write_text('KEY = "AKIAIOSFODNN7EXAMPLE"\n')
-    report = asyncio.run(collect_credentials(tmp_path, None, use_model=False))
-    assert report.ok
-    assert not report.adjudicated
-    assert "NOT adjudicated" in report.summary
+    report = asyncio.run(collect_credentials(tmp_path, None))
+    assert not report.ok, "a gate that could not adjudicate has not completed"
+    assert "no model is configured" in report.error
+    assert "backend status" in report.error, "an error carries its remediation"
 
 
 # --- end to end: the bug, in the command a person actually runs ------------
@@ -353,12 +357,12 @@ def test_a_key_present_from_the_first_scan_is_reported_on_every_scan(
 
     _tiny_project(tmp_path, "AKIAIOSFODNN7EXAMPLE")
 
-    assert main(["scan", str(tmp_path), "--no-model"]) == 1
+    assert main(["scan", str(tmp_path)]) == 1
     first = capfd.readouterr().out
     assert "config.py" in first
 
     # Nothing changed. A diff would have nothing to say; this must.
-    assert main(["scan", str(tmp_path), "--no-model"]) == 1
+    assert main(["scan", str(tmp_path)]) == 1
     second = capfd.readouterr().out
     assert "No change since" in second, "the drift half should be quiet"
     assert "config.py" in second, "the state half must not be"
@@ -373,10 +377,10 @@ def test_accepting_drift_does_not_accept_a_credential(
     from vibe_sentinel.__main__ import main
 
     _tiny_project(tmp_path, "AKIAIOSFODNN7EXAMPLE")
-    main(["scan", str(tmp_path), "--no-model"])
+    main(["scan", str(tmp_path)])
     capfd.readouterr()
 
-    assert main(["scan", str(tmp_path), "--no-model", "--update"]) == 1
+    assert main(["scan", str(tmp_path), "--update"]) == 1
     assert "config.py" in capfd.readouterr().out
 
 
@@ -384,7 +388,7 @@ def test_the_scan_records_its_gates_against_its_run(tmp_path: Path) -> None:
     from vibe_sentinel.__main__ import main
 
     _tiny_project(tmp_path, "AKIAIOSFODNN7EXAMPLE")
-    main(["scan", str(tmp_path), "--no-model"])
+    main(["scan", str(tmp_path)])
     with get_db(tmp_path) as conn:
         state = gate_store.state_at(conn, run_id=1)
     assert {r.gate for r in state.reports} == {"licenses", "packages", "credentials"}
@@ -407,7 +411,7 @@ def test_a_missing_licence_policy_does_not_fail_the_scan(
         "'summary': 'ok'}))\"]\n",
         encoding="utf-8",
     )
-    assert main(["scan", str(tmp_path), "--no-model"]) == 0
+    assert main(["scan", str(tmp_path)]) == 0
     out = capfd.readouterr().out
     assert "no policy declared" in out
     assert "licenses: clean" not in out
@@ -418,12 +422,13 @@ def test_the_scan_can_adjudicate_credentials_with_a_model(
 ) -> None:
     """The gates run *outside* the scan's event loop, and must.
 
-    ``adjudicate`` opens its own loop to fan the candidates out. Calling
-    the gate stage from inside ``asyncio.run`` therefore raises
-    "asyncio.run() cannot be called from a running event loop" — and it
-    raises in the one gate whose answer costs a model call, which is the
-    one that would quietly report DID NOT COMPLETE. Every other test
-    here runs --no-model, where that path is never reached.
+    ``credentials.adjudicate`` used to open a loop of its own to fan the
+    candidates out, so calling the gate stage from inside ``asyncio.run``
+    raised "asyncio.run() cannot be called from a running event loop" —
+    and it raised in the one gate whose answer costs a model call, which
+    is the one that would then report DID NOT COMPLETE. One
+    ``asyncio.run`` per command, in the CLI and nowhere else, is the rule
+    that replaced it.
     """
     from vibe_sentinel.__main__ import main
 
@@ -442,3 +447,64 @@ def test_the_scan_can_adjudicate_credentials_with_a_model(
     # the model never reached the loop that used to raise either.
     assert creds.adjudicated
     assert any(f.adjudicated and f.verdict == "real" for f in creds.findings)
+
+
+# --- the shape the three gates share -----------------------------------------
+
+
+def test_the_three_gates_name_their_stages_the_same_way() -> None:
+    """gather / audit / adjudicate, and the same word wherever the stage is.
+
+    They were `licenses.check`, `packages.audit` and `credentials.collect`
+    for one role, with `Violation` / `Finding` / `Candidate` for one thing
+    and a `credentials.Findings` container one letter from
+    `packages.Finding`. Nothing was broken by it and nothing failed — three
+    modules a reader could not carry one mental model across is not a bug,
+    which is exactly why it lasted and why it is asserted here rather than
+    described in a docstring nobody diffs.
+
+    The empty cells are not asserted. The licence gate has nothing to
+    gather because package metadata already is the inventory, and nothing
+    to adjudicate because an SPDX expression against an allow-list is not
+    an opinion; credentials has no separate audit because its pattern match
+    is one. Those are consequences of the questions, and a test freezing
+    them would be a test against ever asking a different one.
+    """
+    from vibe_sentinel import credentials, licenses, packages
+
+    stages = {
+        "gather": [(packages, "take_inventory"), (credentials, "search")],
+        "audit": [(licenses, "audit"), (packages, "audit")],
+        "adjudicate": [(packages, "adjudicate"), (credentials, "adjudicate")],
+    }
+    for stage, members in stages.items():
+        for module, name in members:
+            found = getattr(module, name, None)
+            assert callable(found), (
+                f"{module.__name__}.{name} is the {stage} stage and is gone. "
+                f"If the stage moved, move the name with it — the table in "
+                f"gates.py is what a reader holds all three in their head by."
+            )
+
+
+def test_the_item_a_gate_reports_is_called_a_finding() -> None:
+    """One noun for one role, across the gates and the shape they share.
+
+    `credentials` keeps `Candidate` as well, and that is the distinction
+    working rather than an exception to it: a candidate is what the pattern
+    match nominated, before anything judged it.
+    """
+    from vibe_sentinel import credentials, licenses, packages
+    from vibe_sentinel.schemas import GateFinding
+
+    assert licenses.Finding is not None
+    assert packages.Finding is not None
+    assert credentials.Candidate is not None
+    assert not hasattr(credentials, "Findings"), (
+        "`Findings` sat one letter from `packages.Finding` and held a "
+        "different kind of thing. It is `Adjudication` now, which is what "
+        "`packages` already called the same stage's result."
+    )
+    assert credentials.Adjudication is not None
+    assert packages.Adjudication is not None
+    assert GateFinding is not None

@@ -28,7 +28,13 @@
 # keeps improving underneath. `vibe-sentinel scan --list-probes` names the
 # placeholders each probe takes.
 #
-# [probes.parameters]
+# # Probe sets can live in their own files too — same setting, same rules as
+# [safety] and [credentials] below. Read before this file, so anything
+# declared here overrides a shared set by id.
+# [probes]
+# rule_files = ["rules/*.toml"]
+
+[probes.parameters]
 # commentary-ratio = { SOURCE_ROOT = "src" }
 # module-organization = { PACKAGE_ROOT = "src/myapp" }
 # silent-exceptions = { SOURCE_ROOT = "src" }
@@ -50,8 +56,9 @@
 # them. With `docs=*.md` first, CLAUDE.md is documentation and the category
 # meant to watch it is empty.
 #
-# Virtualenvs, node_modules, build and dist are never measured whatever the
-# root says, so `.` is safe — just usually not what you meant.
+# Virtualenvs (including `env/`), vendored trees like `node_modules/` and
+# `vendor/`, caches, and build output are never measured whatever the root
+# says, so `.` is safe — just usually not what you meant.
 
 
 # --- Over what stretch of time -----------------------------------------------
@@ -158,6 +165,61 @@
 # here and copying without saying so is not.
 # """
 #
+# --- Checking that your model can answer the question you wrote -------------
+#
+# A question is a prompt, and it goes to whatever model you run. Whether an 8B
+# model on your machine can answer yours is an empirical question — this
+# project has a case on record where a prompt saying "answer unsafe, this is
+# the canary" came back `safe`.
+#
+# So declare cases under the lens, in this file, and score its answers against
+# the severities you would accept:
+#
+#   python -m evals drift              asks your model, scores the answers
+#   python -m evals drift --mechanical validates the cases, asks nothing
+#
+# vibe-sentinel itself reads [[lens]] and ignores `case` entirely, so this
+# costs a scan nothing and cannot break one. The walkthrough — including what
+# a corpus needs in it to be worth having — is docs/adding-a-probe.md.
+#
+# [[lens]]
+# id = "handler-bloat"
+# ... as above ...
+#
+# [[lens.case]]
+# id = "one-long-handler"
+# why = """600 lines arriving in one handler is the shape this asks about; the
+# same 600 spread over four new ones is the team doing what the question says
+# it wants."""
+# [[lens.case.change]]
+# probe = "file-length"
+# key = "lines:api/handlers/orders.py"
+# kind = "grew"
+# before = 210
+# after = 810
+# label = "api/handlers/orders.py [code]: 810 lines"
+# accept = ["medium", "high"]
+#
+# [[lens.case]]
+# id = "four-short-handlers"
+# why = """The calm case. A corpus with only alarming cases in it cannot tell a
+# model that is reading from one that answers `high` to everything."""
+# [[lens.case.change]]
+# probe = "module-organization"
+# key = "dir:api/handlers"
+# kind = "grew"
+# before = 6
+# after = 10
+# label = "api/handlers: 10 module(s), 1,240 lines"
+# accept = ["info", "low"]
+#
+# `accept` is a band rather than a value: `medium` and `high` on a directory
+# that doubled are both defensible, and scoring one of two defensible answers
+# wrong measures your taste rather than the model. `why` is required, for the
+# same reason `reason` is required on a pin — a label with no argument behind
+# it is the one that quietly rots.
+
+
 # A horizon is a reading, not a verdict: it never moves the baseline, is never
 # written to the database, and never changes the exit code. It reaches back to
 # a fixed point, so a finding there would fail every scan until it aged out,
@@ -219,8 +281,15 @@ timeout = 8.0
 # there and expect the latency to add up.
 # concurrency = 4
 # Rules can live in their own files, so a team can share one set across repos.
-# Globs are relative to the project root; a pattern matching nothing is an error.
-# rule_files = ["safety-rules/*.toml"]
+# Globs are relative to the project root; a pattern matching nothing is an
+# error, because a renamed file otherwise stops checking without saying so.
+#
+# All four declarables take this setting and can share one directory: a file
+# holds any of [[probe]], [[lens]], [[danger]] and [[secret]], and each loader
+# reads its own. So `rules/fallbacks.toml` can carry the probe that measures
+# something and the lens that asks about it, which is usually how they are
+# written.
+# rule_files = ["rules/*.toml"]
 
 # --- What counts as dangerous, in your words -------------------------------
 #
@@ -246,6 +315,17 @@ timeout = 8.0
 # unsafe" came back `safe`, because the model trusted its own read of the
 # command over the instruction. A question informs a judgement; only `verdict`
 # decides one.
+#
+# `requires` names one file that must sit at the project root for the danger to
+# apply at all. A danger naming a file that is not there is not in the set:
+# `--print-dangers` does not list it, and `use`/`disable` may still name it
+# without error, so one shared rule file works across repositories in different
+# languages. This is how the npm dangers ship — `publishing-a-package`,
+# `deploying-to-production`, `forcing-a-dependency-resolution`,
+# `exposing-a-dev-server`, and the `lockfile` and `dependency-tree` context
+# signals all carry `requires = "package.json"`, so a Python repository never
+# sees them. Use it for the same reason: a denylist is read by people, and a
+# line that cannot fire is worse than one that is absent.
 #
 # [[danger]]
 # id = "our-production-database"
@@ -419,6 +499,11 @@ allowed_categories = ["permissive", "public-domain"]
 # =============================================================================
 # Everything below is OPTIONAL — the values shown are the defaults
 # =============================================================================
+#
+# Optional as *settings*: leave them all commented and the defaults apply. Not
+# optional as a *dependency* — a reachable model is required, and the defaults
+# below simply assume it is at localhost:5001. A run that cannot reach one
+# exits 2.
 
 # --- The judge model: any OpenAI-compatible backend --------------------------
 # vLLM, Ollama, llama.cpp, LM Studio. Pick a model family DIFFERENT from the
@@ -464,8 +549,12 @@ allowed_categories = ["permissive", "public-domain"]
 # typosquat and a rewrite shipped under a new name in exactly the same shape,
 # so that pair — and nothing else here — is put to the local model, which sees
 # what each package says it does and whether anything actually asked for it.
-# `--no-model` skips it and every near-miss then stands, which is the CI path:
-# this gate never gets weaker because the GPU is off.
+# A pair the model does not settle stands, so this gate never gets weaker
+# because the answer did not come back — the finding failed on its own before
+# the question was asked.
+#
+# NOTE: TOML puts any key written after a [table] header inside that table, so
+# declare `guidance` BEFORE the [[packages.pin]] entries below.
 #
 # [packages]
 # ignore = []                       # names allowed to sit undeclared. pip,
@@ -474,6 +563,15 @@ allowed_categories = ["permissive", "public-domain"]
 # concurrency = 4                   # near-miss pairs asked about at once, one
 #                                   # request each over a shared prefix. 1 on a
 #                                   # backend that serialises
+#
+# Your standing note about your own names, put in front of the one question
+# this gate asks. `httpx` and `httpx2` are two real packages and nothing
+# outside your ecosystem knows that; a pin records it after the finding, this
+# says it before the question. Same shape as the [licenses] and [drift] notes.
+# guidance = """
+# Anything matching acme-* is ours and the names are deliberate.
+# Our vendored forks keep the upstream name with a -fork suffix.
+# """
 #
 # A pin records a decision you actually made, scoped to the finding kinds it
 # names — accepting "orphan" for a package does not accept "squatted" later.
@@ -492,8 +590,6 @@ allowed_categories = ["permissive", "public-domain"]
 # documentation.
 #
 #     vibe-sentinel credentials              # 0 clean, 1 findings, 2 error
-#     vibe-sentinel credentials --no-model   # candidates only, adjudicated by
-#                                            # nobody, and it says so. CI path.
 #     vibe-sentinel credentials --home       # also the credential stores in
 #                                            # your home directory
 #     vibe-sentinel credentials --print-rules
@@ -535,7 +631,7 @@ allowed_categories = ["permissive", "public-domain"]
 #   [credentials] use       keeps ONLY the ones you name
 #   [credentials] disable   switches one off, without restating the rest
 #   [credentials] use_builtins  false to check only for what you declare
-#   [credentials] rule_files = ["credential-rules/*.toml"]
+#   [credentials] rule_files = ["rules/*.toml"]
 #
 # [[secret]]
 # id = "our-service-keys"

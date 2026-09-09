@@ -50,6 +50,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from vibe_sentinel.paths import CONFIG_FILENAME
+from vibe_sentinel.rulesets import rule_file_paths, source_label, tables_in_file
 
 #: Conservative default: paths, globs, module names, simple numbers —
 #: anything a probe legitimately needs, and nothing that would survive as
@@ -107,6 +108,12 @@ class Probe(BaseModel):
 
     id: str
     title: str
+    source: str = "built-in"
+    """Where this came from: ``built-in``, or the file that declared it.
+
+    Set by the loader and never read from the table. A rule set layers, so
+    "which of these are mine, which file won, and did my rule file load at
+    all" is otherwise a question only an error can answer."""
     description: str = ""
     """What structural question this probe answers. Documentation for
     whoever reads `scan --list-probes`, and for whoever has to decide
@@ -337,6 +344,15 @@ class ProbeSettings(BaseModel):
     disable: list[str] = Field(default_factory=list)
     #: Set false to start from nothing and run only what you declare.
     use_builtins: bool = True
+    #: Globs, relative to the project root, naming files that hold
+    #: ``[[probe]]`` tables. The same setting ``[drift]``, ``[safety]`` and
+    #: ``[credentials]`` take, for the same reason: past a certain size a
+    #: declared set is its own document, owned and reviewed by whoever owns
+    #: that question rather than by whoever last edited the config.
+    #:
+    #: Read before the project's own config, so a shared set layers under
+    #: local overrides by id. A glob matching nothing is an error.
+    rule_files: list[str] = Field(default_factory=list)
     #: Per-probe parameter values: ``{probe_id: {PLACEHOLDER: value}}``.
     #:
     #: The light way to change one value. Overriding a probe by
@@ -435,12 +451,31 @@ def load_probes(
         if path.is_file():
             settings = load_probe_settings(path)
 
+    # Rule files first, the project's own config last, so a shared set can
+    # be kept in its own file and still overridden here by id.
+    root = project_root or Path.cwd()
+    rule_paths = rule_file_paths(
+        root,
+        settings.rule_files,
+        setting="[probes]",
+        where=paths[-1] if paths else root / CONFIG_FILENAME,
+    )
+
     merged: dict[str, Probe] = {}
     if settings.use_builtins:
         for probe in default_probes():
             merged[probe.id] = probe
+    for path in rule_paths:
+        # For the presence check only. A file globbed as a probe rule set
+        # and holding no probes is an error; `load_probes_from_toml` reads
+        # a config, where zero is ordinary.
+        tables_in_file(path, "probe")
+        for probe in load_probes_from_toml(path):
+            probe.source = source_label(path, root)
+            merged[probe.id] = probe
     for path in paths:
         for probe in load_probes_from_toml(path):
+            probe.source = source_label(path, root)
             merged[probe.id] = probe
 
     _apply_parameters(merged, settings.parameters)

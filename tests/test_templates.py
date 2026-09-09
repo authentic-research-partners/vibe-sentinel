@@ -409,3 +409,70 @@ def test_a_negative_tolerance_is_refused(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="negative"):
         load_probes(project_root=tmp_path)
+
+
+# --- [probes] rule_files -----------------------------------------------------
+#
+# The same setting `[drift]`, `[safety]` and `[credentials]` take. Past a
+# certain size a declared set is its own document, and the probe set is the
+# one an architect owns rather than whoever last edited `[llm] endpoint`.
+
+
+def test_probes_load_from_a_rule_file(tmp_path: Path) -> None:
+    """A file the config globs is read as if its probes were declared here."""
+    (tmp_path / "rules").mkdir()
+    (tmp_path / "rules" / "shape.toml").write_text(
+        '[[probe]]\nid = "shape"\ntitle = "t"\ncommand = ["echo"]\n', encoding="utf-8"
+    )
+    _config(tmp_path, '[probes]\nrule_files = ["rules/*.toml"]\n')
+
+    ids = {p.id for p in load_probes(project_root=tmp_path)}
+    assert "shape" in ids
+
+
+def test_the_project_config_overrides_a_rule_file_by_id(tmp_path: Path) -> None:
+    """Rule files first, this file last — so a shared set can be kept under
+    version control and still corrected locally without editing it."""
+    (tmp_path / "rules").mkdir()
+    (tmp_path / "rules" / "shape.toml").write_text(
+        '[[probe]]\nid = "shape"\ntitle = "shared"\ncommand = ["echo"]\n',
+        encoding="utf-8",
+    )
+    _config(
+        tmp_path,
+        '[probes]\nrule_files = ["rules/*.toml"]\n\n'
+        '[[probe]]\nid = "shape"\ntitle = "local"\ncommand = ["echo"]\n',
+    )
+
+    by_id = {p.id: p for p in load_probes(project_root=tmp_path)}
+    assert by_id["shape"].title == "local"
+
+
+def test_a_rule_files_glob_matching_nothing_is_an_error(tmp_path: Path) -> None:
+    """A renamed file or a typo in the glob otherwise stops measuring
+    whatever it held, and the config still says it is measured."""
+    _config(tmp_path, '[probes]\nrule_files = ["rules/*.toml"]\n')
+    with pytest.raises(ValueError, match="matches no file"):
+        load_probes(project_root=tmp_path)
+
+
+def test_a_rule_file_holding_no_rules_at_all_is_an_error(tmp_path: Path) -> None:
+    """Somebody wrote it expecting it to check something."""
+    (tmp_path / "rules").mkdir()
+    (tmp_path / "rules" / "empty.toml").write_text("# nothing yet\n", encoding="utf-8")
+    _config(tmp_path, '[probes]\nrule_files = ["rules/*.toml"]\n')
+    with pytest.raises(ValueError, match="declares no rule tables"):
+        load_probes(project_root=tmp_path)
+
+
+def test_a_rule_file_may_carry_a_lens_and_no_probe(tmp_path: Path) -> None:
+    """One file holds the measurement and the question about it, and each
+    loader reads its own half. A file of only lenses is not an empty probe
+    set — it is a document this loader has nothing to take from."""
+    (tmp_path / "rules").mkdir()
+    (tmp_path / "rules" / "ask.toml").write_text(
+        '[[lens]]\nid = "l"\nquestion = "q?"\n', encoding="utf-8"
+    )
+    _config(tmp_path, '[probes]\nrule_files = ["rules/*.toml"]\n')
+
+    assert load_probes(project_root=tmp_path)  # the built-ins, and no error
