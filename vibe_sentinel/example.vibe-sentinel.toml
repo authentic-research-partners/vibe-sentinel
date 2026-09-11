@@ -520,6 +520,19 @@ allowed_categories = ["permissive", "public-domain"]
 # max_tokens = 2048
 # api_key = ""
 #
+# This file is usually checked in, so it says what the PROJECT judges with —
+# the same on every machine that clones it. A contributor whose machine cannot
+# reach that backend overrides these four from the environment instead of
+# editing a line that is not about their laptop:
+#
+#   VIBE_SENTINEL_LLM_ENDPOINT   VIBE_SENTINEL_LLM_API_KEY
+#   VIBE_SENTINEL_LLM_MODEL      VIBE_SENTINEL_LLM_STRUCTURED_OUTPUT
+#
+# `vibe-sentinel backend status` prints a Source: line naming the ones in
+# force. Nothing else here has an environment variable: the probes, the
+# policies and the thresholds are statements about the project, and a second
+# way to set one would be a second answer to a question that has one.
+#
 # Backend-specific knobs, passed through untouched:
 # [llm.extra_body.chat_template_kwargs]
 # enable_thinking = true

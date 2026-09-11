@@ -10,6 +10,7 @@ probe set (``[[probe]]``). Probes are parsed by
 
 from __future__ import annotations
 
+import os
 import tomllib
 from pathlib import Path
 from typing import Any, Literal
@@ -169,6 +170,15 @@ class SentinelConfig(BaseModel):
     #: Optional matching stop command.
     stop_command: list[str] = Field(default_factory=list)
 
+    #: Which ``[llm]`` settings this run took from the environment rather
+    #: than from the file, named by their environment variable. Empty on
+    #: every run nobody overrode. It is reported by ``backend status`` for
+    #: one reason: the failure this whole area is built around is a backend
+    #: that answers under the expected name while being something else, and
+    #: an override the reader cannot see is that failure with a config file
+    #: as the alibi.
+    env_overrides: list[str] = Field(default_factory=list)
+
     @field_validator("drift_horizons")
     @classmethod
     def _horizons_parse(cls, value: list[str]) -> list[str]:
@@ -181,6 +191,52 @@ class SentinelConfig(BaseModel):
         for horizon in value:
             parse_horizon(horizon)
         return value
+
+
+#: Environment variables that override ``[llm]``, and the field each one
+#: sets. Deliberately four, and deliberately all of them about *which
+#: backend this machine can reach*: the config file states what the project
+#: pins, and one checkout of it is shared by everyone, so a contributor
+#: whose machine has no NVIDIA card and no podman has otherwise no way to
+#: run the tool at all without editing a file that is not theirs to change.
+#:
+#: What is not here matters as much. ``allow_remote_model`` is absent for
+#: the reason it is not a command-line flag either — the credentials gate
+#: refuses a non-loopback endpoint whatever is set, and that refusal must
+#: not be reachable by exporting something. Nor are the probe set, the
+#: policies or the thresholds: those are statements about the project,
+#: identical on every machine, and a second way to set them would be a
+#: second answer to a question that has one.
+#:
+#: This is an override, not a fallback: nothing here fires because
+#: something else failed, and nothing produces a substitute for an answer
+#: it could not get. The variable is set or it is not.
+ENV_OVERRIDES: dict[str, str] = {
+    "VIBE_SENTINEL_LLM_ENDPOINT": "llm_endpoint",
+    "VIBE_SENTINEL_LLM_MODEL": "llm_model",
+    "VIBE_SENTINEL_LLM_API_KEY": "api_key",
+    "VIBE_SENTINEL_LLM_STRUCTURED_OUTPUT": "structured_output",
+}
+
+
+def apply_env_overrides(config: SentinelConfig) -> SentinelConfig:
+    """Let the environment name the backend this machine can reach.
+
+    Applied after the file is read and before the re-validation below, so
+    a misspelt ``VIBE_SENTINEL_LLM_STRUCTURED_OUTPUT`` fails at load with
+    every other bad value rather than at the first call.
+
+    An empty variable is not an override. Exporting ``FOO=`` is how a
+    shell says "no value", and taking it literally would set the endpoint
+    to the empty string and report a connection failure against nothing.
+    """
+    for variable, field in ENV_OVERRIDES.items():
+        value = os.environ.get(variable)
+        if value is None or not value.strip():
+            continue
+        setattr(config, field, value.strip())
+        config.env_overrides.append(variable)
+    return config
 
 
 def is_wsl2() -> bool:
@@ -217,7 +273,10 @@ def load_config(path: Path | None = None) -> SentinelConfig:
 
     toml_path = path or find_config()
     if toml_path is None:
-        return config
+        # No file is a supported way to run, so the environment has to be
+        # read on this path too — otherwise the one case with nothing to
+        # override is the one case an override is ignored.
+        return SentinelConfig.model_validate(apply_env_overrides(config).model_dump())
 
     with open(toml_path, "rb") as f:
         data = tomllib.load(f)
@@ -290,6 +349,8 @@ def load_config(path: Path | None = None) -> SentinelConfig:
         config.start_command = list(llm["start_command"])
     if "stop_command" in llm:
         config.stop_command = list(llm["stop_command"])
+
+    config = apply_env_overrides(config)
 
     # Re-validate: the assignments above bypass field validation, and a
     # bad structured_output should fail at load, not at the first call.

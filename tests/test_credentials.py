@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 
 from vibe_sentinel import credentials as creds
-from vibe_sentinel.config import SentinelConfig
+from vibe_sentinel.config import SentinelConfig, load_config
 from vibe_sentinel.exceptions import LLMConnectionError
 
 
@@ -416,6 +416,38 @@ def test_nothing_is_sent_to_a_remote_endpoint(project: Path) -> None:
                 secrets,
                 policy,
                 SentinelConfig(llm_endpoint="https://api.example.com/v1"),
+            )
+        )
+    assert "Not sending anything" in str(exc.value)
+
+
+def test_an_environment_override_cannot_send_a_secret_off_the_machine(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``VIBE_SENTINEL_LLM_ENDPOINT`` names which backend this machine can
+    reach. It is not a way around the one refusal that is not negotiable.
+
+    ``allow_remote_model`` is deliberately absent from ``ENV_OVERRIDES``
+    for the same reason it is not a command-line flag, and the gate reads
+    the resolved endpoint — so an override is refused exactly as a file
+    saying the same thing is.
+    """
+    monkeypatch.setenv("VIBE_SENTINEL_LLM_ENDPOINT", "https://api.example.com/v1")
+    monkeypatch.setenv("VIBE_SENTINEL_ALLOW_REMOTE_MODEL", "true")
+    (project / ".vibe-sentinel.toml").write_text("", encoding="utf-8")
+    (project / "app.py").write_text(
+        'KEY = "sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"\n', encoding="utf-8"
+    )
+
+    config = load_config(project / ".vibe-sentinel.toml")
+    assert config.llm_endpoint == "https://api.example.com/v1"
+
+    policy = creds.Policy()
+    secrets = creds.load_secrets(project)
+    with pytest.raises(LLMConnectionError, match="allow_remote_model") as exc:
+        asyncio.run(
+            creds.adjudicate(
+                creds.search(project, secrets, policy), secrets, policy, config
             )
         )
     assert "Not sending anything" in str(exc.value)

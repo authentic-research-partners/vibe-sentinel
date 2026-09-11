@@ -57,6 +57,12 @@ async def status(config: SentinelConfig) -> int:
     print(f"Endpoint: {config.llm_endpoint}")
     print(f"Model:    {config.llm_model}")
     print(f"Output:   {config.structured_output}")
+    if config.env_overrides:
+        # Named, not merely flagged. The failure this command exists to
+        # catch is a backend answering under the expected name while being
+        # something else, and "some of this came from elsewhere" would be
+        # one more way to read the wrong line and believe it.
+        print(f"Source:   {', '.join(config.env_overrides)} (environment)")
 
     reachable, detail = await check_endpoint(config)
     if reachable:

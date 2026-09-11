@@ -25,6 +25,7 @@ documenting a schema that would not load.
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 from pathlib import Path
 
@@ -47,10 +48,21 @@ def pytest_configure(config: pytest.Config) -> None:
 #: ``unclear`` rather than ``placeholder`` for a credential: it is what an
 #: honest model says about a string it was told nothing about, and it is
 #: what a gate test asserting "this is reported every run" needs to see.
+#:
+#: A lens rates nothing, which is the dullest answer that schema allows and
+#: leaves every mechanical severity standing. It is keyed on the prefix
+#: ``analyze-drift`` because that is what ``analyze.py`` builds the name
+#: from — ``analyze-drift-{lens.id}`` — so one entry covers every lens a
+#: project declares rather than the shipped one only. Without it these
+#: calls fell through to the real ``llm_query`` and twenty tests in
+#: ``test_engine.py`` and ``test_cli.py`` reached the network, which passed
+#: on the maintainer's box and failed everywhere else — the suite claiming
+#: in its own docstring to need no backend.
 _DULL: dict[str, dict[str, object]] = {
     "credential": {"verdict": "unclear", "reason": "stubbed in tests"},
     "near-miss": {"verdict": "distinct", "reason": "stubbed in tests"},
     "safety": {"verdict": "safe", "reason": "stubbed in tests"},
+    "analyze-drift": {"assessment": "", "changes": []},
 }
 
 
@@ -73,9 +85,38 @@ def stub_model(monkeypatch: pytest.MonkeyPatch) -> None:
         for prefix, reply in _DULL.items():
             if schema_name.startswith(prefix):
                 return dict(reply)
-        # Anything else — a licence draft with its own MockTransport, say —
-        # goes through untouched. A stub that swallowed those would make a
-        # test pass without exercising the request it was written for.
-        return await real(system, user, schema, schema_name, *args, **kwargs)  # type: ignore[arg-type]
+        # A caller that brought its own transport — a licence draft with a
+        # MockTransport, say — goes through untouched. A stub that swallowed
+        # those would make a test pass without exercising the request it was
+        # written for, and the transport means it reaches no network.
+        if kwargs.get("client") is not None or len(args) > 1:
+            return await real(system, user, schema, schema_name, *args, **kwargs)  # type: ignore[arg-type]
+
+        # Anything else would open a socket. Say so here rather than there:
+        # an uncovered schema name used to fall through to a live backend,
+        # which passed on the maintainer's box and failed everywhere else
+        # with a connection error naming the endpoint instead of the gap.
+        raise AssertionError(
+            f"no stubbed answer for schema {schema_name!r}, and the caller "
+            "supplied no client — this test would reach a real backend.\n"
+            "Add the dullest answer its schema allows to _DULL in "
+            "tests/conftest.py, keyed on the prefix that names it, or pass "
+            "a client=httpx.AsyncClient(transport=httpx.MockTransport(...)) "
+            "if the request itself is what the test is about."
+        )
 
     monkeypatch.setattr(llm_mod, "llm_query", answer)
+
+    # ``analyze.py`` binds ``llm_query`` at module import; the other four
+    # callers import it inside the function that asks. Patching the ``llm``
+    # module alone therefore reaches the deferred callers and misses the
+    # bound one, which is how twenty tests came to need a backend. Patch
+    # every name already bound to the real function, so a module that binds
+    # it at import tomorrow is covered without anyone remembering to add it
+    # here.
+    for module in list(sys.modules.values()):
+        name = getattr(module, "__name__", "")
+        if not name.startswith("vibe_sentinel.") or module is llm_mod:
+            continue
+        if getattr(module, "llm_query", None) is real:
+            monkeypatch.setattr(module, "llm_query", answer)

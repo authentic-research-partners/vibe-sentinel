@@ -7,7 +7,12 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from vibe_sentinel.config import SentinelConfig, find_config, load_config
+from vibe_sentinel.config import (
+    ENV_OVERRIDES,
+    SentinelConfig,
+    find_config,
+    load_config,
+)
 
 
 def test_defaults_point_at_a_local_endpoint() -> None:
@@ -155,3 +160,117 @@ def test_zero_trend_runs_turns_the_fits_off(tmp_path: Path) -> None:
     path = tmp_path / ".vibe-sentinel.toml"
     path.write_text("[drift]\ntrend_runs = 0\n", encoding="utf-8")
     assert load_config(path).drift_trend_runs == 0
+
+
+# --- the environment names the backend this machine can reach ---------------
+#
+# The config file is one checkout shared by everyone, and it pins a vLLM
+# server on an NVIDIA card. A second contributor on a machine with neither
+# had no way to run the tool at all without editing a file that states what
+# the project pins rather than what their laptop can reach.
+
+
+def test_the_environment_overrides_the_endpoint_the_file_pins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / ".vibe-sentinel.toml").write_text(
+        '[llm]\nendpoint = "http://localhost:5001/v1"\nmodel = "qwen3-8b-fp8"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("VIBE_SENTINEL_LLM_ENDPOINT", "http://localhost:11434/v1")
+    monkeypatch.setenv("VIBE_SENTINEL_LLM_MODEL", "qwen3:14b")
+
+    config = load_config(tmp_path / ".vibe-sentinel.toml")
+
+    assert config.llm_endpoint == "http://localhost:11434/v1"
+    assert config.llm_model == "qwen3:14b"
+
+
+def test_an_override_names_itself(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``backend status`` prints these, because an override the reader
+    cannot see is the stale-backend failure with a config file as alibi."""
+    (tmp_path / ".vibe-sentinel.toml").write_text("", encoding="utf-8")
+    monkeypatch.setenv("VIBE_SENTINEL_LLM_MODEL", "qwen3:14b")
+
+    config = load_config(tmp_path / ".vibe-sentinel.toml")
+
+    assert config.env_overrides == ["VIBE_SENTINEL_LLM_MODEL"]
+
+
+def test_nothing_exported_is_not_an_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / ".vibe-sentinel.toml").write_text(
+        '[llm]\nmodel = "qwen3-8b-fp8"\n', encoding="utf-8"
+    )
+    for variable in ENV_OVERRIDES:
+        monkeypatch.delenv(variable, raising=False)
+
+    config = load_config(tmp_path / ".vibe-sentinel.toml")
+
+    assert config.llm_model == "qwen3-8b-fp8"
+    assert config.env_overrides == []
+
+
+def test_an_empty_variable_is_not_an_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``export FOO=`` is how a shell says "no value". Taken literally it
+    would point the endpoint at the empty string and report a connection
+    failure against nothing."""
+    (tmp_path / ".vibe-sentinel.toml").write_text(
+        '[llm]\nendpoint = "http://localhost:5001/v1"\n', encoding="utf-8"
+    )
+    monkeypatch.setenv("VIBE_SENTINEL_LLM_ENDPOINT", "   ")
+
+    config = load_config(tmp_path / ".vibe-sentinel.toml")
+
+    assert config.llm_endpoint == "http://localhost:5001/v1"
+    assert config.env_overrides == []
+
+
+def test_a_misspelt_override_fails_at_load_not_at_the_first_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same rule the file gets: a statement that cannot happen is an error
+    while somebody is still looking at it."""
+    (tmp_path / ".vibe-sentinel.toml").write_text("", encoding="utf-8")
+    monkeypatch.setenv("VIBE_SENTINEL_LLM_STRUCTURED_OUTPUT", "json_schmea")
+
+    with pytest.raises(ValidationError):
+        load_config(tmp_path / ".vibe-sentinel.toml")
+
+
+def test_the_environment_is_read_when_there_is_no_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Running without a config file is supported, so the one case with
+    nothing to override must not be the one case an override is ignored."""
+    monkeypatch.setenv("VIBE_SENTINEL_LLM_ENDPOINT", "http://localhost:11434/v1")
+    monkeypatch.chdir(tmp_path)
+
+    config = load_config()
+
+    assert config.config_path is None
+    assert config.llm_endpoint == "http://localhost:11434/v1"
+
+
+def test_no_override_reaches_the_probe_set_or_the_policies() -> None:
+    """Four variables, all of them about which backend this machine can
+    reach. The probes, the policies and the thresholds are statements
+    about the project, identical on every machine — a second way to set
+    one would be a second answer to a question that has one.
+
+    ``allow_remote_model`` is absent for the reason it is not a
+    command-line flag either: the credentials gate refuses a non-loopback
+    endpoint whatever is set, and that refusal must not be reachable by
+    exporting something.
+    """
+    assert set(ENV_OVERRIDES.values()) == {
+        "llm_endpoint",
+        "llm_model",
+        "api_key",
+        "structured_output",
+    }

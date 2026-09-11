@@ -7,6 +7,26 @@ All notable changes to this project are recorded here. The format follows
 A release is refused if the version it names has no section here. The date on
 the heading is stamped at release; write `unreleased` and leave it.
 
+## [0.4.0] — 2026-09-11
+
+### Added
+
+- `VIBE_SENTINEL_LLM_ENDPOINT`, `_MODEL`, `_API_KEY` and
+  `_STRUCTURED_OUTPUT`, overriding the `[llm]` wiring for one machine.
+  `docs/getting-started.md`.
+- `backend status` prints a `Source:` line naming the overrides in force.
+
+### Changed
+
+- The README's opening: what a probe, a lens and a gate each are, stated
+  before the argument for building it that way.
+- The test stub answers a lens, and refuses any model call it has no answer
+  for rather than letting it reach a backend.
+
+### Removed
+
+- The README's "Why it is built this way" section.
+
 ## [0.3.0] — 2026-09-09
 
 ### Added

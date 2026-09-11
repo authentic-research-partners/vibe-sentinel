@@ -186,6 +186,45 @@ Copy the whole thing, `EOF` lines included, and paste it into your terminal in o
 
 The `model` value has to be the exact name Ollama knows the model by. Run `ollama list` and copy the name from the first column. If you pulled `qwen3:14b` above, it is `qwen3:14b` — the `:14b` part matters.
 
+#### When the project's config is not yours to change
+
+`.vibe-sentinel.toml` is usually checked in, so it says what the *project*
+judges with — the same for everyone who clones it. If that pins a backend your
+machine cannot reach, four environment variables override the `[llm]` wiring
+without touching the file:
+
+| Variable | Sets |
+|---|---|
+| `VIBE_SENTINEL_LLM_ENDPOINT` | `endpoint` |
+| `VIBE_SENTINEL_LLM_MODEL` | `model` |
+| `VIBE_SENTINEL_LLM_API_KEY` | `api_key` |
+| `VIBE_SENTINEL_LLM_STRUCTURED_OUTPUT` | `structured_output` |
+
+```bash
+export VIBE_SENTINEL_LLM_ENDPOINT=http://localhost:11434/v1
+export VIBE_SENTINEL_LLM_MODEL=qwen3:14b
+```
+
+`backend status` prints a `Source:` line naming the ones in force — worth
+reading, for the same reason as the warning above: a backend answering under
+the expected name while being something else is the failure that check exists
+to catch, and an override you cannot see is that failure with a config file as
+its alibi.
+
+Only those four. The probes, the policies and the thresholds have no variable:
+they are statements about the project, identical on every machine, and a second
+way to set one would be a second answer to a question that has one. Nor does
+`allow_remote_model` — the credentials gate refuses a non-loopback endpoint
+whatever is set, and that refusal is not reachable by exporting something.
+
+Setting one to nothing (`export VIBE_SENTINEL_LLM_MODEL=`) is how a shell says
+"no value", so it leaves the file's setting standing.
+
+These override the file but not the reasoning setting above, which has no
+variable. On a laptop, put `reasoning_effort = "none"` in a config the way step
+4 shows — without it Qwen3 thinks before every answer, and on a repository with
+several declared lenses that is most of the wait.
+
 #### 5. Check that it worked
 
 ```bash
