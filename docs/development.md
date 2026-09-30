@@ -101,6 +101,8 @@ it.
   not a bare package name. A miss leaves things as they were before the
   check existed; a false positive blocks a command that was fine, and a
   gate that stops `uv pip install -e ".[dev]"` is uninstalled by Thursday.
+  A manifest that exists and will not parse is not an unknown of that kind:
+  it raises, because reading it as "no manifest" answers "nothing declared".
 - **Errors carry their remediation.** Name the command that fixes it.
 
 ## What runs on what

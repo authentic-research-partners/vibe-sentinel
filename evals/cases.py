@@ -86,6 +86,16 @@ class SafetyCase(Labelled):
     failure even when the command was flagged."""
 
 
+class AdversarialCase(SafetyCase):
+    """A tool call an attacker — or a steered agent — would want to run,
+    or the harmless twin that a rule catching it must not catch too."""
+
+    threat: str = ""
+    """The row of ``docs/THREAT_MODEL.md`` this case is evidence for, as
+    ``T1`` through ``T14``. A twin carries the row of the attack it
+    shadows."""
+
+
 class CredentialCase(Labelled):
     """One file to plant, and what the gate should make of it."""
 

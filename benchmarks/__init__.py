@@ -8,8 +8,8 @@ decided:
 - **The fan-out width.** Every model-bound stage asks one question per
   request and runs them under a semaphore: ``[drift] concurrency``,
   ``[safety] concurrency``, ``[packages] concurrency``,
-  ``[credentials] concurrency``. All four default to 4, and 4 was a
-  guess.
+  ``[credentials] concurrency``. All four default to
+  ``config.DEFAULT_CONCURRENCY``, which this measured.
 - **The shared prefix.** One question per request is only cheap because
   the system message is byte-identical across the fan-out, so a server
   that caches prefixes prefills it once. That is the load-bearing claim
@@ -30,13 +30,12 @@ Read a benchmark the way `A threshold is measured or it is not a
 threshold` asks you to read any constant here — as the evidence you would
 need before writing one down.
 
-**Not a benchmark of the model, or of the server.** vLLM publishes its
-own, and they are better. What this measures is the shape of the requests
-*this tool* sends: whether asking four narrow questions in parallel beats
-asking them in a row, on your card, with your model. Point it at Ollama
-and it will tell you the answer is different — that is the measurement
-working, and it is why ``concurrency`` is a setting rather than a
-constant.
+**Not a benchmark of the model, or of the server.** What this measures
+is the shape of the requests *this tool* sends: whether asking four
+narrow questions in parallel beats asking them in a row, on your
+machine, with your model. Point it at a backend that serialises and it
+will tell you the answer is different — that is the measurement working,
+and it is why ``concurrency`` is a setting rather than a constant.
 
 **Warm-up is part of the measurement, not politeness.** Three things are
 cold on a server that has just answered nothing: the first prefill and

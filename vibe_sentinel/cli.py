@@ -200,12 +200,14 @@ def _checked_declarations(root: Path, pool: list[Probe]) -> tuple[Lens, ...]:
     after every probe has run costs the measurements.
 
     The safety gate's tables are read here for a sharper version of the
-    same reason. The alternative place to find out is the hook, which
-    runs in front of a tool call, where the only honest answer to "this
-    table will not parse" is to refuse the command. A scan is where
-    somebody can read the error and fix the line.
+    same reason, and so is ``pyproject.toml``, which the gate reads to
+    tell a declared install from an undeclared one. The alternative place
+    to find out is the hook, which runs in front of a tool call, where the
+    only honest answer to "this file will not parse" is to refuse the
+    command. A scan is where somebody can read the error and fix the line.
     """
     from vibe_sentinel.analyze import load_lenses, unknown_watches
+    from vibe_sentinel.requirements import load_manifest
     from vibe_sentinel.safety import configured_mode, load_dangers
 
     lenses = load_lenses(root)
@@ -225,6 +227,7 @@ def _checked_declarations(root: Path, pool: list[Probe]) -> tuple[Lens, ...]:
 
     configured_mode(root)
     load_dangers(root)
+    load_manifest(root)
     return lenses
 
 
@@ -1399,15 +1402,6 @@ def run_backend(args: argparse.Namespace) -> int:
         )
     if action == "stop":
         return backend.stop(config)
-    if action == "monitor":
-        count = max(1, int(getattr(args, "count", 1)))
-        interval = float(getattr(args, "interval", 2.0))
-        try:
-            return asyncio.run(backend.monitor(config, interval, count))
-        except KeyboardInterrupt:
-            # Watching is the point, so stopping watching is not a failure.
-            return 0
-
     logger.error("vibe-sentinel backend: no action given. Try 'backend status'.")
     return 2
 
@@ -1570,19 +1564,21 @@ def run_safety(args: argparse.Namespace) -> int:
             dangers = safety.load_dangers(root)
             with get_db(root) as conn:
                 recorded = journal_store.list_commands(conn, limit=10_000)
+            matched = [
+                (
+                    row.command or row.describe(),
+                    bool(
+                        safety.triage(
+                            row.tool_name, row.command, row.target, root, dangers
+                        )
+                    ),
+                )
+                for row in reversed(recorded)
+                if candidate.search(row.command or row.describe())
+            ]
         except (SchemaMismatchError, ValueError) as e:
             logger.error(str(e))
             return 2
-        matched = [
-            (
-                row.command or row.describe(),
-                bool(
-                    safety.triage(row.tool_name, row.command, row.target, root, dangers)
-                ),
-            )
-            for row in reversed(recorded)
-            if candidate.search(row.command or row.describe())
-        ]
         render_pattern_match(pattern, len(recorded), matched)
         return 0
 
@@ -1692,7 +1688,9 @@ def run_safety(args: argparse.Namespace) -> int:
                     "\nThe gate is off. Turn it on in .vibe-sentinel.toml:\n"
                     '  [safety]\n  mode = "observe"   # record verdicts, block nothing'
                 )
-    except SchemaMismatchError as e:
+    except (SchemaMismatchError, ValueError) as e:
+        # ValueError: a [[danger]] set or a pyproject.toml that will not
+        # load, each named in its message with the command that checks it.
         logger.error(str(e))
         return 2
     return 0

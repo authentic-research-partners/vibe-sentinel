@@ -445,8 +445,8 @@ def build_context(report: DriftReport, current: Snapshot, guidance: str = "") ->
     """The shared half of the prompt: the whole report, once.
 
     This is the **system** message and it is byte-identical for every lens
-    asked about this run, so a server that caches prefixes — vLLM does —
-    prefills the report once however many questions are asked of it. The
+    asked about this run, so a server that caches prefixes prefills the
+    report once however many questions are asked of it. The
     divergent tail is one lens's question, from :func:`build_question`.
     """
     summaries = "\n".join(
@@ -632,9 +632,9 @@ async def analyze_drift(
     )
 
     async def ask_all() -> list[Any]:
-        # Free against a server that batches: the context above is one
-        # prefix, prefilled once for the whole fan-out. Ollama serialises,
-        # so set [drift] concurrency = 1 there and pay for it in latency.
+        # The context above is one prefix, prefilled once for the whole
+        # fan-out. Width pays only against a server that batches; see
+        # config.DEFAULT_CONCURRENCY for why the default is 1.
         limit = asyncio.Semaphore(max(1, tuned.drift_concurrency))
 
         async def one(lens: Lens) -> tuple[Lens, dict[str, Any] | None]:

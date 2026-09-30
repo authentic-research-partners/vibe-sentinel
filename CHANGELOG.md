@@ -7,6 +7,68 @@ All notable changes to this project are recorded here. The format follows
 A release is refused if the version it names has no section here. The date on
 the heading is stamped at release; write `unreleased` and leave it.
 
+## [0.5.0] — 2026-09-30
+
+### Added
+
+- `docs/THREAT_MODEL.md` and `SECURITY.md`.
+- `docs/CONTROL_MAPPING.md`: each risk against OWASP, MITRE ATLAS and the
+  NIST AI RMF, with the tests and eval cases that evidence it.
+- `python -m evals adversarial`: the threat model's attacks, each with a
+  harmless twin, scored end to end.
+- `changing-the-gate`, a shipped danger settled `unsafe` without a model: a
+  write, move or delete of `.vibe-sentinel.toml`, `.vibe-sentinel/`,
+  `.claude/settings*.json` or a declared rule file. `applies_to =
+  "control-file"`.
+- `secret-store` and `secret-store-target`, settled `unsafe`: a command or a
+  tool naming a file that holds keys in the home directory.
+- `reaching-into-home`, asked: a read or a shell write in the home directory,
+  outside the project. `applies_to = "home-outside-project"`.
+- `sending-data-off-the-machine`, asked: local data uploaded to a host not in
+  `[safety] expected_hosts`. `applies_to = "egress"`.
+- `installing-undeclared-dependency` reads npm, pnpm, yarn and bun installs
+  against `package.json`.
+- Under `enforce`, a flagged command with no verdict — `unclear`, or no
+  answer within `[safety] timeout` — is asked with Claude Code's permission
+  prompt instead of allowed. `[safety] no_verdict = "allow"` restores
+  allowing it. A review records `decision`: `allow`, `ask` or `deny`.
+- `applies_to = "tool"`, matching a danger's pattern against a tool's name,
+  and `deleting-through-a-connected-tool`, settled `unsafe`: an MCP tool
+  whose name says it deletes.
+
+### Changed
+
+- The default backend is Ollama: `[llm] endpoint` defaults to
+  `http://localhost:11434/v1` and `model` to `gemma4:26b-a4b-it-qat`.
+- `python -m benchmarks` counts truncated answers from each response's
+  `finish_reason` rather than from a server's `/metrics`.
+- `concurrency` under `[drift]`, `[safety]`, `[packages]` and `[credentials]`
+  defaults to 1, from `config.DEFAULT_CONCURRENCY`.
+- `python -m evals safety` asks about one case at a time by default.
+- `[llm] extra_body` defaults to `reasoning_effort = "none"`, switching a
+  reasoning model's thinking off.
+
+### Removed
+
+- `vibe-sentinel backend monitor`, and the benchmarks' `cached` column and
+  preemption count, which read metrics only vLLM publishes.
+- vLLM from the documentation.
+
+### Fixed
+
+- The `safety` and `adversarial` evals score what the gate decides: a
+  declared verdict settles a case, as it does in the hook, instead of the
+  model's opinion of it.
+- A `pyproject.toml` that will not parse no longer reads as no manifest,
+  which let every install through `undeclared-install`. The safety gate
+  handles it by mode, `scan` reports it, and the `packages` gate fails on it.
+- The safety gate reads `exec` in front of a command as a wrapper, as the
+  install check already did.
+- A safety gate failure is recorded as an `unreviewed` review naming the
+  error, and a command the gate cannot split is logged.
+- An install the gate cannot split into words, such as `pip install x #
+  don't`, is asked about instead of being read as installing nothing.
+
 ## [0.4.0] — 2026-09-11
 
 ### Added

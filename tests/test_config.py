@@ -8,6 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from vibe_sentinel.config import (
+    DEFAULT_CONCURRENCY,
     ENV_OVERRIDES,
     SentinelConfig,
     find_config,
@@ -17,7 +18,8 @@ from vibe_sentinel.config import (
 
 def test_defaults_point_at_a_local_endpoint() -> None:
     config = SentinelConfig()
-    assert config.llm_endpoint == "http://localhost:5001/v1"
+    assert config.llm_endpoint == "http://localhost:11434/v1"
+    assert config.llm_model == "gemma4:26b-a4b-it-qat"
     assert config.structured_output == "json_schema"
     assert config.config_path is None
     assert config.start_command == []
@@ -162,27 +164,62 @@ def test_zero_trend_runs_turns_the_fits_off(tmp_path: Path) -> None:
     assert load_config(path).drift_trend_runs == 0
 
 
+def test_every_fan_out_shares_one_default() -> None:
+    """Four stages fan out, and they had four copies of the default.
+
+    One owner now, with the measurement beside it. A stage that stops
+    reading it is a second answer to the question, so each is checked, both
+    as a model default and as what a policy table with no ``concurrency``
+    key comes out as.
+    """
+    from vibe_sentinel import credentials, packages
+
+    config = SentinelConfig()
+    assert config.drift_concurrency == DEFAULT_CONCURRENCY
+    assert config.safety_concurrency == DEFAULT_CONCURRENCY
+    assert credentials.policy_from_data({}, "test").concurrency == DEFAULT_CONCURRENCY
+    assert packages.policy_from_data({}, "test").concurrency == DEFAULT_CONCURRENCY
+
+
+def test_thinking_is_off_unless_a_project_says_otherwise(tmp_path: Path) -> None:
+    """The default model thinks unless told not to, and with thinking on the
+    safety gate's verdicts missed their timeout 26 times in 27. So the
+    default turns it off, and declaring the table replaces that default
+    whole: an empty one sends nothing, which is how a project turns thinking
+    back on or stops sending a field its server rejects."""
+    assert SentinelConfig().extra_body == {"reasoning_effort": "none"}
+
+    empty = tmp_path / "empty.toml"
+    empty.write_text("[llm.extra_body]\n", encoding="utf-8")
+    assert load_config(empty).extra_body == {}
+
+    other = tmp_path / "other.toml"
+    other.write_text("[llm.extra_body]\ntop_k = 20\n", encoding="utf-8")
+    assert load_config(other).extra_body == {"top_k": 20}
+
+
 # --- the environment names the backend this machine can reach ---------------
 #
-# The config file is one checkout shared by everyone, and it pins a vLLM
-# server on an NVIDIA card. A second contributor on a machine with neither
-# had no way to run the tool at all without editing a file that states what
-# the project pins rather than what their laptop can reach.
+# The config file is one checkout shared by everyone, and it pins a model
+# some machines cannot run. A contributor on one of those had no way to run
+# the tool at all without editing a file that states what the project pins
+# rather than what their laptop can reach.
 
 
 def test_the_environment_overrides_the_endpoint_the_file_pins(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     (tmp_path / ".vibe-sentinel.toml").write_text(
-        '[llm]\nendpoint = "http://localhost:5001/v1"\nmodel = "qwen3-8b-fp8"\n',
+        '[llm]\nendpoint = "http://localhost:11434/v1"\n'
+        'model = "vibe-sentinel-judge"\n',
         encoding="utf-8",
     )
-    monkeypatch.setenv("VIBE_SENTINEL_LLM_ENDPOINT", "http://localhost:11434/v1")
+    monkeypatch.setenv("VIBE_SENTINEL_LLM_ENDPOINT", "http://localhost:1234/v1")
     monkeypatch.setenv("VIBE_SENTINEL_LLM_MODEL", "qwen3:14b")
 
     config = load_config(tmp_path / ".vibe-sentinel.toml")
 
-    assert config.llm_endpoint == "http://localhost:11434/v1"
+    assert config.llm_endpoint == "http://localhost:1234/v1"
     assert config.llm_model == "qwen3:14b"
 
 
@@ -203,14 +240,14 @@ def test_nothing_exported_is_not_an_override(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     (tmp_path / ".vibe-sentinel.toml").write_text(
-        '[llm]\nmodel = "qwen3-8b-fp8"\n', encoding="utf-8"
+        '[llm]\nmodel = "vibe-sentinel-judge"\n', encoding="utf-8"
     )
     for variable in ENV_OVERRIDES:
         monkeypatch.delenv(variable, raising=False)
 
     config = load_config(tmp_path / ".vibe-sentinel.toml")
 
-    assert config.llm_model == "qwen3-8b-fp8"
+    assert config.llm_model == "vibe-sentinel-judge"
     assert config.env_overrides == []
 
 
@@ -221,13 +258,13 @@ def test_an_empty_variable_is_not_an_override(
     would point the endpoint at the empty string and report a connection
     failure against nothing."""
     (tmp_path / ".vibe-sentinel.toml").write_text(
-        '[llm]\nendpoint = "http://localhost:5001/v1"\n', encoding="utf-8"
+        '[llm]\nendpoint = "http://localhost:8080/v1"\n', encoding="utf-8"
     )
     monkeypatch.setenv("VIBE_SENTINEL_LLM_ENDPOINT", "   ")
 
     config = load_config(tmp_path / ".vibe-sentinel.toml")
 
-    assert config.llm_endpoint == "http://localhost:5001/v1"
+    assert config.llm_endpoint == "http://localhost:8080/v1"
     assert config.env_overrides == []
 
 

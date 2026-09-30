@@ -4,11 +4,17 @@ Claude Code fires a ``PreToolUse`` hook before every tool call. This
 module is that hook's other end: it reads the event from stdin and
 appends one row to the project's history database.
 
-It records; it never judges. The hook writes nothing to stdout and
-always exits 0, so it cannot deny a tool call, rewrite one, or stall the
-agent with an opinion — the same boundary the rest of vibe-sentinel
-keeps between measuring a codebase and evaluating it. A probe measures
-the shape the work left behind; this measures the work itself.
+It always records, and judges only when a project asks it to. Under
+``[safety] mode = "off"``, the default, the hook writes nothing to stdout
+and cannot deny a tool call, rewrite one, or stall the agent with an
+opinion. ``observe`` also asks :mod:`vibe_sentinel.safety` for a verdict
+and records it, still refusing nothing. ``enforce`` turns an ``unsafe``
+verdict — or a policy the gate cannot load — into a ``deny`` decision on
+stdout, the only thing ever written there. It exits 0 in every mode.
+Recording is this module's job and judging is ``safety.py``'s, kept apart
+for the reason the rest of vibe-sentinel keeps measuring a codebase apart
+from evaluating it. A probe measures the shape the work left behind; this
+measures the work itself.
 
 **Identity is the point.** The payload carries enough to keep several
 concurrent actors apart instead of collapsing them into one stream:
@@ -57,8 +63,9 @@ from typing import Any
 from vibe_sentinel.log import logger
 
 from vibe_sentinel.paths import CONFIG_FILENAME
+from vibe_sentinel.requirements import ManifestUnreadable
 from vibe_sentinel.safety import (
-    configured_mode,
+    configured_safety,
     declared_verdict,
     load_dangers,
     review,
@@ -89,8 +96,17 @@ HOOK_COMMAND = "vibe-sentinel hook"
 #: Seconds Claude Code waits for the hook. Bounded, so a locked database
 #: cannot stall a tool call for the default ten minutes — but with room
 #: above ``safety.timeout``, which is the bound that actually matters
-#: when the gate is on: measured verdicts from a local 8B model ran
-#: 2.9-6.0 s, and the outer limit must not be what cuts one off.
+#: when the gate is on.
+#:
+#: Keeping ``safety.timeout`` under this is a security property, not a
+#: tidiness one. Claude Code's hooks reference: "A timed-out command,
+#: http, or mcp_tool hook doesn't block the tool call. The call continues
+#: through the normal permission flow, so don't count on a stalled hook to
+#: act as a gate." So a verdict that runs past this limit is not asked
+#: about or refused — the hook is cancelled and the call proceeds, which
+#: is the one fail-open path ``[safety] no_verdict`` cannot close. The
+#: gate gives up at ``safety.timeout`` and answers; this must never be
+#: what cuts it off.
 HOOK_TIMEOUT = 20
 
 
@@ -240,6 +256,45 @@ def _deny(reason: str) -> dict[str, Any]:
     }
 
 
+def _ask(reason: str) -> dict[str, Any]:
+    """The JSON that hands this tool call to the person to approve or refuse.
+
+    Claude Code shows its own permission prompt, with ``reason`` on it.
+    Where nobody can answer — a ``claude -p`` run with no permission host —
+    Claude Code denies the request instead, so ``reason`` has to carry the
+    fix as well as the doubt.
+    """
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "ask",
+            "permissionDecisionReason": reason,
+        }
+    }
+
+
+def _no_verdict_reason(
+    verdict: str, reason: str, signals: tuple[str, ...], timeout: float
+) -> str:
+    """Why the gate is asking rather than deciding, and what fixes it."""
+    flagged = ", ".join(signals)
+    if verdict == "unreviewed":
+        return (
+            f"vibe-sentinel flagged this command ({flagged}) and got no verdict "
+            f"within [safety] timeout ({timeout:g} s), so it cannot say whether "
+            f"it is safe. Approve it only if you know what it does. Check the "
+            f"model with `vibe-sentinel backend status` — a model the backend "
+            f"had unloaded can miss the timeout while it loads."
+        )
+    return (
+        f"vibe-sentinel flagged this command ({flagged}) and the model could "
+        f"not decide whether it is safe: {reason} Approve it only if you know "
+        f"what it does. To stop asking about a command you trust, declare a "
+        f"verdict for its danger in .vibe-sentinel.toml, or set [safety] "
+        f"no_verdict = 'allow'."
+    )
+
+
 def _unreadable_config(error: str) -> dict[str, Any]:
     """What to do when the safety mode itself cannot be read.
 
@@ -259,24 +314,20 @@ def _unreadable_config(error: str) -> dict[str, Any]:
     )
 
 
-def _unloadable_dangers(
-    root: Path, command_id: int, occurred_at: str, mode: str, error: str
-) -> dict[str, Any] | None:
-    """What to do when a project's ``[[danger]]`` set will not load.
+def _record_unreviewed(
+    root: Path,
+    command_id: int,
+    occurred_at: str,
+    mode: str,
+    reason: str,
+    decision: str,
+) -> None:
+    """Record that a command was acted on with no verdict, and why.
 
-    Not the built-in set. Substituting one rule set for another produces a
-    verdict about a policy nobody declared, and it reads exactly like a
-    verdict about theirs — a shipped list cannot know which of your database
-    hosts is production, which is the whole reason the table is declared.
-
-    So the gate says what is true: it could not triage, and therefore cannot
-    clear the command. ``enforce`` refuses and names the file. ``observe``
-    never refuses — that is the mode's own meaning rather than a second path
-    — and records that nothing was judged, and why, so
-    ``vibe-sentinel safety --list`` shows the gap instead of a clean run.
+    The row is what ``vibe-sentinel safety --list`` reads, so a command the
+    gate could not judge shows up there as ``unreviewed`` with the reason,
+    rather than only in a log. A command that already has a row keeps it.
     """
-    logger.warning("safety: {}", error)
-    reason = f"the project's [[danger]] set could not be loaded: {error}"
     try:
         with get_db(root, JOURNAL_DURABILITY) as conn:
             journal_store.save_review(
@@ -289,20 +340,56 @@ def _unloadable_dangers(
                 model="",
                 reviewed=False,
                 mode=mode,
-                enforced=mode == "enforce",
+                enforced=decision == "deny",
                 history_count=0,
                 duration_ms=0,
+                decision=decision,
             )
     except (SchemaMismatchError, sqlite3.Error, OSError) as e:
-        logger.warning("safety: could not record the unloadable danger set ({})", e)
+        logger.warning("safety: could not record the unreviewed command ({})", e)
 
+
+def _untriageable(
+    root: Path,
+    command_id: int,
+    occurred_at: str,
+    mode: str,
+    reason: str,
+    fix: str,
+) -> dict[str, Any] | None:
+    """What to do when something triage reads will not load.
+
+    Two things can: the project's ``[[danger]]`` set, and its
+    ``pyproject.toml``, which ``undeclared-install`` reads to know what is
+    declared. Neither gets a substitute. The built-in set in place of a
+    declared one produces a verdict about a policy nobody declared, and it
+    reads exactly like a verdict about theirs — a shipped list cannot know
+    which of your database hosts is production. "No manifest" in place of an
+    unreadable one concludes that nothing is declared, so no install can be
+    undeclared.
+
+    So the gate says what is true: it could not triage, and therefore cannot
+    clear the command. ``enforce`` refuses and names the fix. ``observe``
+    never refuses — that is the mode's own meaning rather than a second path
+    — and records that nothing was judged, and why, so
+    ``vibe-sentinel safety --list`` shows the gap instead of a clean run.
+    """
+    logger.warning("safety: {}", reason)
+    _record_unreviewed(
+        root,
+        command_id,
+        occurred_at,
+        mode,
+        reason,
+        "deny" if mode == "enforce" else "allow",
+    )
     if mode != "enforce":
         return None
     return _deny(
         f"vibe-sentinel refused this command because it could not tell whether "
         f"the command is dangerous: {reason} Fix the file and check it with "
-        f"`vibe-sentinel safety --print-dangers`, or set safety.mode to "
-        f"'observe' in .vibe-sentinel.toml to record without acting."
+        f"{fix}, or set safety.mode to 'observe' in .vibe-sentinel.toml to "
+        f"record without acting."
     )
 
 
@@ -312,15 +399,23 @@ def gate(
     """Judge one recorded command, and decide whether to stop it.
 
     Returns the decision JSON for Claude Code, or None to say nothing —
-    which is what happens for every command triage does not flag, every
-    configuration that is not ``enforce``, and every review that did not
-    reach a verdict.
+    which is what happens for every command triage does not flag and every
+    configuration that is not ``enforce``.
 
-    **Nothing here may raise.** It runs in front of a tool call the user
-    is waiting on, and a gate that turns a bug into a blocked command is
-    worse than the risk it was guarding against. Any failure is logged
-    and the command proceeds.
+    Under ``enforce`` the gate never degrades silently. ``unsafe`` is
+    refused. A command with no verdict — the model answered ``unclear``,
+    did not answer in time, or the gate itself failed — is handed to the
+    person to approve (``[safety] no_verdict = "ask"``, the default), and
+    where nobody can answer Claude Code turns that into a refusal carrying
+    the fix. ``no_verdict = "allow"`` lets it run instead, chosen on
+    purpose. ``observe`` records and never acts.
+
+    **Nothing here may raise.** A bug must not become a blocked command:
+    under ``enforce`` it becomes a question, and elsewhere the command
+    proceeds.
     """
+    mode = "off"
+    no_verdict = "allow"
     try:
         # The mode first, and before the danger set, for two reasons. It is
         # the cheaper read, so the common case — a project that never turned
@@ -328,7 +423,7 @@ def gate(
         # gate off must not be refused a command because a `[[danger]]` table
         # it does not use will not parse.
         try:
-            mode = configured_mode(root)
+            mode, no_verdict = configured_safety(root)
         except ValueError as e:
             return _unreadable_config(str(e))
         if mode == "off":
@@ -337,11 +432,28 @@ def gate(
         try:
             dangers = load_dangers(root)
         except ValueError as e:
-            return _unloadable_dangers(root, command_id, occurred_at, mode, str(e))
+            return _untriageable(
+                root,
+                command_id,
+                occurred_at,
+                mode,
+                f"the project's [[danger]] set could not be loaded: {e}",
+                "`vibe-sentinel safety --print-dangers`",
+            )
 
-        signals = triage(
-            event.tool_name, event.command_text(), event.target(), root, dangers
-        )
+        try:
+            signals = triage(
+                event.tool_name, event.command_text(), event.target(), root, dangers
+            )
+        except ManifestUnreadable as e:
+            return _untriageable(
+                root,
+                command_id,
+                occurred_at,
+                mode,
+                str(e),
+                "`vibe-sentinel packages`",
+            )
         if not signals:
             return None
 
@@ -398,7 +510,15 @@ def gate(
             verdict = opinion.verdict if opinion is not None else "unreviewed"
             reason = opinion.reason if opinion is not None else ""
             resolves_to = opinion.resolves_to if opinion is not None else ""
-        enforced = mode == "enforce" and verdict == "unsafe"
+        if mode != "enforce":
+            decision = "allow"
+        elif verdict == "unsafe":
+            decision = "deny"
+        elif verdict in ("unclear", "unreviewed") and no_verdict == "ask":
+            decision = "ask"
+        else:
+            decision = "allow"
+        enforced = decision == "deny"
 
         with get_db(root, JOURNAL_DURABILITY) as conn:
             journal_store.save_review(
@@ -414,9 +534,14 @@ def gate(
                 enforced=enforced,
                 history_count=len(history),
                 duration_ms=duration_ms,
+                decision=decision,
             )
 
-        if not enforced:
+        if decision == "ask":
+            return _ask(
+                _no_verdict_reason(verdict, reason, signals, config.safety_timeout)
+            )
+        if decision != "deny":
             return None
 
         detail = f" It resolves to: {resolves_to}." if resolves_to else ""
@@ -427,6 +552,23 @@ def gate(
             f"in .vibe-sentinel.toml to record the verdict without acting on it."
         )
     except Exception as e:  # noqa: BLE001 - never block a tool call over a bug
+        asking = mode == "enforce" and no_verdict == "ask"
+        _record_unreviewed(
+            root,
+            command_id,
+            occurred_at,
+            mode,
+            f"the safety gate failed: {e}",
+            "ask" if asking else "allow",
+        )
+        if asking:
+            logger.warning("safety gate failed ({}) — asking about the command", e)
+            return _ask(
+                f"vibe-sentinel failed while judging this command ({e}), so it "
+                f"has no verdict. Approve it only if you know what it does. The "
+                f"failure is in the hook log; `vibe-sentinel safety --check "
+                f"'<command>'` runs the same review where the error is visible."
+            )
         logger.warning("safety gate failed ({}) — command allowed through", e)
         return None
 

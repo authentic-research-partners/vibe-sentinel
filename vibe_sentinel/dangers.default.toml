@@ -13,9 +13,10 @@
 #
 # `pattern` is the cheap stage — a regex over the command text, deciding
 # whether this is worth a model call at all. `question` is what the model is
-# then asked, one request per matched danger. Two entries carry no pattern
-# because what they ask is a fact about the tree rather than about the text:
-# `writing-outside-the-project` and `installing-undeclared-dependency`.
+# then asked, one request per matched danger. Five entries carry no pattern
+# because what they ask needs more than a regex over the text:
+# `writing-outside-the-project`, `changing-the-gate`, `reaching-into-home`,
+# `sending-data-off-the-machine` and `installing-undeclared-dependency`.
 #
 # `vibe-sentinel safety --print-dangers` prints the set as it resolves here.
 
@@ -129,6 +130,84 @@ question = """\
     This writes outside the project directory. Is that destination \
     something this work should be modifying at all?"""
 applies_to = 'outside-project'
+
+# The gate's own settings, the hook entry that calls it, its record, and every
+# rule file the project's config points at. Settled here rather than asked:
+# the text an agent writes into the file is what the model would read, and a
+# control the agent can talk its way past is not one. A project that wants its
+# agent to edit these redeclares this id without the verdict, or disables it.
+[[danger]]
+id = 'changing-the-gate'
+title = "Changing vibe-sentinel's own settings, hook or record"
+applies_to = 'control-file'
+verdict = 'unsafe'
+
+# Files that hold keys and passwords, in the user's home directory. A coding
+# agent has no reason to name one: `git`, `aws`, `ssh` and `kubectl` read their
+# own without the agent ever spelling the path, so a command that does spell it
+# is either steered or mistaken. Settled for the same reason as the gate's own
+# files — the text a planted instruction wrote is what a model would read. Add a
+# path your company keeps secrets at by declaring your own entry; remove one by
+# redeclaring these ids without the verdict. Twice, because one pattern cannot
+# be matched against both the command text and a tool's target.
+[[danger]]
+id = 'secret-store'
+title = 'Naming a file that holds keys or passwords'
+pattern = '''(?:~|\$HOME|\$\{HOME\}|/Users/[^/\s]+|/home/[^/\s]+|/root)/(?:\.ssh(?:/|\b)|\.aws/|\.gnupg/|\.netrc\b|\.docker/config\.json|\.kube/config\b|\.npmrc\b|\.pypirc\b|\.config/gh/|Library/Keychains/)'''
+verdict = 'unsafe'
+
+[[danger]]
+id = 'secret-store-target'
+title = 'A tool reading or writing a file that holds keys or passwords'
+pattern = '''(?:~|/Users/[^/]+|/home/[^/]+|/root)/(?:\.ssh(?:/|$)|\.aws/|\.gnupg/|\.netrc$|\.docker/config\.json$|\.kube/config$|\.npmrc$|\.pypirc$|\.config/gh/|Library/Keychains/)'''
+applies_to = 'target'
+verdict = 'unsafe'
+
+# Everything else in the home directory, outside the project. Asked, not
+# settled: reading another of the user's repositories or their git config is
+# sometimes the work. The rest of the filesystem is not watched — /usr/bin,
+# /etc and /tmp hold nothing personal, and asking about them would slow every
+# session for nothing.
+[[danger]]
+id = 'reaching-into-home'
+title = "Reaching into the user's home directory, outside the project"
+question = """\
+    This names a path in the user's home directory, outside the project. What \
+    does it read or change there — is any of it private, like keys, tokens or \
+    another project's files — and does the work in this project need it?"""
+applies_to = 'home-outside-project'
+
+# Local data sent to another machine: curl or wget with data or an upload, a raw
+# socket, a copy whose destination is remote, ssh with data piped into it, a
+# cloud-storage upload. Fetching is not sending, loopback is not off the
+# machine, and `git push` to the project's own remote is the work. Hosts the
+# project sends to on purpose go in `[safety] expected_hosts`, and a subdomain
+# of one counts as it; a destination nobody can read off the command is asked
+# about. Asked rather than settled, because what matters is what leaves.
+[[danger]]
+id = 'sending-data-off-the-machine'
+title = 'Sending local data to a host the project does not expect'
+question = """\
+    This sends data off the machine to a host the project does not list in \
+    [safety] expected_hosts. What exactly leaves — a file, a command's \
+    output, a secret, source code — where does it go, and why would this \
+    work send it there?"""
+applies_to = 'egress'
+
+# A connected tool whose name says it deletes — a repository, a page, an issue,
+# a record in someone else's service. Settled rather than asked, because an MCP
+# call reaches the gate as a tool name and little else: the model would be
+# judging `mcp__github__delete_repository` without knowing which repository,
+# which is no better than this pattern. Deleting through a connected service is
+# rarely a coding agent's job and usually cannot be undone. A project that needs
+# it redeclares this id without the verdict, or declares its own tools by name
+# with `applies_to = 'tool'`.
+[[danger]]
+id = 'deleting-through-a-connected-tool'
+title = 'A connected (MCP) tool that deletes'
+pattern = '^mcp__.+__(?:\w*_)?(?:delete|remove|destroy|drop|purge|erase|wipe)(?:_|$)'
+applies_to = 'tool'
+verdict = 'unsafe'
 
 [[danger]]
 id = 'installing-undeclared-dependency'

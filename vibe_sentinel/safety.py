@@ -37,10 +37,14 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from vibe_sentinel.rulesets import rule_file_paths, source_label, tables_in_file
-from vibe_sentinel.requirements import undeclared_installs
+from vibe_sentinel.requirements import (
+    WRAPPERS,
+    undeclared_installs,
+    unreadable_install,
+)
 
 if TYPE_CHECKING:
     from vibe_sentinel.config import SentinelConfig
@@ -74,11 +78,18 @@ class Danger:
     """What the pattern is matched against, or the structural question asked
     instead of one.
 
-    ``command`` matches the command text and ``target`` the path a tool is
-    writing to. The other two ignore ``pattern`` entirely and ask something
-    a regex cannot: ``outside-project``, whether the target leaves the
-    project directory, and ``undeclared-install``, whether the command
-    installs a package name no manifest in the tree declares.
+    Three match ``pattern``: ``command`` against the command text,
+    ``target`` against the path a tool acts on, and ``tool`` against the
+    tool's own name — ``mcp__github__delete_repository`` — which is how a
+    call with no command and no path, an MCP tool's, is matched at all. The
+    rest ignore ``pattern`` and ask something a regex cannot:
+    ``outside-project``, whether a write leaves the project directory;
+    ``control-file``, whether a call changes the gate's own files;
+    ``home-outside-project``, whether it reaches into the user's home
+    directory; ``egress``, whether it sends local data to a host the
+    project does not expect; and ``undeclared-install``, whether the
+    command installs a package name no manifest in the tree declares — or
+    names an installer and cannot be read, so what it installs is unknown.
 
     The structural ones exist because the interesting half of each question
     is a fact about the tree rather than about the text. No pattern can
@@ -206,7 +217,15 @@ _WRITING_TOOLS = frozenset({"Write", "Edit", "NotebookEdit", "MultiEdit"})
 
 #: ``applies_to`` values that ask a question about the tree rather than
 #: matching text, and so carry no ``pattern``.
-_STRUCTURAL = frozenset({"outside-project", "undeclared-install"})
+_STRUCTURAL = frozenset(
+    {
+        "outside-project",
+        "undeclared-install",
+        "control-file",
+        "home-outside-project",
+        "egress",
+    }
+)
 
 
 def _applicable(merged: dict[str, Danger], root: Path) -> tuple[Danger, ...]:
@@ -291,6 +310,7 @@ def load_dangers(root: Path | None = None) -> tuple[Danger, ...]:
 
     raw_settings = data.get("safety")
     settings: dict[str, Any] = raw_settings if isinstance(raw_settings, dict) else {}
+    expected_hosts(root)
     if not settings.get("use_builtins", True):
         merged = {}
 
@@ -382,10 +402,12 @@ def _danger_from_toml(raw: dict[str, object], path: Path, index: int) -> Danger:
             f"the model is never asked for another."
         )
     applies_to = str(raw.get("applies_to", "command"))
-    if applies_to not in ("command", "target", *_STRUCTURAL):
+    if applies_to not in ("command", "target", "tool", *_STRUCTURAL):
         raise ValueError(
             f"{where} ({danger_id}) has applies_to={applies_to!r}. Use "
-            f"'command', 'target', 'outside-project', or 'undeclared-install'."
+            f"'command', 'target', 'tool', 'outside-project', "
+            f"'undeclared-install', 'control-file', 'home-outside-project', "
+            f"or 'egress'."
         )
     pattern = str(raw.get("pattern", ""))
     if applies_to not in _STRUCTURAL:
@@ -448,9 +470,19 @@ def triage(
         if danger.applies_to == "outside-project":
             matched = tool_name in _WRITING_TOOLS and _writes_outside(target, root)
         elif danger.applies_to == "undeclared-install":
-            matched = bool(undeclared_installs(text, root))
+            matched = bool(undeclared_installs(text, root)) or unreadable_install(
+                text, root
+            )
+        elif danger.applies_to == "control-file":
+            matched = _changes_control_file(tool_name, text, target, root)
+        elif danger.applies_to == "home-outside-project":
+            matched = _reaches_home(tool_name, text, target, root)
+        elif danger.applies_to == "egress":
+            matched = _sends_data_out(tool_name, text, target, root)
         elif danger.applies_to == "target":
             matched = bool(target and re.search(danger.pattern, target, re.I))
+        elif danger.applies_to == "tool":
+            matched = bool(re.search(danger.pattern, tool_name, re.I))
         else:
             matched = bool(text and re.search(danger.pattern, text, re.I))
         if not matched:
@@ -519,6 +551,459 @@ def _writes_outside(target: str, root: Path | None) -> bool:
         candidate.resolve().relative_to(root.resolve())
     except (ValueError, OSError):
         return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# The gate's own files
+# ---------------------------------------------------------------------------
+
+#: Files that make up the gate: its settings, and the hook entry that calls
+#: it. Relative to the project root.
+CONTROL_FILES = (
+    ".vibe-sentinel.toml",
+    ".claude/settings.json",
+    ".claude/settings.local.json",
+)
+#: Directories that make up the gate: its record — the history database,
+#: the journal, the verdicts. Relative to the project root.
+CONTROL_DIRS = (".vibe-sentinel",)
+#: The config tables that can point ``rule_files`` at more of the policy.
+_RULE_TABLES = ("probes", "drift", "safety", "credentials")
+
+#: Commands that read the paths they are given and write none of them.
+#: Anything not here is assumed to be able to write what it names, which
+#: is the strict reading on purpose: this list decides whether an agent may
+#: be refused, and a verb missing from it costs a question, not a file.
+_READS = frozenset(
+    {
+        "cat", "less", "more", "head", "tail", "grep", "egrep", "fgrep", "rg",
+        "ag", "ls", "du", "stat", "wc", "diff", "cmp", "file", "bat", "jq",
+        "yq", "awk", "sort", "uniq", "cut", "md5", "md5sum", "shasum",
+        "sha256sum", "readlink", "realpath", "echo", "printf", "test", "[",
+        "vibe-sentinel",
+    }
+)  # fmt: skip
+#: git subcommands that leave the working tree as it was.
+_GIT_READS = frozenset(
+    {"diff", "log", "show", "status", "blame", "add", "commit", "grep",
+     "ls-files", "check-ignore"}
+)  # fmt: skip
+#: Commands whose last argument is the only one written; the rest are read.
+_COPIES = frozenset({"cp", "rsync", "scp", "install", "ln"})
+#: Commands that take a path away, so naming a directory that holds the
+#: gate's files is naming those files too.
+_REMOVES = frozenset({"rm", "rmdir", "unlink", "shred", "srm", "mv"})
+
+
+def _project_config(root: Path) -> dict[str, Any]:
+    """The project's ``.vibe-sentinel.toml`` as data, for the structural checks.
+
+    Empty when there is none: no config declares nothing. A config that will
+    not parse is not the same answer, and is refused before triage ever runs
+    — by ``configured_mode`` in the hook, by ``load_dangers`` everywhere else
+    — so it is not caught here.
+    """
+    import tomllib
+
+    try:
+        return tomllib.loads((root / CONTROL_FILES[0]).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+
+
+def control_paths(root: Path) -> tuple[frozenset[Path], frozenset[Path]]:
+    """The gate's own files and directories under ``root``, resolved.
+
+    The fixed ones, plus every file a ``rule_files`` glob in the project's
+    config names: a project that keeps its dangers in ``rules/`` has made
+    those files part of the gate, and a fixed list cannot know that. A glob
+    that matches nothing adds nothing — there is no file there to change —
+    and ``scan`` is where an empty glob is reported.
+    """
+    base = root.resolve()
+    files = {base / name for name in CONTROL_FILES}
+    data = _project_config(base)
+    for table in _RULE_TABLES:
+        section = data.get(table)
+        patterns = section.get("rule_files", []) if isinstance(section, dict) else []
+        for pattern in patterns if isinstance(patterns, list) else []:
+            files.update(path.resolve() for path in base.glob(str(pattern)))
+    return frozenset(files), frozenset(base / name for name in CONTROL_DIRS)
+
+
+def _as_path(word: str, root: Path) -> Path | None:
+    """What a word on a command line names, if it could be a path."""
+    import os
+
+    if "=" in word and word.startswith("-"):
+        word = word.split("=", 1)[1]
+    if not word or word.startswith("-"):
+        return None
+    path = Path(os.path.expanduser(word))
+    if not path.is_absolute():
+        path = root / path
+    return Path(os.path.normpath(path))
+
+
+def _names_control(
+    word: str,
+    root: Path,
+    controls: tuple[frozenset[Path], frozenset[Path]],
+    *,
+    or_holder: bool = False,
+) -> bool:
+    """Whether ``word`` names one of the gate's files.
+
+    ``or_holder`` also counts a directory that contains one — the right
+    reading for a command that deletes or moves what it is given, and the
+    wrong one for anything else: ``ruff format .`` names the project root,
+    which holds the settings, and writes none of them.
+    """
+    import fnmatch
+
+    files, dirs = controls
+    base = root.resolve()
+    if any(ch in word for ch in "*?["):
+        names = [str(p.relative_to(base)) for p in (*files, *dirs)]
+        pattern = word.removeprefix("./")
+        return any(fnmatch.fnmatch(name, pattern) for name in names)
+    path = _as_path(word, base)
+    if path is None:
+        return False
+    if path in files or any(path == d or d in path.parents for d in dirs):
+        return True
+    if or_holder:
+        return any(path in f.parents for f in (*files, *dirs))
+    return False
+
+
+class _Simple(NamedTuple):
+    """One simple command out of a shell line: what runs, on what, into what."""
+
+    verb: str
+    args: list[str]
+    """Everything after the verb, redirects removed."""
+    redirected: list[str]
+    """Where output is redirected to — files this command writes."""
+    piped: bool = False
+    """Whether another command's output is piped into this one."""
+
+
+def _simple_commands(command: str) -> list[_Simple] | None:
+    """A shell line split into its simple commands, or None if it will not parse.
+
+    Split on ``;``, ``&&``, ``||``, ``|`` and ``&``; each part loses the
+    ``VAR=value`` assignments and the wrappers — ``sudo``, ``env`` — in front
+    of the command that really runs. Shared by every check that reads paths
+    out of a command, so they cannot disagree about what a command names.
+    """
+    import shlex
+
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError as e:
+        # Recorded, because what follows is not neutral: a caller that gets
+        # None reads nothing structural out of this command.
+        from vibe_sentinel.log import logger
+
+        logger.warning(
+            "safety: could not split a command ({}); the structural checks "
+            "read nothing from it",
+            e,
+        )
+        return None
+
+    out: list[_Simple] = []
+    words: list[str] = []
+    piped = False
+    for token in [*tokens, ";"]:
+        if token and set(token) <= set(";&|()"):
+            simple = _one_simple(words, piped)
+            if simple is not None:
+                out.append(simple)
+            words = []
+            piped = token == "|"  # nosec B105 - a pipe, not a password
+        else:
+            words.append(token)
+    return out
+
+
+def _one_simple(words: list[str], piped: bool = False) -> _Simple | None:
+    args: list[str] = []
+    redirected: list[str] = []
+    into = False
+    for word in words:
+        if into:
+            redirected.append(word)
+            into = False
+        elif set(word) <= set("<>&") and ">" in word:
+            into = True
+        elif word.isdigit() and not args:
+            continue  # the `2` of `2>`
+        else:
+            args.append(word)
+    while args and ("=" in args[0] and not args[0].startswith("-")):
+        args.pop(0)  # VAR=value before the command
+    while args and args[0] in WRAPPERS:
+        args.pop(0)
+    if not args and not redirected:
+        return None
+    verb = Path(args[0]).name if args else ""
+    return _Simple(verb, args[1:], redirected, piped)
+
+
+def _changes_control_file(
+    tool_name: str, command: str, target: str, root: Path | None
+) -> bool:
+    """Whether this call would change the gate's own settings, hook or record.
+
+    A writing tool is judged by its target. A shell command is judged word
+    by word: a redirect into one of the files writes it; a copy writes only
+    its destination; a delete or a move takes away whatever it names,
+    including a directory that holds one; a command that only reads — see
+    ``_READS`` — writes nothing it names; anything else is taken to be able
+    to write what it names. A command that cannot be parsed counts if it
+    mentions one of the files at all: unlike an install, this check can
+    refuse, and it refuses on the side of the gate.
+    """
+    if root is None:
+        return False
+    controls = control_paths(root)
+    if tool_name in _WRITING_TOOLS:
+        return bool(target) and _names_control(target, root, controls)
+    if not command:
+        return False
+
+    simples = _simple_commands(command)
+    if simples is None:
+        files, dirs = controls
+        base = root.resolve()
+        return any(str(p.relative_to(base)) in command for p in (*files, *dirs))
+    return any(_simple_changes(s, root, controls) for s in simples)
+
+
+def _simple_changes(
+    simple: _Simple,
+    root: Path,
+    controls: tuple[frozenset[Path], frozenset[Path]],
+) -> bool:
+    """One simple command: does it write a control file?"""
+    if any(_names_control(w, root, controls) for w in simple.redirected):
+        return True
+    verb, rest = simple.verb, simple.args
+    if not verb or verb in _READS:
+        return False
+    if verb == "git":
+        sub = next((a for a in rest if not a.startswith("-")), "")
+        if sub in _GIT_READS:
+            return False
+    if verb in ("sed", "perl") and not any(a.startswith("-i") for a in rest):
+        return False
+    if verb in _COPIES:
+        paths = [a for a in rest if not a.startswith("-")]
+        return bool(paths) and _names_control(paths[-1], root, controls)
+    holder = verb in _REMOVES
+    return any(_names_control(a, root, controls, or_holder=holder) for a in rest)
+
+
+# ---------------------------------------------------------------------------
+# The user's home directory
+# ---------------------------------------------------------------------------
+
+#: Tools that read, and whose target is therefore the path read.
+_READING_TOOLS = frozenset({"Read", "Grep", "Glob", "LS", "NotebookRead"})
+#: Commands that name a path without opening it.
+_NO_FILE_VERBS = frozenset(
+    {"echo", "printf", "cd", "pushd", "popd", "which", "type", "export"}
+)
+
+
+def _in_home_outside_project(word: str, root: Path, home: Path) -> bool:
+    """Whether ``word`` names a path in ``home`` that is not inside ``root``."""
+    for spelling in ("${HOME}", "$HOME"):
+        if word.startswith(spelling):
+            word = "~" + word[len(spelling) :]
+    path = _as_path(word, root)
+    if path is None:
+        return False
+    inside_home = path == home or home in path.parents
+    inside_project = path == root or root in path.parents
+    return inside_home and not inside_project
+
+
+def _reaches_home(tool_name: str, command: str, target: str, root: Path | None) -> bool:
+    """Whether this call reads or writes the user's home directory, outside
+    the project.
+
+    A question, not a verdict: reading another of the user's repositories or
+    their git config is sometimes the work. The home directory is the line
+    because it is where what is private lives — keys, tokens, other
+    projects — and the rest of the filesystem outside the project is not:
+    ``/usr/bin/python``, ``/etc/hosts`` and ``/tmp`` are ordinary. A reading
+    tool is judged by its target; a writing tool is already asked about by
+    ``outside-project``. A shell command counts every path it names, minus
+    the command itself and commands that name a path without opening it —
+    ``echo "$HOME/.config"`` is not an incident. A command that will not
+    parse counts as nothing here; the secret stores are caught by pattern,
+    which needs no parse.
+    """
+    if root is None:
+        return False
+    home = Path.home().resolve()
+    base = root.resolve()
+    if tool_name in _READING_TOOLS:
+        return bool(target) and _in_home_outside_project(target, base, home)
+    if tool_name in _WRITING_TOOLS or not command:
+        return False
+    simples = _simple_commands(command)
+    if simples is None:
+        return False
+    for simple in simples:
+        words = list(simple.redirected)
+        if simple.verb not in _NO_FILE_VERBS:
+            words += [a for a in simple.args if not a.startswith("-") or "=" in a]
+        if any(_in_home_outside_project(w, base, home) for w in words):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Data leaving the machine
+# ---------------------------------------------------------------------------
+
+#: A request that never leaves the machine is not egress. Destinations, not
+#: addresses anything binds to: a request to 0.0.0.0 reaches this machine.
+_LOOPBACK = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})  # nosec B104
+#: Options that make ``curl`` and ``wget`` send local data rather than fetch.
+_CURL_SENDS = (
+    "-d", "--data", "--data-binary", "--data-raw", "--data-urlencode",
+    "--data-ascii", "-F", "--form", "--form-string", "-T", "--upload-file",
+    "--json",
+)  # fmt: skip
+_WGET_SENDS = ("--post-data", "--post-file", "--body-data", "--body-file")
+#: Raw sockets: whatever reaches them goes to the host they name.
+_SOCKETS = frozenset({"nc", "ncat", "netcat", "socat", "telnet"})
+#: Copies whose destination can be another machine.
+_REMOTE_COPIES = frozenset({"scp", "rsync", "sftp"})
+#: Cloud storage copies, and the URL schemes their remote side uses.
+_CLOUD_SCHEMES = ("s3://", "gs://", "az://")
+
+
+def expected_hosts(root: Path) -> tuple[str, ...]:
+    """``[safety] expected_hosts``: where this project sends data on purpose.
+
+    A host listed here, or any subdomain of one, is not asked about. Empty
+    by default, so every upload to a host off the machine is. Raises for a
+    value that is not a list of names, the way every declared table here
+    does; ``load_dangers`` calls this so ``scan`` reports it.
+    """
+    section = _project_config(root.resolve()).get("safety", {})
+    hosts = section.get("expected_hosts", []) if isinstance(section, dict) else []
+    if not isinstance(hosts, list) or not all(isinstance(h, str) for h in hosts):
+        raise ValueError(
+            f"{root / CONTROL_FILES[0]}: [safety] expected_hosts = {hosts!r} is "
+            f"not a list of host names. It takes names like "
+            f'expected_hosts = ["api.github.com", "pypi.org"].'
+        )
+    return tuple(h.strip().lower().rstrip(".") for h in hosts if h.strip())
+
+
+def _host_of(word: str) -> str:
+    """The host a URL, ``user@host:path`` or ``TCP:host:port`` names; '' if none."""
+    from urllib.parse import urlsplit
+
+    if "://" in word:
+        return (urlsplit(word).hostname or "").lower()
+    for prefix in ("TCP:", "TCP4:", "TCP6:", "UDP:", "OPENSSL:"):
+        if word.upper().startswith(prefix):
+            return word[len(prefix) :].split(":", 1)[0].lower()
+    if ":" in word and not word.startswith(("/", ".", "~")):
+        return word.split(":", 1)[0].rsplit("@", 1)[-1].lower()
+    return ""
+
+
+def _is_remote_spec(word: str) -> bool:
+    """``host:path`` or ``user@host:path`` — scp and rsync's remote side."""
+    return bool(_host_of(word)) and "://" not in word and not word.startswith("-")
+
+
+def _sends(flags: tuple[str, ...], args: list[str]) -> bool:
+    for arg in args:
+        for flag in flags:
+            if arg == flag or arg.startswith(flag + "="):
+                return True
+            if len(flag) == 2 and arg.startswith(flag) and len(arg) > 2:
+                return True  # -d@file, -Tfile
+    return False
+
+
+def _destinations(simple: _Simple) -> list[str] | None:
+    """The hosts this command sends local data to, or None if it sends none.
+
+    A host that cannot be read off the command — a variable, a bare name
+    curl will guess a scheme for — comes back as ``''``, which no expected
+    host matches: a destination nobody can name is not one the project
+    listed.
+    """
+    verb, args = simple.verb, simple.args
+    words = [a for a in args if not a.startswith("-")]
+    urls = [_host_of(a) for a in args if "://" in a]
+
+    if verb in ("curl", "wget"):
+        if not _sends(_CURL_SENDS if verb == "curl" else _WGET_SENDS, args):
+            return None
+        return urls or [""]
+    if verb in _SOCKETS:
+        return [_host_of(words[0]) or words[0].lower() if words else ""]
+    if verb in _REMOTE_COPIES:
+        if verb == "sftp":
+            return [words[0].rsplit("@", 1)[-1].lower() if words else ""]
+        if words and _is_remote_spec(words[-1]):
+            return [_host_of(words[-1])]
+        return None
+    if verb == "ssh" and simple.piped:
+        return [words[0].rsplit("@", 1)[-1].lower() if words else ""]
+    if verb in ("aws", "gsutil", "rclone"):
+        if words and words[-1].startswith(_CLOUD_SCHEMES):
+            return [words[-1].split("/", 3)[2].lower() if "//" in words[-1] else ""]
+        if verb == "rclone" and words and _is_remote_spec(words[-1]):
+            return [_host_of(words[-1])]
+        return None
+    return None
+
+
+def _sends_data_out(
+    tool_name: str, command: str, target: str, root: Path | None
+) -> bool:
+    """Whether this command sends local data to a host the project does not
+    expect.
+
+    Only sending counts: ``curl https://…`` fetches and passes, ``curl -d``
+    and ``-F`` and ``-T`` send, as do raw sockets, a copy whose destination
+    is another machine, ``ssh`` with data piped into it, and a cloud-storage
+    upload. Loopback is not off the machine. ``git push`` is not counted —
+    sending code to the project's own remote is the work. A command that
+    will not parse counts as nothing here, like every asked-about check.
+    """
+    if root is None or not command:
+        return False
+    simples = _simple_commands(command)
+    if not simples:
+        return False
+    expected = expected_hosts(root)
+    for simple in simples:
+        hosts = _destinations(simple)
+        if hosts is None:
+            continue
+        for host in hosts:
+            if host in _LOOPBACK:
+                continue
+            if host and any(host == e or host.endswith("." + e) for e in expected):
+                continue
+            return True
     return False
 
 
@@ -607,8 +1092,8 @@ def build_prompt(
     what preceded it.
 
     This is the **system** message, and it is byte-identical across every
-    question asked about one command. That is the point: vLLM caches the
-    prefix after the first request, so fanning out across five dangers
+    question asked about one command. That is the point: a server that
+    caches prefixes keeps it after the first request, so fanning out across five dangers
     prefills the history once rather than five times. The divergent tail
     — one danger's question — goes in the user message, from
     :func:`build_question`.
@@ -658,11 +1143,19 @@ def build_prompt(
         # The one thing a model reading this command cannot work out for
         # itself: which of these names the manifests already carry. It is
         # mechanical, so it is stated rather than asked about.
-        undeclared = undeclared_installs(command, root)
-        lines.append(
-            "Names this would install that no manifest in the project "
-            f"declares: {', '.join(undeclared) or '(none)'}"
-        )
+        if unreadable_install(command, root):
+            lines.append(
+                "Which names this would install could not be read: the command "
+                "does not split into words here, so the manifests were not "
+                "compared with it. Read the command itself to see what it "
+                "installs."
+            )
+        else:
+            undeclared = undeclared_installs(command, root)
+            lines.append(
+                "Names this would install that no manifest in the project "
+                f"declares: {', '.join(undeclared) or '(none)'}"
+            )
         lines.append("")
     if history:
         lines.append(
@@ -696,6 +1189,40 @@ def build_question(danger: Danger) -> str:
         f"Answer this one question about the command above, and nothing else.\n\n"
         f"({danger.id}) {danger.title}\n\n{danger.question}\n\n"
         f"{BREVITY} {every_field('resolves_to')}"
+    )
+
+
+async def settle_or_review(
+    tool_name: str,
+    command: str,
+    target: str,
+    cwd: str,
+    root: Path,
+    signals: tuple[str, ...],
+    history: list[CommandRecord],
+    config: SentinelConfig,
+    dangers: tuple[Danger, ...] | None = None,
+) -> SafetyOpinion | None:
+    """What the gate decides about a flagged call: a declared verdict if one
+    applies, and the model's otherwise. None means the model did not answer.
+
+    The order the hook and ``safety --check`` apply, as one function, for
+    whatever measures the gate. The evals called :func:`review` directly and
+    so measured the model's opinion where the gate would have settled: an
+    MCP delete that the gate refuses without asking came back ``unclear``,
+    because the model could not see which page. The hook keeps its own two
+    lines rather than calling this — a settled verdict there must not pay
+    for ``asyncio``, which this path cannot avoid.
+    """
+    active = dangers if dangers is not None else load_dangers(root)
+    settled = declared_verdict(signals, active)
+    if settled is not None:
+        from vibe_sentinel.schemas import SafetyOpinion
+
+        verdict, reason = settled
+        return SafetyOpinion(verdict=verdict, reason=reason)
+    return await review(
+        tool_name, command, target, cwd, root, signals, history, config, active
     )
 
 
@@ -756,10 +1283,9 @@ async def review(
     )
 
     async def ask_all() -> list[object]:
-        # Concurrency is worth having only against a server that batches.
-        # vLLM does, and the shared prefix means the history is prefilled
-        # once for the whole fan-out. Ollama serialises, so set
-        # safety.concurrency = 1 there and pay for it in latency.
+        # The shared prefix means the history is prefilled once for the
+        # whole fan-out. Width pays only against a server that batches; see
+        # config.DEFAULT_CONCURRENCY for why the default is 1.
         limit = asyncio.Semaphore(max(1, config.safety_concurrency))
 
         async def one(danger: Danger) -> tuple[Danger, dict[str, Any] | None]:
@@ -847,10 +1373,18 @@ def _combine(
 
 #: What ``[safety] mode`` may say. Anything else is a typo, not a fourth mode.
 SAFETY_MODES: tuple[str, ...] = ("off", "observe", "enforce")
+#: What ``enforce`` does when the gate has no verdict. See
+#: ``SentinelConfig.safety_no_verdict``.
+NO_VERDICT: tuple[str, ...] = ("ask", "allow")
 
 
 def configured_mode(root: Path) -> str:
-    """The configured safety mode, read without building the config model.
+    """The configured safety mode. See :func:`configured_safety`."""
+    return configured_safety(root)[0]
+
+
+def configured_safety(root: Path) -> tuple[str, str]:
+    """``(mode, no_verdict)``, read without building the config model.
 
     One ``tomllib.load`` rather than ``load_config``, which would build a
     pydantic model and cost ~40 ms. This runs in front of a tool call.
@@ -873,7 +1407,7 @@ def configured_mode(root: Path) -> str:
 
     path = root / CONFIG_FILENAME
     if not path.is_file():
-        return "off"
+        return "off", "ask"
     try:
         with path.open("rb") as handle:
             data = tomllib.load(handle)
@@ -885,7 +1419,7 @@ def configured_mode(root: Path) -> str:
         ) from e
 
     if "safety" not in data:
-        return "off"
+        return "off", "ask"
     section = data["safety"]
     if not isinstance(section, dict):
         raise ValueError(
@@ -893,8 +1427,17 @@ def configured_mode(root: Path) -> str:
             f"table, so the safety mode is unknown. Fix the file, then check "
             f"it with `vibe-sentinel safety --print-dangers`."
         )
+    no_verdict = section.get("no_verdict", "ask")
+    if no_verdict not in NO_VERDICT:
+        # Read even with no mode declared, so a typo is found by the scan
+        # that validates this rather than on the day enforce is turned on.
+        raise ValueError(
+            f"{path}: [safety] no_verdict is {no_verdict!r}, which is not "
+            f"'ask' or 'allow'. A setting this cannot read is not 'allow' — "
+            f"fix it, then check it with `vibe-sentinel safety --print-dangers`."
+        )
     if "mode" not in section:
-        return "off"
+        return "off", str(no_verdict)
     mode = section["mode"]
     if mode not in SAFETY_MODES:
         raise ValueError(
@@ -903,4 +1446,4 @@ def configured_mode(root: Path) -> str:
             f"read is not 'off' — fix it, then check it with `vibe-sentinel "
             f"safety --print-dangers`."
         )
-    return str(mode)
+    return str(mode), str(no_verdict)

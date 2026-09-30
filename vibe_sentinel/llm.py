@@ -15,7 +15,7 @@ second half is only visible in ``finish_reason`` — never in the parse.
 Anything else is retried, and a truncation is retried with more room,
 because retrying it unchanged fails the same way.
 
-Any OpenAI-compatible server works: vLLM, Ollama, llama.cpp's server,
+Any OpenAI-compatible server works: Ollama, llama.cpp's server,
 LM Studio, LocalAI, text-generation-webui. Nothing here is specific to
 one of them. That matters for the independence claim — the point is a
 judge from a *different model family* than whatever wrote your code, and
@@ -26,7 +26,7 @@ to a JSON shape, so ``structured_output`` picks the strongest mode yours
 supports:
 
   - ``json_schema`` — the server constrains decoding to the schema.
-    Best when available (vLLM, llama.cpp, LM Studio, recent Ollama).
+    Best when available (Ollama, llama.cpp, LM Studio).
   - ``json_object`` — the server guarantees valid JSON but not the
     shape. Widely supported.
   - ``none`` — plain text; the schema goes in the prompt instead.
@@ -228,19 +228,25 @@ async def llm_query(
 
             if response.status_code >= 400:
                 # 4xx is a malformed request — the model name is wrong,
-                # or the backend rejects this response_format. Retrying
-                # produces the same error, so say what happened instead.
+                # the backend rejects this response_format, or it rejects
+                # a field extra_body added. Retrying produces the same
+                # error, so say what happened instead.
                 logger.error(
                     "{}: request rejected (HTTP {}): {}\n"
                     "  endpoint: {}\n  model: {}\n  structured_output: {}\n"
+                    "  extra_body: {}\n"
                     "  If the backend does not support this mode, set "
-                    "[llm] structured_output to 'json_object' or 'none'.",
+                    "[llm] structured_output to 'json_object' or 'none'.\n"
+                    "  If it rejects a field extra_body sends, declare "
+                    "[llm.extra_body] without it — an empty table sends "
+                    "nothing.",
                     schema_name,
                     response.status_code,
                     response.text[:300],
                     config.llm_endpoint,
                     config.llm_model,
                     mode,
+                    config.extra_body,
                 )
                 return None
 

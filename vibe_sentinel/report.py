@@ -759,7 +759,7 @@ def render_reviews(rows: list[ReviewRecord]) -> None:
     print(f"{'when':<19}  {'v':<1} {'verdict':<10} {'actor':<14} command")
     for r in rows:
         mark = _VERDICT_MARK.get(r.verdict, "?")
-        blocked = " [BLOCKED]" if r.enforced else ""
+        blocked = {"deny": " [BLOCKED]", "ask": " [ASKED]"}.get(r.decision, "")
         # A `safety --check` verdict is about a command somebody typed to
         # tune the gate, not one an agent ran. It shares this table, so
         # the listing has to say which — the same honesty rule `reviewed`
@@ -775,7 +775,8 @@ def render_reviews(rows: list[ReviewRecord]) -> None:
     asked = sum(1 for r in rows if r.reviewed)
     declared = sum(1 for r in rows if not r.reviewed and r.verdict != "unreviewed")
     lost = sum(1 for r in rows if r.verdict == "unreviewed")
-    refused = sum(1 for r in rows if r.enforced)
+    refused = sum(1 for r in rows if r.decision == "deny")
+    prompted = sum(1 for r in rows if r.decision == "ask")
     checks = sum(1 for r in rows if r.mode == "check")
     parts = [f"{len(rows)} flagged", f"{asked} put to the model"]
     if declared:
@@ -785,12 +786,16 @@ def render_reviews(rows: list[ReviewRecord]) -> None:
     if checks:
         parts.append(f"{checks} typed at `safety --check`, not run by an agent")
     parts.append(f"{refused} blocked")
+    # Asked is its own outcome: the person was handed the call, which is
+    # neither a refusal nor a pass — how often that happened is what
+    # `[safety] no_verdict = "ask"` costs.
+    parts.append(f"{prompted} asked")
     print("\n" + ", ".join(parts) + ".")
     if lost:
         print(
-            f"  {lost} row(s) marked 'unreviewed' were flagged and ran anyway — "
-            "the model did not answer.\n  Check it with: vibe-sentinel backend "
-            "status"
+            f"  {lost} row(s) marked 'unreviewed' were flagged and got no verdict "
+            "in time — asked under enforce, allowed otherwise.\n  Check the "
+            "model with: vibe-sentinel backend status"
         )
 
 

@@ -590,6 +590,27 @@ def test_a_broken_danger_set_is_an_error_with_the_file_named(
     assert "has no question" in "".join(logged)
 
 
+def test_a_broken_manifest_is_an_error_where_someone_can_read_it(
+    project: Path, logged: list[str]
+) -> None:
+    """The safety command names the file and the check, rather than a
+    traceback; the hook, where nobody reads, is the place it cannot do that."""
+    _config(project, "")
+    (project / "pyproject.toml").write_text("authors = authors = [\n", encoding="utf-8")
+    assert main(["safety", str(project), "--check", "pip install reqeusts"]) == 2
+    assert "pyproject.toml could not be read" in "".join(logged)
+
+
+def test_scan_checks_the_manifest_before_the_probes(project: Path) -> None:
+    """The same up-front check the [[danger]] set gets, for the same reason:
+    a scan is somewhere a person reads the error."""
+    from vibe_sentinel import cli
+
+    (project / "pyproject.toml").write_text("authors = authors = [\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="pyproject.toml could not be read"):
+        cli._checked_declarations(project, [])
+
+
 def test_match_measures_a_pattern_against_real_history(
     project: Path, capfd: pytest.CaptureFixture[str]
 ) -> None:

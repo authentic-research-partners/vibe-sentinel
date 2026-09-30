@@ -4,6 +4,7 @@
     python -m evals credentials         secrets at rest, and which are real
     python -m evals packages            names one edit apart
     python -m evals drift               what a lens makes of a report
+    python -m evals adversarial         the attacks in the threat model
     python -m evals all                 every suite above
 
     python -m evals all --mechanical    only what needs no model
@@ -24,6 +25,7 @@ import sys
 from pathlib import Path
 
 from evals import (
+    adversarial_eval,
     credentials_eval,
     drift_eval,
     metrics,
@@ -31,13 +33,13 @@ from evals import (
     report,
     safety_eval,
 )
-from vibe_sentinel.config import SentinelConfig, load_config
+from vibe_sentinel.config import DEFAULT_CONCURRENCY, SentinelConfig, load_config
 
 #: Where a run is written unless ``--output-dir`` says otherwise. The
 #: point of a rate is comparing it with the last one.
 DEFAULT_OUTPUT = Path("results")
 
-SUITES = ("safety", "credentials", "packages", "drift")
+SUITES = ("safety", "credentials", "packages", "drift", "adversarial")
 
 
 async def _run_suite(
@@ -51,6 +53,10 @@ async def _run_suite(
         return await credentials_eval.run(config, mechanical_only=args.mechanical)
     if name == "packages":
         return await packages_eval.run(config, mechanical_only=args.mechanical)
+    if name == "adversarial":
+        return await adversarial_eval.run(
+            config, mechanical_only=args.mechanical, concurrency=args.concurrency
+        )
     return await drift_eval.run(config, mechanical_only=args.mechanical)
 
 
@@ -130,11 +136,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--concurrency",
         type=int,
-        default=4,
+        default=DEFAULT_CONCURRENCY,
         help=(
-            "cases asked about at once in the safety suite. Each case is "
-            "already a fan-out over its own questions; 1 on a backend that "
-            "serialises (default: 4)"
+            "cases asked about at once in the safety suite. Each case's "
+            "timeout counts the time it waits behind the others, so above 1 "
+            "on a backend that answers one request at a time, the queue is "
+            "reported as unanswered verdicts — the hook asks one at a time "
+            f"(default: {DEFAULT_CONCURRENCY})"
         ),
     )
     parser.add_argument(

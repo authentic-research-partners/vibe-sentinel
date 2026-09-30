@@ -28,10 +28,9 @@ from typing import Any
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
-from vibe_sentinel.backend import read_metrics
 from vibe_sentinel.config import SentinelConfig
 from vibe_sentinel.llm import llm_query
-from vibe_sentinel.schemas import BackendMetrics, chars_to_words, every_field
+from vibe_sentinel.schemas import chars_to_words, every_field
 
 #: Change lines in the synthetic drift report. Deliberately few, and the
 #: reason is the whole shape of this file.
@@ -201,44 +200,21 @@ def question(index: int) -> str:
 class Pass(BaseModel):
     """One timed run of ``requests`` requests at one width.
 
-    ``truncated`` is how many answers the server cut off at ``max_tokens``
-    during this pass, read from its metrics endpoint before and after. It
-    is ``None`` where the backend publishes no metrics — most of them do
-    not — and that is not the same as zero: one means "none were cut off",
-    the other "we cannot see whether any were". A pass with truncations in
-    it timed ``llm_query``'s retry, not the fan-out, and the report says so
-    rather than letting the number pass as clean.
+    ``truncated`` is how many answers came back cut off at ``max_tokens``
+    during this pass — every response whose ``finish_reason`` was
+    ``length``, retries included. It is read from the responses themselves
+    rather than from the server, because ``finish_reason`` is part of the
+    OpenAI-compatible surface and a server's own counters are not: most
+    backends publish none. A pass with truncations in it timed
+    ``llm_query``'s retry, not the fan-out, and the report says so rather
+    than letting the number pass as clean.
     """
 
     seconds: float
     answered: int
     unanswered: int
-    truncated: int | None = None
-    #: Prefix-cache blocks hit and queried during this pass, from the same
-    #: before-and-after reading as ``truncated``. This is the mechanism the
-    #: prefix suite is actually about, and it is worth recording separately
-    #: from the timing because it is a *binary* signal where the timing is a
-    #: noisy one: whether the server reused the prefill does not depend on
-    #: how busy the card was, so it answers "is the cache working" even on a
-    #: run whose seconds cannot separate two arms.
-    prefix_hits: int | None = None
-    prefix_queries: int | None = None
-    #: Requests the server evicted and had to recompute during this pass.
-    #:
-    #: The mechanism that puts a ceiling on the fan-out, and the reason a
-    #: width sweep needs more than a stopwatch. Throughput flattens gently and
-    #: noisily; preemption is a cliff, and it is what a KV cache running out
-    #: actually looks like. Reading it means a width can be called too wide
-    #: for a reason rather than because a median moved.
-    preemptions: int | None = None
+    truncated: int = 0
     latencies: list[float] = Field(default_factory=list)
-
-    @property
-    def prefix_hit_rate(self) -> float | None:
-        """Share of this pass's prefill blocks the server already had."""
-        if self.prefix_hits is None or self.prefix_queries is None:
-            return None
-        return self.prefix_hits / self.prefix_queries if self.prefix_queries else None
 
     @property
     def per_second(self) -> float:
@@ -323,32 +299,9 @@ class Measurement(BaseModel):
         return sum(p.unanswered for p in self.passes)
 
     @property
-    def truncated(self) -> int | None:
-        """Answers cut off across every pass, or None if never observable."""
-        seen = [p.truncated for p in self.passes if p.truncated is not None]
-        return sum(seen) if seen else None
-
-    @property
-    def preemptions(self) -> int | None:
-        """Requests evicted and recomputed across every pass, or None."""
-        seen = [p.preemptions for p in self.passes if p.preemptions is not None]
-        return sum(seen) if seen else None
-
-    @property
-    def prefix_hit_rate(self) -> float | None:
-        """Prefill blocks the server already had, over every pass.
-
-        Pooled rather than averaged: the passes are different sizes only by
-        accident, and a rate of rates weights a short pass like a long one.
-        """
-        hits = [p.prefix_hits for p in self.passes if p.prefix_hits is not None]
-        queries = [
-            p.prefix_queries for p in self.passes if p.prefix_queries is not None
-        ]
-        if not hits or not queries:
-            return None
-        total = sum(queries)
-        return sum(hits) / total if total else None
+    def truncated(self) -> int:
+        """Answers cut off at ``max_tokens`` across every pass."""
+        return sum(p.truncated for p in self.passes)
 
 
 class Suite(BaseModel):
@@ -376,12 +329,23 @@ async def _one_pass(
     if condition.max_tokens is not None:
         config = config.model_copy(update={"max_tokens": condition.max_tokens})
     limit = asyncio.Semaphore(condition.width)
-    client = (
-        httpx.AsyncClient(timeout=httpx.Timeout(config.llm_timeout, connect=10.0))
-        if condition.shared_client
-        else None
-    )
-    before = await read_metrics(config)
+    truncated = 0
+
+    async def count_truncation(response: httpx.Response) -> None:
+        nonlocal truncated
+        await response.aread()
+        if _cut_off(response):
+            truncated += 1
+
+    def new_client() -> httpx.AsyncClient:
+        # The timeouts llm_query gives the client it builds for itself, so a
+        # fresh client per call here costs what that one costs.
+        return httpx.AsyncClient(
+            timeout=httpx.Timeout(config.llm_timeout, connect=10.0),
+            event_hooks={"response": [count_truncation]},
+        )
+
+    shared = new_client() if condition.shared_client else None
     latencies: list[float] = []
     answered = 0
 
@@ -390,14 +354,19 @@ async def _one_pass(
         system, user = condition.payload(index)
         async with limit:
             started = time.perf_counter()
-            raw = await llm_query(
-                system,
-                user,
-                _BENCH_SCHEMA,
-                f"bench-{condition.id}-{index}",
-                config=config,
-                client=client,
-            )
+            client = shared or new_client()
+            try:
+                raw = await llm_query(
+                    system,
+                    user,
+                    _BENCH_SCHEMA,
+                    f"bench-{condition.id}-{index}",
+                    config=config,
+                    client=client,
+                )
+            finally:
+                if shared is None:
+                    await client.aclose()
             latencies.append(time.perf_counter() - started)
         if raw is not None:
             answered += 1
@@ -406,48 +375,32 @@ async def _one_pass(
     try:
         await asyncio.gather(*(one(offset + i) for i in range(requests)))
     finally:
-        if client is not None:
-            await client.aclose()
+        if shared is not None:
+            await shared.aclose()
     elapsed = time.perf_counter() - started
-    after = await read_metrics(config)
     return Pass(
         seconds=elapsed,
         answered=answered,
         unanswered=requests - answered,
-        truncated=_truncated_between(before, after),
-        prefix_hits=_delta(before, after, "prefix_hits"),
-        prefix_queries=_delta(before, after, "prefix_queries"),
-        preemptions=_delta(before, after, "preemptions"),
+        truncated=truncated,
         latencies=latencies,
     )
 
 
-def _delta(
-    before: BackendMetrics | None, after: BackendMetrics | None, field: str
-) -> int | None:
-    """One counter's movement across a pass, or None where it was not visible.
+def _cut_off(response: httpx.Response) -> bool:
+    """Whether this response is an answer the server stopped at ``max_tokens``.
 
-    Both readings have to carry it. Missing either yields ``None`` — "we
-    cannot see" — never a zero, which would read as "nothing happened".
+    The same test ``llm.py`` makes before it retries with more room, read
+    here only to count it. Anything that is not a completion — an error
+    status, a body that is not JSON — is not a truncation.
     """
-    if before is None or after is None:
-        return None
-    start, end = getattr(before, field), getattr(after, field)
-    if start is None or end is None:
-        return None
-    return int(end - start)
-
-
-def _truncated_between(
-    before: BackendMetrics | None, after: BackendMetrics | None
-) -> int | None:
-    """Answers cut off at ``max_tokens`` during a pass, or None if unseen.
-
-    Both readings have to carry the counter for the difference to mean
-    anything. Missing either one yields ``None`` — "we cannot see" — never
-    a zero that would read as "none were cut off".
-    """
-    return _delta(before, after, "truncated")
+    if response.status_code != 200:
+        return False
+    try:
+        choices = response.json().get("choices") or []
+    except ValueError:
+        return False
+    return bool(choices) and choices[0].get("finish_reason") == "length"
 
 
 async def measure(

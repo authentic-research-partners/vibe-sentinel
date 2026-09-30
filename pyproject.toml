@@ -4,12 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vibe-sentinel"
-version = "0.4.0"
+version = "0.5.0"
 description = "Safeguards a codebase against the problems AI coding agents introduce: structural drift, secrets at rest, unvetted dependencies, and dangerous commands."
 requires-python = ">=3.13,<3.14"
 license = "MIT"
-authors = [{ name = "Sergey Samsonau" }]
-maintainers = [{ name = "Authentic Research Partners LLC", email = "info@arpconnect.com" }]
+authors = [
+    { name = "Olga Vine" },
+    { name = "Sergey Samsonau" },
+]
+maintainers = [{ name = "Authentic Research Partners LLC", email = "oss@arpconnect.com" }]
 readme = "README.md"
 keywords = [
     "code-organization",
@@ -21,8 +24,7 @@ keywords = [
     "coding-agent",
     "llm",
     "local-llm",
-    "vllm",
-    "qwen",
+    "ollama",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -90,10 +92,9 @@ addopts = "-n auto -p no:cacheprovider"
 [tool.bandit]
 skips = [
     "B101",  # assert — used for type narrowing and internal invariants
-    "B104",  # bind 0.0.0.0 — container start command for vLLM
     "B404",  # subprocess import — CLI tool, subprocess is core functionality
-    "B603",  # subprocess call — the CLI invokes docker/podman by design
-    "B607",  # partial path — container runtimes resolved via PATH
+    "B603",  # subprocess call — probes and [llm] start_command, by design
+    "B607",  # partial path — backend commands resolved via PATH
     "B615",  # HF from_pretrained without revision pin — trusted publisher
 ]
 

@@ -1,6 +1,6 @@
 # Getting Started
 
-Vibe Sentinel requires Python 3.13 and an OpenAI-compatible local backend such as vLLM, Ollama, llama.cpp, or LM Studio. Your project needs neither — this is a command you point at a repository, not a library you import into one.
+Vibe Sentinel requires Python 3.13 and an OpenAI-compatible local backend — Ollama, llama.cpp, LM Studio, or anything else that serves one. Your project needs neither — this is a command you point at a repository, not a library you import into one.
 
 All commands below run from the root of the repository you want to watch. Developing Vibe Sentinel itself requires a different setup — see [development.md](development.md).
 
@@ -31,99 +31,17 @@ pip install git+https://github.com/authentic-research-partners/vibe-sentinel    
 
 ## 2. Start the model backend
 
-Any OpenAI-compatible endpoint works — vLLM, Ollama, llama.cpp, LM Studio. Point `[llm] endpoint` and `[llm] model` at whatever you serve. An 8B model is enough: a scan makes a few small calls, and none of them take long. On an Apple Silicon Mac, see [macOS — recommended setup](#macos--recommended-setup) below.
+These instructions use **Ollama**, and the tool's defaults point at it: Ollama's own port, and the model below. It runs on macOS, Linux and Windows and serves the same local endpoint on each. Nothing in the tool is specific to it — any OpenAI-compatible endpoint works, such as llama.cpp or LM Studio — so if you already serve models another way, point `[llm] endpoint` and `[llm] model` at it as [step 4](#4-tell-vibe-sentinel-about-the-model) shows.
 
-A known-good setup, on an NVIDIA GPU with about 20GB, under Podman — Docker takes the same arguments with `--gpus all` in place of `--device`:
+The recommended model is **Gemma 4 26B in its QAT build**, about 15 GB, so a machine with 32 GB of memory or more. In the measurements in [evals.md](evals.md) it judged commands and package names best of the models tried, and ran fastest; Qwen3 14B rated code changes better, but called two dangerous commands safe. Smaller models run, and measured weaker: Qwen3 8B, the previous recommendation, let a misspelled package name through as a real one.
 
-```bash
-podman run -d --name vibe-sentinel-llm --device nvidia.com/gpu=all \
-    -p 5001:8000 -v ~/.cache/huggingface:/root/.cache/huggingface \
-    docker.io/vllm/vllm-openai:v0.18.0 RedHatAI/Qwen3-8B-FP8-dynamic \
-    --served-model-name qwen3-8b-fp8 --max-model-len 40960 \
-    --gpu-memory-utilization 0.85 --kv-cache-dtype fp8
-```
+Tested on Linux, macOS, and Windows under WSL2. Native Windows — a Windows Python in PowerShell — is untested.
 
-Put that argv in `[llm] start_command` and the tool runs it for you:
+#### 1. Install and start Ollama
 
-```bash
-vibe-sentinel backend start
-vibe-sentinel backend status
-```
-
-Once it is up, `backend monitor` says what it is doing:
-
-```bash
-vibe-sentinel backend monitor              # one snapshot
-vibe-sentinel backend monitor --count 300  # watch a scan; Ctrl-C to stop
-```
-
-```
-  requests running    3
-  requests waiting    2   <- queueing: the fan-out is wider than the server will batch
-  KV cache in use     7.4%
-  prefix cache hits   91.0%  (910 of 1,000)
-  answers finished    420
-  cut off at the      138   <- each one costs a retry at double the budget
-    token ceiling
-```
-
-Those last two rows are the ones worth acting on. A **waiting** count above
-zero means the `concurrency` settings are asking for more than the server will
-batch at once. A **cut off** count means answers are hitting `[llm] max_tokens`
-and being retried at double the budget, so each of those candidates cost two
-generations instead of one — raise `max_tokens` rather than live with it.
-
-This reads a Prometheus `/metrics` endpoint beside the OpenAI-compatible one.
-vLLM publishes one; Ollama, llama.cpp and LM Studio do not, and on those the
-rows read `unavailable` rather than zero — a server nobody can see is not a
-server with an empty queue. Nothing in a scan reads any of it.
-
-Two things about that container are worth knowing before you trust a scan.
-
-**`backend status` proves that *something* answers, not that it is yours.** It
-asks `/v1/models` and reports what comes back, so any server on that port
-serving that `--served-model-name` reads as `ready` — including one started by
-another project, on a different image, with different flags. An *absent*
-backend is caught by the connection error the tool raises; a *substituted* one
-is caught by nothing. This is not hypothetical: it is how a set of timings in
-`benchmarks/results/` were nearly recorded against the wrong vLLM version, with
-double the KV cache of the container the config named. If a number surprises
-you, check what is actually serving:
-
-```bash
-podman ps --format '{{.Names}} {{.Image}} {{.Ports}}'
-```
-
-**`--restart unless-stopped` does not survive a reboot on its own.** Rootless
-podman restarts containers through a user service that ships disabled:
-
-```bash
-systemctl --user enable --now podman-restart.service
-loginctl enable-linger "$USER"    # so it starts without you logged in
-```
-
-Without both, the container comes back only when you start it — which
-`vibe-sentinel backend start` does.
-
-### Why there is no compose file
-
-There is one container and no service graph, which is the thing compose exists
-to describe. Splitting the argv across a second file also costs the property
-worth having here: `[llm] start_command` is the only place the image version
-and the serving flags are written down, so the config the tool reads and the
-container it talks to cannot drift apart without it being visible in one diff.
-Nothing is built either — the image is pulled from Docker Hub as published, so
-there is no `Containerfile` or `Dockerfile` to keep.
-
-### macOS — recommended setup
-
-On Apple Silicon Macs, the recommended local backend is **Ollama**. It is native on Apple Silicon and exposes the local API Vibe Sentinel needs. Nothing here is Ollama-specific — vLLM and the rest work too — but vLLM's Apple Silicon support is experimental and needs a source build, so Ollama is the path these instructions take.
-
-Vibe Sentinel does not need a large model. The model only reviews findings already produced by deterministic checks, so an 8B model is already enough; a 12–14B model is the comfortable default on a Mac with the memory for it.
-
-#### 1. Install Ollama
-
-Install Ollama for macOS from [ollama.com/download/mac](https://ollama.com/download/mac).
+- **macOS:** download it from [ollama.com/download/mac](https://ollama.com/download/mac).
+- **Linux:** `curl -fsSL https://ollama.com/install.sh | sh`
+- **Windows:** run Vibe Sentinel under WSL2 and install Ollama *inside* WSL2 with the Linux command. An Ollama installed on the Windows side is not on `localhost` from inside WSL2 under its default networking, and the address that does reach it is not loopback — so the credentials gate, which only sends an excerpt to a model on this machine, refuses it.
 
 After installation, confirm it is available:
 
@@ -131,60 +49,66 @@ After installation, confirm it is available:
 ollama --version
 ```
 
-If Ollama is not already running in the background, start it:
+**Give it a large enough context before you start it.** Ollama sizes the context it reads to the GPU memory it finds, and below 24 GB that is 4,096 tokens — which includes most 32 GB Macs, whose GPU gets only part of the memory. A question longer than that is cut to fit without an error, and the answer comes back about half the report while reading like an answer about all of it. The questions this tool asks run past 6,000 tokens on a mid-sized repository, so set 32,768:
 
 ```bash
-ollama serve
+# Ollama started from a terminal
+OLLAMA_CONTEXT_LENGTH=32768 ollama serve
+
+# The macOS app: set it, then quit Ollama from the menu bar and open it again
+launchctl setenv OLLAMA_CONTEXT_LENGTH 32768
+
+# Linux, where the installer set Ollama up as a service
+sudo systemctl edit ollama     # add, under [Service]:  Environment="OLLAMA_CONTEXT_LENGTH=32768"
+sudo systemctl restart ollama
 ```
+
+`ollama ps` shows the context in force once a model is loaded, in the `CONTEXT` column.
+
+**And keep the model loaded between checks.** Ollama unloads a model after five idle minutes by default, and loading it again takes longer than the safety gate's eight seconds — so the first flagged command after a pause gets no verdict, and under `enforce` you are asked about it rather than told. The OpenAI-compatible endpoint this tool uses ignores a per-request `keep_alive`, so it has to be set on the server, the same way as the context:
+
+```bash
+OLLAMA_KEEP_ALIVE=2h OLLAMA_CONTEXT_LENGTH=32768 ollama serve   # from a terminal
+launchctl setenv OLLAMA_KEEP_ALIVE 2h                            # the macOS app, then reopen it
+```
+
+The cost is the model's memory, about 15 GB, held while you are not using it — which is why two hours rather than a day: long enough to cover an ordinary break, short enough to hand the memory back when you stop for the evening. `-1` keeps the model loaded until the server stops.
 
 #### 2. Install the recommended model
 
-The default recommendation is Qwen3 14B. Any 12–14B local model works just as well — pick a family different from the one that writes your code:
-
 ```bash
-ollama pull qwen3:14b
+ollama pull gemma4:26b-a4b-it-qat
 ```
 
-The standard Ollama build is quantized and uses roughly 9 GB for the model, so it runs comfortably on Macs with 16 GB or more unified memory while leaving room for the editor, coding agent, and Vibe Sentinel.
+Pick a family different from the one that writes your code: a judge that shares the agent's blind spots about what normal code looks like is not much of a second opinion.
 
 #### 3. Test the model
 
 ```bash
-ollama run qwen3:14b
+ollama run gemma4:26b-a4b-it-qat
 ```
 
 This opens a chat prompt. Type anything to confirm the model answers, then type `/bye` to leave it — Vibe Sentinel talks to Ollama in the background and does not need this window open.
 
-#### 4. Tell Vibe Sentinel where the model is
+#### 4. Tell Vibe Sentinel about the model
 
-Ollama is now running, but Vibe Sentinel does not know that yet. Out of the box it looks for a model on port 5001, which is where the vLLM setup above listens. Ollama listens on port **11434**, so you have to say so.
+If you pulled `gemma4:26b-a4b-it-qat` into Ollama, there is nothing to set: the defaults name that model on Ollama's port, and they switch its thinking off. Gemma 4 thinks before it answers unless told not to, and with thinking on, 26 of 27 safety verdicts missed their 8-second timeout in the evals — the gate in front of an agent's commands would stop working.
 
-You do that in a file named `.vibe-sentinel.toml`, which lives in the project you want to check — not in Vibe Sentinel's own directory. Change into that project first:
+To use a different model or backend, say so in a file named `.vibe-sentinel.toml`, which lives in the project you want to check — not in Vibe Sentinel's own directory:
 
 ```bash
 cd ~/path/to/your-project
-```
-
-Then run this. It adds the settings to `.vibe-sentinel.toml`, creating the file if it is not there yet:
-
-```bash
 cat >> .vibe-sentinel.toml <<'EOF'
 
 [llm]
 endpoint = "http://localhost:11434/v1"
-model = "qwen3:14b"
-
-# Qwen3 is a reasoning model and thinks before it answers. Nothing here needs
-# that — the model reviews findings the deterministic checks already made — and
-# on a laptop the tokens it spends thinking are the ones you wait for.
-[llm.extra_body]
-reasoning_effort = "none"
+model = "the-model-you-serve"
 EOF
 ```
 
-Copy the whole thing, `EOF` lines included, and paste it into your terminal in one go.
+Copy the whole thing, `EOF` lines included, and paste it into your terminal in one go. The `model` value has to be the exact name the backend knows the model by — for Ollama, the first column of `ollama list`.
 
-The `model` value has to be the exact name Ollama knows the model by. Run `ollama list` and copy the name from the first column. If you pulled `qwen3:14b` above, it is `qwen3:14b` — the `:14b` part matters.
+Thinking is switched off by sending `reasoning_effort = "none"` with every question. Ollama and llama.cpp's server honour it. If your server rejects it, the error names it; add an empty `[llm.extra_body]` table to the file, which replaces the default and sends nothing. The same empty table turns thinking back on, if you want it and can wait for it.
 
 #### When the project's config is not yours to change
 
@@ -202,11 +126,11 @@ without touching the file:
 
 ```bash
 export VIBE_SENTINEL_LLM_ENDPOINT=http://localhost:11434/v1
-export VIBE_SENTINEL_LLM_MODEL=qwen3:14b
+export VIBE_SENTINEL_LLM_MODEL=gemma4:26b-a4b-it-qat
 ```
 
 `backend status` prints a `Source:` line naming the ones in force — worth
-reading, for the same reason as the warning above: a backend answering under
+reading, for the reason under step 5: a backend answering under
 the expected name while being something else is the failure that check exists
 to catch, and an override you cannot see is that failure with a config file as
 its alibi.
@@ -220,10 +144,8 @@ whatever is set, and that refusal is not reachable by exporting something.
 Setting one to nothing (`export VIBE_SENTINEL_LLM_MODEL=`) is how a shell says
 "no value", so it leaves the file's setting standing.
 
-These override the file but not the reasoning setting above, which has no
-variable. On a laptop, put `reasoning_effort = "none"` in a config the way step
-4 shows — without it Qwen3 thinks before every answer, and on a repository with
-several declared lenses that is most of the wait.
+These override the file but not the thinking setting above, which has no
+variable and needs none: it is off unless a config turns it back on.
 
 #### 5. Check that it worked
 
@@ -235,18 +157,36 @@ You want to see your endpoint and `Status: ready`:
 
 ```
 Endpoint: http://localhost:11434/v1
-Model:    qwen3:14b
+Model:    gemma4:26b-a4b-it-qat
 Status:   ready — ...
 ```
 
 Two things that commonly go wrong:
 
-- **It still says `http://localhost:5001/v1`.** Then it did not read your settings. The usual cause is running the command from a different directory than the one holding `.vibe-sentinel.toml`. Check the file has an active block with `grep -n -A6 '^\[llm\]' .vibe-sentinel.toml` — if that prints nothing, the settings are not there, so run the `cat >>` command above from inside the project.
+- **It shows a different endpoint or model than you set.** Then it did not read your settings. The usual cause is running the command from a different directory than the one holding `.vibe-sentinel.toml`. Check the file has an active block with `grep -n -A6 '^\[llm\]' .vibe-sentinel.toml` — if that prints nothing, the settings are not there, so run the `cat >>` command above from inside the project.
 - **It says `unreachable`.** Ollama is not running. Start it with `ollama serve` and try again.
 
 The line `No [llm] start_command configured` is not an error and needs no fixing. It only means you start Ollama yourself, which is what the Ollama app does for you.
 
 One more, only if a later scan complains that the backend rejected the request: add `structured_output = "json_object"` inside the `[llm]` block, and `"none"` if that still fails. How strictly a backend can be held to a JSON shape is a property of the backend, not the model.
+
+**`backend status` proves that *something* answers, not that it is yours.** It
+asks `/v1/models` and reports what comes back, so anything on that port serving
+a model by that name reads as `ready`. Port 11434 is shared by everything on the
+machine that uses Ollama, and a tag like `gemma4:26b-a4b-it-qat` names whatever was last
+pulled under it — so another project's pull, or an upgrade, changes what judges
+your scans without changing a line of your config. An *absent* backend is caught
+by the connection error the tool raises; a *substituted* one is caught by
+nothing. If a result surprises you, check what is serving:
+
+```bash
+ollama ps       # what is loaded right now
+ollama list     # what each name points at — the ID column is the digest
+```
+
+A project that wants the answer to be one model and no other can build a
+name nothing else uses — `ollama create` from a Modelfile — and put that in
+`[llm] model`.
 
 A backend is required. Rating a change and adjudicating a credential candidate are half of what this tool does, so a run that cannot reach a model exits 2 and names the fix rather than reporting the mechanical half as though it were the whole answer. See [use-of-local-model.md](use-of-local-model.md).
 

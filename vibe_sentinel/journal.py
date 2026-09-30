@@ -341,6 +341,10 @@ class ReviewRecord:
     reviewed: bool = False
     mode: str = ""
     enforced: bool = False
+    decision: str = "allow"
+    """``allow``, ``ask`` or ``deny`` — what the gate did. ``enforced`` is
+    True exactly when this is ``deny``; ``ask`` handed the call to the
+    person."""
     history_count: int = 0
     duration_ms: int = 0
     command: str = ""

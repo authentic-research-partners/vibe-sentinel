@@ -2,7 +2,7 @@
 
 ## What this tool actually is
 
-A small local model — 8B, one GPU, no internet — cannot be handed a repository
+A small local model — one machine, no internet — cannot be handed a repository
 and asked whether it is well organised. It has no room for the tree, no memory
 of last month, and a marked tendency to answer the easiest part of any question
 containing several.
@@ -120,17 +120,19 @@ Any OpenAI-compatible `/v1/chat/completions` endpoint works; nothing in the pack
 
 ```toml
 [llm]
-endpoint = "http://localhost:5001/v1"
-model = "qwen3-8b-fp8"
+endpoint = "http://localhost:11434/v1"   # Ollama
+model = "gemma4:26b-a4b-it-qat"
 structured_output = "json_schema"   # json_schema | json_object | none
 ```
 
 Pick a family **different from the one that writes your code** — one from the
-same family shares its blind spots about what normal structure looks like. An 8B
-model is enough; on an Apple Silicon Mac the default is Qwen3 14B under Ollama,
-and any other 12–14B local model does the job. On a backend that serialises,
-set `concurrency = 1` under `[safety]`, `[credentials]`, `[packages]` and
-`[drift]`.
+same family shares its blind spots about what normal structure looks like. The
+default is Gemma 4 26B in its QAT build under Ollama, about 15 GB; smaller
+models run and measured weaker, and [evals.md](evals.md) has the numbers. Its
+thinking is off by default — `[llm] extra_body` sends `reasoning_effort =
+"none"` — and Ollama needs a context of at least 32,768 tokens, which
+[Getting Started](getting-started.md) shows how to set. Requests go one at a time by
+default; raise `concurrency` only for a server that batches.
 
 **One hard boundary:** a credential excerpt goes to the configured endpoint only
 if that endpoint is loopback. `[credentials] allow_remote_model = true` is the

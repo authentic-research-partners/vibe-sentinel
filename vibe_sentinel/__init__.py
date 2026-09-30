@@ -10,7 +10,7 @@ with their parameters declared in your config. Measuring is mechanical. A
 local LLM — a different model family from whatever wrote the code — then
 reads the resulting changes to say which ones matter, and judges the
 credential candidates the rules flagged. It never chooses what to
-measure. Any OpenAI-compatible backend works: vLLM, Ollama, llama.cpp,
+measure. Any OpenAI-compatible backend works: Ollama, llama.cpp,
 LM Studio.
 
 A scan answers two questions, and they are kept apart on purpose. *What
@@ -59,7 +59,7 @@ from __future__ import annotations
 import importlib
 from typing import TYPE_CHECKING, Any
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 if TYPE_CHECKING:
     from vibe_sentinel.analyze import analyze_drift

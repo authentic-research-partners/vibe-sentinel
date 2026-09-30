@@ -65,6 +65,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 from pydantic import BaseModel, ConfigDict
 
+from vibe_sentinel.config import DEFAULT_CONCURRENCY
 from vibe_sentinel.probes import EXCLUDED_DIRS
 from vibe_sentinel.policy import PROJECT_CONFIG, accepts_value, check_pins
 from vibe_sentinel.policy import declared_layers
@@ -574,10 +575,10 @@ class Policy(BaseModel):
     pins: tuple[dict[str, Any], ...] = ()
     new_package_days: int = 90
     source: str = "defaults"
-    concurrency: int = 4
+    concurrency: int = DEFAULT_CONCURRENCY
     """How many near-miss pairs are adjudicated at once. One request each
-    over a shared prefix, as in the other two gates; 1 on a backend that
-    serialises."""
+    over a shared prefix, as in the other two gates; see
+    :data:`vibe_sentinel.config.DEFAULT_CONCURRENCY` for the default."""
     guidance: str = ""
     """A project's standing note about its own names, put in front of the
     near-miss question.
@@ -641,7 +642,7 @@ def policy_from_data(data: dict[str, Any], where: str) -> Policy:
         pins=tuple(data.get("pin", ())),
         new_package_days=days,
         source=where,
-        concurrency=int(data.get("concurrency", 4)),
+        concurrency=int(data.get("concurrency", DEFAULT_CONCURRENCY)),
         guidance=str(data.get("guidance", "")).strip(),
     )
 

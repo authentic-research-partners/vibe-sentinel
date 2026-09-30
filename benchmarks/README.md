@@ -19,34 +19,35 @@ anything, and neither is a threshold — a benchmark is the evidence you
 would need before writing one down, which is the same standard every
 constant in `trends.py` is held to.
 
-These are also not a benchmark of the model or of the server. vLLM
-publishes its own and they are better. What is measured here is the shape
-of the requests *this tool* sends — one narrow question per request, a
-system message identical across the fan-out, a semaphore over the lot —
-against whatever is serving them. Point it at a backend that serialises
-and it will report a different answer. That is the measurement working,
-and it is exactly why `concurrency` is a setting rather than a constant.
+These are also not a benchmark of the model or of the server. What is
+measured here is the shape of the requests *this tool* sends — one narrow
+question per request, a system message identical across the fan-out, a
+semaphore over the lot — against whatever is serving them. Point it at a
+backend that serialises and it will report a different answer. That is the
+measurement working, and it is exactly why `concurrency` is a setting
+rather than a constant.
 
 ## The three suites
 
 ### `concurrency` — what the fan-out width buys
 
-Four settings default to 4 — `[drift] concurrency`, `[safety] concurrency`,
-`[packages] concurrency`, `[credentials] concurrency` — and 4 was a guess.
+Four settings share one default — `[drift] concurrency`, `[safety]
+concurrency`, `[packages] concurrency`, `[credentials] concurrency` — and this
+suite is where it came from: `config.DEFAULT_CONCURRENCY`, and the reason
+beside it.
 The suite sweeps the width over a fixed batch of requests and reports the
 wall clock of the whole batch, not throughput at saturation: a scan asks N
 questions and waits for all of them, so what a person waits for is the
 last answer.
 
-Three things bound the answer, and only the first is in the table. The
-server stops rewarding width once the KV cache is full, which shows up as
-`preempted` rather than as a slower median. The `slowest` column matters
-separately from `seconds`, because the safety gate runs inside its own
-timeout in front of a tool call, where one long tail is a command recorded
-`unreviewed`. And the tool's own fan-outs are small — a drift pass asks once
-per watched lens, a safety review once per matched danger — so a width above
-what your project actually asks for costs nothing and buys nothing. The
-credentials gate on an unpinned tree is the one that gets wide.
+Two things bound the answer beyond the median. The `slowest` column
+matters separately from `seconds`, because the safety gate runs inside its
+own timeout in front of a tool call, where one long tail is a command
+recorded `unreviewed`. And the tool's own fan-outs are small — a drift
+pass asks once per watched lens, a safety review once per matched danger —
+so a width above what your project actually asks for costs nothing and
+buys nothing. The credentials gate on an unpinned tree is the one that
+gets wide.
 
 ### `prefix` — what the identical system message buys
 
@@ -95,46 +96,35 @@ of the loop. The first ad-hoc version of the client suite did exactly
 that and made a shared client look 7% *slower* than a fresh one per call,
 on nothing but running second.
 
-Columns: `seconds` is the median pass **with the pass-to-pass spread beside
-it**, `req/s` the batch divided by it, `median` the middle single-request
-latency across every pass, `slowest` the worst single request seen,
-`vs first` the ratio against the first condition, and `cached` the share of
-this arm's prefill the server already had.
+Columns: `seconds` is the median pass **with the pass-to-pass spread
+beside it**, `req/s` the batch divided by it, `median` the middle
+single-request latency across every pass, `slowest` the worst single
+request seen, and `vs first` the ratio against the first condition.
 
-Two of those are there because of what the first recorded sweep hid. The
-spread is the more important: a row reading `30.07 ±115%` had passes of
-41.06s and 19.08s, and its median looked exactly as solid as every other
-row's. **A gap between two rows means nothing until it is larger than the
-spread within them** — on this project's own data, one pair of arms differed
-by 7% while overlapping completely, and another differed by 10% with no
-overlap at all. Only the second is a result.
+The spread is there because of what the first recorded sweep hid: a row
+reading `30.07 ±115%` had passes of 41.06s and 19.08s, and its median
+looked exactly as solid as every other row's. **A gap between two rows
+means nothing until it is larger than the spread within them** — on this
+project's own data, one pair of arms differed by 7% while overlapping
+completely, and another differed by 10% with no overlap at all. Only the
+second is a result.
 
-A row can also be flagged `N preempted`, and that one is a stop sign rather
-than a note. It means the server ran out of KV cache, evicted work in flight
-and recomputed it — which is what a fan-out too wide for the card actually
-looks like. Throughput flattens gently and noisily as width grows, so a
-median alone cannot tell you where to stop; preemption is a cliff, and it
-lets a width be called too wide for a reason instead of because a number
-moved.
-
-`cached` is there because it is the one column that is a *mechanism* rather
-than a duration. Seconds on a shared card move with whatever else is
-running; whether the server reused a prefix does not. So an arm whose timing
-cannot be separated from its sibling's can still say plainly whether the
-prefix cache was working — which is what the `prefix` suite is really
-asking. `—` means the backend publishes no metrics, not a cache that missed
-every time. A condition whose requests did not all come back
-with a usable answer says so beside its label — a pass that was fast
-because a third of its answers were unparseable is not a fast pass, and
-the wall clock alone cannot tell you which you are holding.
+A row flagged `N truncated+retried` had answers cut off at `max_tokens`,
+counted from each response's `finish_reason` — part of the
+OpenAI-compatible surface, so it is visible on every backend. A condition
+whose requests did not all come back with a usable answer says so beside
+its label — a pass that was fast because a third of its answers were
+unparseable is not a fast pass, and the wall clock alone cannot tell you
+which you are holding.
 
 ## Cost
 
 The defaults sweep five widths at 16 requests, three passes each, plus a
 warm-up per condition, and then three two-armed suites on top — and the
-serial width is by construction the slowest thing in any of it. On one card
-with an 8B model that is the better part of an hour for the full run. `--repeat 1` and a shorter `--widths` list is the quick look;
-the recorded runs in `results/` are the slow one.
+serial width is by construction the slowest thing in any of it. On the
+backend the runs in `results/` came from, that was the better part of an
+hour for the full run. `--repeat 1` and a shorter `--widths` list is the
+quick look; the recorded runs in `results/` are the slow one.
 
 There is no mechanical tier here and no `--no-model`. An eval can measure
 the preparation without a backend because the preparation is arithmetic. A

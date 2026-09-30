@@ -22,6 +22,21 @@ from vibe_sentinel.paths import CONFIG_FILENAME
 
 StructuredOutput = Literal["json_schema", "json_object", "none"]
 SafetyMode = Literal["off", "observe", "enforce"]
+NoVerdict = Literal["ask", "allow"]
+
+#: How many requests each model-bound stage sends at once — the default for
+#: ``[drift]``, ``[safety]``, ``[packages]`` and ``[credentials]``
+#: ``concurrency``, and the one place it is written down.
+#:
+#: 1 because the default backend answers one request at a time, and a
+#: request's timeout counts the time it spends queued. Measured on
+#: 2026-09-30 against Ollama at its default settings (runner started with
+#: ``-np 1``), 16 requests took 14.3-14.9 s at every width from 1 to 16:
+#: width bought nothing, and at 32 a scan's questions waited past their
+#: timeout and the scan failed. With ``OLLAMA_NUM_PARALLEL=4`` the widest
+#: setting was at most 1.42x faster, with passes up to 37% apart. Raise it
+#: for a server that batches; benchmarks/ says by how much on yours.
+DEFAULT_CONCURRENCY = 1
 
 
 class SentinelConfig(BaseModel):
@@ -68,10 +83,9 @@ class SentinelConfig(BaseModel):
     #: each ``[[lens]]`` belongs once, above all of them.
     drift_guidance: str = ""
     #: How many lenses are asked at once. Each is its own request sharing
-    #: a cached prefix — the report is byte-identical across the fan-out —
-    #: so this is free against a server that batches. vLLM does. Ollama
-    #: serialises regardless; set it to 1 there.
-    drift_concurrency: int = 4
+    #: a cached prefix — the report is byte-identical across the fan-out.
+    #: See :data:`DEFAULT_CONCURRENCY` for why the default is 1.
+    drift_concurrency: int = DEFAULT_CONCURRENCY
 
     # --- The safety gate ---
     #
@@ -93,11 +107,18 @@ class SentinelConfig(BaseModel):
     #: runs. Running out means the command proceeds and is recorded as
     #: unreviewed — never blocked because a model was slow.
     safety_timeout: float = 8.0
+    #: What ``enforce`` does with a flagged command that has no verdict —
+    #: the model answered ``unclear``, or did not answer in time. ``ask``
+    #: hands it to the person with Claude Code's own prompt; where nobody
+    #: can answer, as in a ``claude -p`` run with no permission host, the
+    #: prompt ends in a deny. ``allow`` lets it run, which is what an
+    #: unattended setup that prefers that trade chooses on purpose.
+    #: ``observe`` never acts and is unaffected.
+    safety_no_verdict: NoVerdict = "ask"
     #: How many of a command's questions are asked at once. Each question
-    #: is its own request sharing a cached prefix, so this is free against
-    #: a server that batches — vLLM does. Ollama serialises regardless;
-    #: set it to 1 there and expect the latency to add up.
-    safety_concurrency: int = 4
+    #: is its own request sharing a cached prefix. See
+    #: :data:`DEFAULT_CONCURRENCY` for why the default is 1.
+    safety_concurrency: int = DEFAULT_CONCURRENCY
 
     # --- The history database ---
     #
@@ -132,13 +153,14 @@ class SentinelConfig(BaseModel):
 
     # --- The judge model ---
     #
-    # Any OpenAI-compatible endpoint: vLLM, Ollama, llama.cpp's server,
-    # LM Studio, LocalAI. Nothing here is specific to one of them.
-    llm_endpoint: str = "http://localhost:5001/v1"
-    #: Model name as the backend serves it — `ollama list`, or vLLM's
-    #: --served-model-name. Not an alias this tool resolves; whatever
-    #: string your server answers to.
-    llm_model: str = "qwen3"
+    # Any OpenAI-compatible endpoint: Ollama, llama.cpp's server,
+    # LM Studio, LocalAI. Nothing here is specific to one of them; the
+    # defaults are Ollama's port and the model the docs have users pull.
+    llm_endpoint: str = "http://localhost:11434/v1"
+    #: Model name as the backend serves it — exactly as `ollama list`
+    #: prints it. Not an alias this tool resolves; whatever string your
+    #: server answers to.
+    llm_model: str = "gemma4:26b-a4b-it-qat"
     #: Most local servers ignore this. Set it for one that doesn't.
     api_key: str = ""
     #: Whole-request timeout in seconds. Generous by default because a
@@ -157,11 +179,21 @@ class SentinelConfig(BaseModel):
     #: Passed into the request body untouched — a reasoning toggle, a
     #: sampler setting, anything one backend supports and others don't.
     #: The escape hatch that keeps backend-specific support out of the
-    #: client. Example for a Qwen3 vLLM server::
+    #: client.
     #:
-    #:     [llm.extra_body.chat_template_kwargs]
-    #:     enable_thinking = true
-    extra_body: dict[str, Any] = Field(default_factory=dict)
+    #: The default switches thinking off, because the default model thinks
+    #: unless told not to and the safety gate cannot afford it. Measured on
+    #: 2026-09-30 with Gemma 4 on Ollama: with thinking on, 26 of 27 safety
+    #: verdicts missed their 8-second timeout, and a drift question took
+    #: 83.6 s against 12.9 s. Whether thinking improves the answers could not
+    #: be told from the noise. Ollama and llama.cpp's server both honour it.
+    #:
+    #: A project that declares ``[llm.extra_body]`` replaces this default
+    #: whole, so an empty table sends nothing — the way to turn thinking
+    #: back on, or to stop sending a field a server rejects.
+    extra_body: dict[str, Any] = Field(
+        default_factory=lambda: {"reasoning_effort": "none"}
+    )
 
     #: Optional command that starts your backend, run verbatim by
     #: ``vibe-sentinel backend start``. Empty means "I start it myself".
@@ -197,7 +229,7 @@ class SentinelConfig(BaseModel):
 #: sets. Deliberately four, and deliberately all of them about *which
 #: backend this machine can reach*: the config file states what the project
 #: pins, and one checkout of it is shared by everyone, so a contributor
-#: whose machine has no NVIDIA card and no podman has otherwise no way to
+#: whose machine cannot run the pinned model has otherwise no way to
 #: run the tool at all without editing a file that is not theirs to change.
 #:
 #: What is not here matters as much. ``allow_remote_model`` is absent for
@@ -267,7 +299,7 @@ def load_config(path: Path | None = None) -> SentinelConfig:
 
     If ``path`` is None, searches for ``.vibe-sentinel.toml`` via
     :func:`find_config`. Running without a config file is supported: the
-    defaults point at a local server on port 5001 and the shipped probes.
+    defaults point at Ollama on its own port and the shipped probes.
     """
     config = SentinelConfig()
 
@@ -309,6 +341,8 @@ def load_config(path: Path | None = None) -> SentinelConfig:
         config.safety_timeout = float(safety["timeout"])
     if "concurrency" in safety:
         config.safety_concurrency = int(safety["concurrency"])
+    if "no_verdict" in safety:
+        config.safety_no_verdict = safety["no_verdict"]
 
     database = data.get("database", {})
     if "check_interval_hours" in database:

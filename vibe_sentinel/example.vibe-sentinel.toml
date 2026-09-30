@@ -111,12 +111,13 @@
 #   [drift] use_builtins    false to ask only what you declare
 #
 # Each lens is one request and the report is the shared prefix, so a server
-# that batches (vLLM) prefills it once and three questions cost close to what
-# one does. Ollama serialises: set concurrency = 1 there and expect the latency
-# to add up.
+# prefills it once however many questions are asked. Requests go one at a
+# time by default, because Ollama answers one at a time and a request's
+# timeout counts the time it waits in the queue. Raise it for a server that
+# batches.
 #
 # [drift]
-# concurrency = 4
+# concurrency = 1
 # A standing note in front of EVERY question, rather than repeated in each:
 # guidance = """
 # vibe_sentinel/probes/ is meant to grow — one file per probe is the design.
@@ -270,16 +271,20 @@ history = 100
 # means the command proceeds, recorded as unreviewed — never blocked on a slow
 # model.
 timeout = 8.0
+# What enforce does with a flagged command that has no verdict — the model
+# answered "unclear", or not in time. "ask" hands it to you with Claude Code's
+# own prompt; where nobody can answer (a `claude -p` run), that prompt ends in
+# a refusal naming the fix. "allow" lets it run, for a setup nobody watches.
+# no_verdict = "ask"
 # use_builtins = true
 # `disable` is "everything except these", so a danger added in a later release
 # arrives switched on. `use` is "only these", so it cannot. Pick by which
 # surprise you would rather have.
 # disable = ["changing-permissions"]
 # use = ["deleting-files", "running-as-root", "writing-outside-the-project"]
-# Questions are asked one request each, in parallel, sharing a cached prefix —
-# free against a server that batches (vLLM). Ollama serialises: set this to 1
-# there and expect the latency to add up.
-# concurrency = 4
+# Questions are asked one request each, sharing a cached prefix. One at a
+# time by default, as under [drift]; raise it for a server that batches.
+# concurrency = 1
 # Rules can live in their own files, so a team can share one set across repos.
 # Globs are relative to the project root; a pattern matching nothing is an
 # error, because a renamed file otherwise stops checking without saying so.
@@ -290,6 +295,10 @@ timeout = 8.0
 # something and the lens that asks about it, which is usually how they are
 # written.
 # rule_files = ["rules/*.toml"]
+# Hosts this project sends data to on purpose — a subdomain of one counts as
+# it. Uploads anywhere else, and to a destination nobody can read off the
+# command, are asked about; fetching, loopback and `git push` never are.
+# expected_hosts = ["api.github.com", "pypi.org"]
 
 # --- What counts as dangerous, in your words -------------------------------
 #
@@ -502,17 +511,18 @@ allowed_categories = ["permissive", "public-domain"]
 #
 # Optional as *settings*: leave them all commented and the defaults apply. Not
 # optional as a *dependency* — a reachable model is required, and the defaults
-# below simply assume it is at localhost:5001. A run that cannot reach one
-# exits 2.
+# below simply assume Ollama, at localhost:11434, serving gemma4:26b-a4b-it-qat.
+# A run that cannot reach one exits 2.
 
 # --- The judge model: any OpenAI-compatible backend --------------------------
-# vLLM, Ollama, llama.cpp, LM Studio. Pick a model family DIFFERENT from the
-# agent that writes your code — that separation is the whole point.
-# The README has a known-good vLLM command to start from.
+# Ollama, llama.cpp, LM Studio, or anything else that serves one. Pick a model
+# family DIFFERENT from the agent that writes your code — that separation is the
+# whole point. docs/getting-started.md walks through Ollama, which the
+# defaults below point at.
 #
 # [llm]
-# endpoint = "http://localhost:5001/v1"
-# model = "qwen3"                    # the name YOUR backend serves
+# endpoint = "http://localhost:11434/v1"
+# model = "gemma4:26b-a4b-it-qat"    # exactly as `ollama list` prints it
 # structured_output = "json_schema"  # json_schema | json_object | none
 #                                    # step down if your backend 4xxs
 # timeout = 300.0
@@ -533,18 +543,18 @@ allowed_categories = ["permissive", "public-domain"]
 # policies and the thresholds are statements about the project, and a second
 # way to set one would be a second answer to a question that has one.
 #
-# Backend-specific knobs, passed through untouched:
-# [llm.extra_body.chat_template_kwargs]
-# enable_thinking = true
+# Backend-specific knobs, passed through untouched. The default switches a
+# reasoning model's thinking off, because with it on the safety gate's
+# verdicts miss their timeout. Declaring the table replaces the default whole,
+# so an empty one sends nothing — to turn thinking back on, or for a server
+# that rejects the field:
+# [llm.extra_body]
+# reasoning_effort = "none"
 #
 # Optional: `vibe-sentinel backend start|stop` runs these verbatim (no shell).
-# start_command = [
-#     "podman", "run", "-d", "--name", "vibe-sentinel-llm",
-#     "--device", "nvidia.com/gpu=all", "-p", "5001:8000",
-#     "docker.io/vllm/vllm-openai:v0.18.0", "RedHatAI/Qwen3-8B-FP8-dynamic",
-#     "--served-model-name", "qwen3-8b-fp8", "--max-model-len", "40960",
-# ]
-# stop_command  = ["podman", "rm", "-f", "vibe-sentinel-llm"]
+# start_command = ["ollama", "serve"]
+# stop_command  = [...]              # leave unset for a server other projects
+#                                    # share: stopping it stops theirs too
 
 # --- Output ------------------------------------------------------------------
 # [output]
@@ -573,9 +583,9 @@ allowed_categories = ["permissive", "public-domain"]
 # ignore = []                       # names allowed to sit undeclared. pip,
 #                                   # setuptools, wheel and uv are always ignored
 # new_package_days = 90             # younger than this, a package is "newborn"
-# concurrency = 4                   # near-miss pairs asked about at once, one
-#                                   # request each over a shared prefix. 1 on a
-#                                   # backend that serialises
+# concurrency = 1                   # near-miss pairs asked about at once, one
+#                                   # request each over a shared prefix. Raise
+#                                   # it for a server that batches
 #
 # Your standing note about your own names, put in front of the one question
 # this gate asks. `httpx` and `httpx2` are two real packages and nothing
@@ -634,7 +644,8 @@ allowed_categories = ["permissive", "public-domain"]
 #                                   # `sk-ant-` can be told from a placeholder.
 #                                   # Never more than half the value. 0 sends
 #                                   # only the shape.
-# concurrency = 4                   # as with [safety]: 1 on Ollama
+# concurrency = 1                   # as with [safety]: raise it for a server
+#                                   # that batches
 # allow_remote_model = false        # true only if you own that endpoint and
 #                                   # meant to send credentials to it
 #

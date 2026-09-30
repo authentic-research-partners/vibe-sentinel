@@ -214,10 +214,22 @@ flowchart TB
   REV -->|"unsafe, and only in enforce mode"| DENY
 ```
 
-**Guarantees:** Never blocks because the model was slow or the backend down — the
-command runs and the row is marked `unreviewed`. Never blocks because of a bug in
-the gate: any failure lets the command through. Verdicts are stored apart from
-the commands, so the journal stays a record rather than a set of opinions.
+**Guarantees:** Never refuses a command because the model was slow, the backend
+down, or the gate itself broke — and under `enforce` never lets one through
+silently either. A flagged command with no verdict — `unclear`, or no answer
+within `[safety] timeout` — is *asked*: Claude Code shows its own permission
+prompt with the gate's reason on it, and the row records `decision = ask`.
+Where nobody can answer, Claude Code denies the request instead, so the reason
+names the fix: the timeout it missed, and `vibe-sentinel backend status`.
+`[safety] no_verdict = "allow"` lets such a command run, for a setup nobody
+watches that prefers that trade. `observe` records and never acts. Verdicts are
+stored apart from the commands, so the journal stays a record rather than a set
+of opinions, and `vibe-sentinel safety` counts how many commands were blocked
+and how many were asked.
+
+One limit no setting closes: if the hook itself runs past the timeout Claude
+Code gives it, Claude Code cancels it and the call proceeds. That is why
+`[safety] timeout` stays well under the hook's own.
 
 What counts as dangerous is yours, because a shipped list of verbs cannot know
 which of your database hosts is production. `pattern` is a regex over the command
@@ -245,11 +257,77 @@ vibe-sentinel safety --print-dangers
 
 ### When the question is about the tree, not the text
 
-Two dangers carry no `pattern` at all. They set `applies_to` instead, because
-what they ask cannot be asked of a command's text: `outside-project`, whether a
-write lands outside the project directory, and `undeclared-install`, whether a
-command installs a package name that no manifest declares. That second one is
-the only thing separating
+Five dangers carry no `pattern` at all. They set `applies_to` instead,
+because what they ask needs more than a regex over a command's text:
+`outside-project`, whether a write lands outside the project directory;
+`control-file`, whether a call changes the gate itself;
+`home-outside-project`, whether it reaches into the user's home directory;
+`egress`, whether it sends local data to a host the project does not expect;
+and `undeclared-install`, whether a command installs a package name that no
+manifest declares.
+
+`egress` is `sending-data-off-the-machine`, and only sending counts: `curl`
+or `wget` with data or an upload, a raw socket (`nc`, `socat`), a copy whose
+destination is another machine (`scp`, `rsync`, `sftp`), `ssh` with data
+piped into it, and a cloud-storage upload. `curl https://…` fetches and
+passes; loopback is not off the machine; `git push` to the project's own
+remote is the work. Hosts the project sends to on purpose go in
+`[safety] expected_hosts`, and a subdomain of one counts as it. A destination
+nobody can read off the command — `curl -d "$DATA" "$URL"` — is asked about,
+because a host no one can name is not one the project listed. The question
+is what leaves and where it goes; a secret sent to an expected host is not
+caught.
+
+The home directory is watched in two tiers. A file that holds keys —
+`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.netrc`, `~/.docker/config.json`,
+`~/.kube/config`, `~/.npmrc`, `~/.pypirc`, `~/.config/gh`, the macOS keychains
+— is matched by pattern, as `secret-store` for a command and
+`secret-store-target` for a tool's path, and settled `unsafe`: `git`, `aws`,
+`ssh` and `kubectl` read their own without the agent ever naming the path, so
+an agent that names one is steered or mistaken. That includes
+`ssh -i ~/.ssh/key`, which a project that needs it overrides. Anything else in
+the home directory and outside the project — another repository, the git
+config, a shell start-up file — is `reaching-into-home`, and asked about,
+because reading it is sometimes the work. The rest of the filesystem is not
+watched: `/usr/bin`, `/etc` and `/tmp` hold nothing personal. A command that
+names a path without opening it — `echo "$HOME/.config"`, `cd ~` — does not
+count, and nor does the program being run, so `~/.local/bin/uv` is not a read.
+
+A pattern can also be matched against a tool's own name, with
+`applies_to = "tool"`. That is how an MCP call — which reaches the gate as a
+name like `mcp__github__delete_repository`, with no command and usually no
+path — is matched at all. One ships: `deleting-through-a-connected-tool`,
+settled `unsafe`, for a connected tool whose name says it deletes, removes,
+destroys, drops, purges, erases or wipes. It is settled rather than asked
+because the model would see the tool's name and not which repository or page,
+which it can judge no better than the pattern can. A project declares its
+own:
+
+```toml
+[[danger]]
+id = "production-database-tools"
+title = "Anything through the production database server"
+pattern = '^mcp__prod_db__'
+applies_to = "tool"
+verdict = "unsafe"
+```
+
+`control-file` is what `changing-the-gate` uses, and it is the one shipped
+danger that settles instead of asking: `verdict = "unsafe"`. A control the
+agent can switch off is not a control, and asking a model would hand the
+decision to the text the agent is writing into the file. It covers
+`.vibe-sentinel.toml`, everything under `.vibe-sentinel/` — the history
+database included — `.claude/settings.json` and `settings.local.json`, and
+every file a `rule_files` glob in the project's config names. A writing tool
+aimed at one of them counts. From a shell, a redirect into one counts, a copy
+counts only if one is its destination, a delete or a move counts if it names
+one or a directory holding one (`rm -rf .`), and a command that only reads —
+`cat`, `ls`, `diff`, `git diff`, `git add` — does not. `ruff format .` names
+the directory that holds the settings and writes none of them, so it does not
+count either. A project that wants its agent to edit these files redeclares
+`changing-the-gate` without the verdict, or disables it.
+
+`undeclared-install` is the only thing separating
 
 ```bash
 uv pip install -e ".[dev]"     # re-syncing what pyproject.toml already says
@@ -269,6 +347,26 @@ install`, whose names are not the ones `pyproject.toml` carries. Nothing that
 is not a bare package name is treated as one — `-r requirements.txt`, `-e .`,
 a wheel, a URL, `$PKG`. A tree with no `pyproject.toml` reports nothing at
 all, because nowhere to read a declaration is not a declaration of nothing.
+
+For JavaScript it reads `npm install`, `npm i` and `npm add`, `pnpm add` and
+`pnpm install`, `yarn add`, and `bun add` and `bun install` — with names —
+against `package.json`'s dependency tables and its own name. There is no npm
+counterpart to `uv add` to leave out, because every one of these records the
+name it adds; what is asked about is the name, before its install scripts
+run. The same command without names re-syncs and is not read, and neither is
+a global tool install (`-g`, `yarn global add`), for the reason `pipx
+install` is not. A local path, a tarball, a git or GitHub reference and an
+alias (`foo@npm:bar`) are not registry names. The manifest read is the
+project root's: a monorepo sub-package's own `package.json` is not.
+
+A `pyproject.toml` that will not parse is not that case, and is not treated
+as it. Read as "no manifest", it would declare nothing, so no install could be
+undeclared — a typo in the file would switch the check off. So an install by
+name in a tree whose manifest will not parse is handled the way an unloadable
+`[[danger]]` set is: `observe` records it as unreviewed with the parse error,
+`enforce` refuses it and names `vibe-sentinel packages` as the check, and
+`off` does nothing. A command that installs nothing never reads the file.
+`scan` checks it up front, and the `packages` gate fails on it.
 
 Every one of those is the same rule, and it points one way: when in doubt, say
 nothing. A missed install leaves things as they were before the check existed.

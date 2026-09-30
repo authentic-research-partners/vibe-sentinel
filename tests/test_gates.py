@@ -508,3 +508,20 @@ def test_the_item_a_gate_reports_is_called_a_finding() -> None:
     assert credentials.Adjudication is not None
     assert packages.Adjudication is not None
     assert GateFinding is not None
+
+
+def test_a_broken_manifest_fails_the_packages_gate(tmp_path: Path) -> None:
+    """Unreadable is not undeclared. It used to come back as "nothing in this
+    tree declares its dependencies" — unconfigured, which a scan does not
+    count against anyone — when what was true is that the gate could not
+    read what the tree declares."""
+    from vibe_sentinel.gates import collect_packages
+
+    (tmp_path / "pyproject.toml").write_text(
+        "authors = authors = [\n", encoding="utf-8"
+    )
+    report = asyncio.run(collect_packages(tmp_path))
+
+    assert not report.ok
+    assert report.configured, "a broken manifest is a failure, not an absence"
+    assert "pyproject.toml could not be read" in report.error

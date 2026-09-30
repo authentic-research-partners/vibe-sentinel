@@ -28,8 +28,16 @@ from typing import Any
 
 import pytest
 
-from evals import credentials_eval, drift_eval, packages_eval, report, safety_eval
-from evals.cases import Band, DriftCase, SafetyCase
+from evals import (
+    adversarial_eval,
+    credentials_eval,
+    drift_eval,
+    packages_eval,
+    report,
+    safety_eval,
+)
+from evals.cases import AdversarialCase, Band, DriftCase, SafetyCase
+from evals.corpus import adversarial as adversarial_corpus
 from evals.corpus import credentials as credential_corpus
 from evals.corpus import declared
 from evals.corpus import drift as drift_corpus
@@ -173,6 +181,7 @@ def test_every_case_carries_an_argument_and_a_unique_id() -> None:
         credential_corpus.CASES,
         package_corpus.CASES,
         drift_corpus.CASES,
+        adversarial_corpus.CASES,
     ):
         ids = [case.id for case in corpus]
         assert len(ids) == len(set(ids)), f"duplicate ids in {ids}"
@@ -422,12 +431,18 @@ def test_the_judged_tier_records_what_the_model_answered(
 
     monkeypatch.setattr("vibe_sentinel.llm.llm_query", answer)
     suite = asyncio.run(safety_eval.run(SentinelConfig(), concurrency=2))
-    judged = suite.measurements[-1]
+    by_id = {m.id: m for m in suite.measurements}
+    judged = by_id["model-verdict"]
     assert suite.used_model is True
     assert judged.matrix is not None
     assert judged.matrix.count("safe", "unsafe") > 0
     assert judged.matrix.count("unsafe", "unsafe") > 0
     assert judged.unanswered == 0
+
+    # And what that costs, read off the same answers: every safe command
+    # the model calls unsafe is one enforce would refuse.
+    cost = by_id["safe-command-interrupted"]
+    assert cost.outcomes and all(o.observed == "refused" for o in cost.outcomes)
 
 
 def test_a_rating_that_names_nothing_measured_is_counted(
@@ -567,3 +582,155 @@ def test_a_case_that_bands_nothing_is_refused(tmp_path: Path) -> None:
     body = _LENS + _CASE.replace('accept = ["info", "low"]', "")
     with pytest.raises(ValueError, match="bands none of its changes"):
         declared.load_cases(_project(tmp_path, body))
+
+
+# --- the adversarial suite ----------------------------------------------------
+#
+# Its one rule is that an attack is scored end to end, and each test below
+# guards a way that rule could quietly stop holding: a miss dropped from the
+# denominator scores well for every attack the gate fails to see.
+
+
+def test_every_attack_is_labelled_unsafe_and_every_twin_is_not_judged() -> None:
+    for case in adversarial_corpus.CASES:
+        if case.escalates:
+            assert case.verdict == "unsafe" and not case.also_ok, case.id
+        else:
+            assert case.verdict == "", f"{case.id}: a twin is measured, not judged"
+
+
+def test_every_threat_row_has_an_attack_and_a_twin() -> None:
+    attacks = {c.threat for c in adversarial_corpus.CASES if c.escalates}
+    twins = {c.threat for c in adversarial_corpus.CASES if not c.escalates}
+    assert attacks == twins, "a rule catching an attack must be priced by a twin"
+
+
+def test_the_threat_model_cites_every_attack_and_every_row_exists() -> None:
+    """The document's evidence column names these cases. If one is renamed or
+    a row is dropped, the document stops being evidence, and nothing else
+    would notice."""
+    doc = (Path(__file__).parent.parent / "docs" / "THREAT_MODEL.md").read_text(
+        encoding="utf-8"
+    )
+    table = doc.split("## Threats")[1].split("## What a verdict")[0]
+    for case in adversarial_corpus.CASES:
+        assert f"| {case.threat} |" in table, f"{case.id}: no row {case.threat}"
+        if case.escalates:
+            assert f"`{case.id}`" in table, f"{case.id} is not cited"
+
+
+def test_an_attack_triage_never_flags_counts_as_not_stopped(tmp_path: Path) -> None:
+    """Never asked is not the same as not measured: the attack ran."""
+    adversarial_eval.plant_scene(tmp_path)
+    missed = AdversarialCase(
+        id="quiet",
+        threat="T0",
+        why="nothing flags it",
+        command="ls",
+        escalates=True,
+        verdict="unsafe",
+    )
+    stopped = asyncio.run(
+        adversarial_eval.measure_stopped(
+            tmp_path, safety.load_dangers(tmp_path), SentinelConfig(), 1, (missed,)
+        )
+    )
+    (outcome,) = stopped.outcomes
+    assert outcome.observed == adversarial_eval.NOT_FLAGGED
+    assert not outcome.ok
+    assert stopped.matrix is not None and stopped.matrix.total == 1
+
+
+def test_an_attack_with_no_verdict_counts_as_not_stopped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """unreviewed is allowed in front of a tool call, so the attack ran."""
+    adversarial_eval.plant_scene(tmp_path)
+
+    async def no_answer(*args: object, **kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(adversarial_eval.safety, "review", no_answer)
+    attack = next(c for c in adversarial_corpus.CASES if c.id == "force-push-main")
+    stopped = asyncio.run(
+        adversarial_eval.measure_stopped(
+            tmp_path, safety.load_dangers(tmp_path), SentinelConfig(), 1, (attack,)
+        )
+    )
+    (outcome,) = stopped.outcomes
+    assert outcome.observed == adversarial_eval.UNREVIEWED
+    assert not outcome.ok
+    assert stopped.matrix is not None and stopped.matrix.total == 1
+
+
+def test_the_adversarial_mechanical_tier_needs_no_model() -> None:
+    suite = asyncio.run(adversarial_eval.run(SentinelConfig(), mechanical_only=True))
+    assert suite.used_model is False
+    reach = suite.measurements[0]
+    assert reach.id == "attack-reaches-the-gate"
+    assert reach.counts is not None
+    assert reach.counts.total == len(adversarial_corpus.CASES)
+
+
+def test_the_evals_measure_what_the_gate_decides_not_what_the_model_says(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A declared verdict settles a call in the hook without asking. The
+    evals called the model anyway and so scored its opinion: an MCP delete
+    the gate refuses came back `unclear`, because the model could not see
+    which page. Reaching the model here is the bug."""
+    adversarial_eval.plant_scene(tmp_path)
+
+    async def must_not_ask(*args: object, **kwargs: object) -> None:
+        raise AssertionError("a settled call was put to the model")
+
+    monkeypatch.setattr(adversarial_eval.safety, "review", must_not_ask)
+    attack = next(c for c in adversarial_corpus.CASES if c.id == "mcp-delete-page")
+    stopped = asyncio.run(
+        adversarial_eval.measure_stopped(
+            tmp_path, safety.load_dangers(tmp_path), SentinelConfig(), 1, (attack,)
+        )
+    )
+    (outcome,) = stopped.outcomes
+    assert outcome.observed == "unsafe"
+    assert outcome.ok
+
+
+def test_a_prompt_counts_as_an_interruption_like_a_refusal() -> None:
+    """The cost of `no_verdict = "ask"` is a prompt on work that was fine,
+    so `unclear` and no answer at all are counted, not only `unsafe`."""
+    from evals.metrics import enforce_decision
+
+    assert enforce_decision("unsafe") == "refused"
+    assert enforce_decision("unclear") == "asked"
+    assert enforce_decision("unreviewed") == "asked"
+    assert enforce_decision("unanswered") == "asked"
+    assert enforce_decision("safe") == "allowed"
+
+
+def test_every_piece_of_evidence_the_control_mapping_cites_exists() -> None:
+    """docs/CONTROL_MAPPING.md is evidence only while what it names is real.
+
+    Its evidence column cites tests as `test_file::test_name` and eval cases
+    as `suite:case-id`. A test renamed or a case dropped would leave a row
+    pointing at nothing while still reading as proven, and nothing else
+    would notice — so each citation is resolved here.
+    """
+    import re
+
+    root = Path(__file__).parent.parent
+    doc = (root / "docs" / "CONTROL_MAPPING.md").read_text(encoding="utf-8")
+    corpora = {
+        "safety": {c.id for c in safety_corpus.CASES},
+        "adversarial": {c.id for c in adversarial_corpus.CASES},
+        "credentials": {c.id for c in credential_corpus.CASES},
+        "packages": {c.id for c in package_corpus.CASES},
+    }
+    tests = re.findall(r"`(test_[a-z0-9_]+)::(test_[a-z0-9_]+)`", doc)
+    cases = re.findall(r"`(safety|adversarial|credentials|packages):([a-z0-9-]+)`", doc)
+    assert tests and cases, "the mapping cites no evidence at all"
+    for module, name in tests:
+        source = (root / "tests" / f"{module}.py").read_text(encoding="utf-8")
+        assert f"def {name}(" in source, f"{module}::{name} does not exist"
+    for suite, case in cases:
+        assert case in corpora[suite], f"{suite}:{case} does not exist"

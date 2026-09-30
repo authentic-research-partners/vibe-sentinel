@@ -220,10 +220,27 @@ def test_a_tuning_check_is_not_rendered_as_agent_work(
 def test_a_real_verdict_carries_no_check_tag(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    render_reviews([_review(enforced=True)])
+    render_reviews([_review(enforced=True, decision="deny")])
     out = capsys.readouterr().out
     assert "[check]" not in out
     assert "[BLOCKED]" in out
+
+
+def test_an_asked_row_is_marked_and_counted(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A prompt is neither a refusal nor a pass, and how often people were
+    asked is what `no_verdict = "ask"` costs — so it is shown, and counted."""
+    render_reviews(
+        [
+            _review(verdict="unclear", decision="ask"),
+            _review(verdict="unsafe", enforced=True, decision="deny"),
+            _review(verdict="safe"),
+        ]
+    )
+    out = capsys.readouterr().out
+    assert "[ASKED]" in out
+    assert "1 blocked, 1 asked" in out
 
 
 def test_an_unreviewed_row_is_listed_not_hidden(

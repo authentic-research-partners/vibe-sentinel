@@ -70,6 +70,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict
 
+from vibe_sentinel.config import DEFAULT_CONCURRENCY
 from vibe_sentinel.exceptions import LLMConnectionError
 from vibe_sentinel.paths import CONFIG_FILENAME
 from vibe_sentinel.probes import EXCLUDED_DIRS
@@ -367,7 +368,7 @@ class Policy(BaseModel):
     #: Never more than half the value, never anything at all to stdout, the
     #: log, or the database. 0 sends only the shape.
     reveal_chars: int = 8
-    concurrency: int = 4
+    concurrency: int = DEFAULT_CONCURRENCY
     #: Refuse to send excerpts anywhere but loopback. The one setting here
     #: that is about where bytes go rather than what counts as a finding.
     allow_remote_model: bool = False
@@ -434,7 +435,7 @@ def policy_from_data(data: dict[str, Any], where: str) -> Policy:
         max_file_kb=int(data.get("max_file_kb", 512)),
         max_files=int(data.get("max_files", 20000)),
         reveal_chars=reveal,
-        concurrency=max(1, int(data.get("concurrency", 4))),
+        concurrency=max(1, int(data.get("concurrency", DEFAULT_CONCURRENCY))),
         allow_remote_model=bool(data.get("allow_remote_model", False)),
         source=where,
     )
@@ -1292,8 +1293,8 @@ def build_context(path: str, exposure: str, candidates: list[Candidate]) -> str:
     """The shared half of the prompt: one file, reduced.
 
     This is the **system** message and it is byte-identical for every
-    question asked about the same file, so a server that caches prefixes —
-    vLLM does — prefills the file once however many rules fired in it. The
+    question asked about the same file, so a server that caches prefixes
+    prefills the file once however many rules fired in it. The
     divergent tail is one rule's question, from :func:`build_question`.
     """
     where = {

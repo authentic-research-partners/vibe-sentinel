@@ -597,45 +597,6 @@ class SafetyOpinion(BaseModel):
     cannot tell — which is itself worth recording."""
 
 
-class BackendMetrics(BaseModel):
-    """What a serving backend says about itself, where it says anything.
-
-    Read from a Prometheus ``/metrics`` endpoint beside the OpenAI-compatible
-    one. Every field is ``None`` when the backend did not publish it, and that
-    is load-bearing: a server with no queue is not the same thing as a server
-    that does not report its queue, and rendering the second as ``0`` would
-    turn "we cannot see" into "all clear" — the failure this project refuses
-    everywhere else. Whoever renders these must say *unavailable*, never zero.
-
-    Names move between vLLM releases (``gpu_cache_usage_perc`` became
-    ``kv_cache_usage_perc``), so the reader accepts the aliases it knows and
-    leaves the field ``None`` rather than guessing.
-    """
-
-    running: float | None = None
-    waiting: float | None = None
-    kv_cache_used: float | None = None
-    prefix_hits: float | None = None
-    prefix_queries: float | None = None
-    preemptions: float | None = None
-    finished: float | None = None
-    truncated: float | None = None
-
-    @property
-    def prefix_hit_rate(self) -> float | None:
-        """Share of prefix-cache queries that hit, or None if unmeasured."""
-        if self.prefix_queries is None or self.prefix_hits is None:
-            return None
-        return self.prefix_hits / self.prefix_queries if self.prefix_queries else None
-
-    @property
-    def anything(self) -> bool:
-        """Whether the backend published a single field we understand."""
-        return any(
-            getattr(self, name) is not None for name in self.__class__.model_fields
-        )
-
-
 class SecretOpinion(BaseModel):
     """The model's read of one candidate credential.
 

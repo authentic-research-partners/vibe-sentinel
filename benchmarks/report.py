@@ -112,17 +112,7 @@ async def describe(config: SentinelConfig, note: str = "") -> Environment:
 
 
 def _rows(suite: Suite) -> list[tuple[str, ...]]:
-    """One row per measurement, in the order :data:`_HEAD` names.
-
-    ``cached`` is the share of this arm's prefill the server already had, and
-    it is here because it is the one column that is a *mechanism* rather than
-    a duration. Seconds on a shared card move with whatever else is running;
-    whether the server reused a prefix does not. An arm whose timing cannot
-    be separated from its sibling's can still say plainly whether the cache
-    was working, which is what the prefix suite is really asking. ``—`` where
-    the backend publishes no metrics — not zero, which would read as a cache
-    that missed every time.
-    """
+    """One row per measurement, in the order :data:`_HEAD` names."""
     if not suite.measurements:
         return []
     baseline = suite.measurements[0].seconds
@@ -134,8 +124,6 @@ def _rows(suite: Suite) -> list[tuple[str, ...]]:
             notes.append(f"{m.unanswered} unanswered")
         if m.truncated:
             notes.append(f"{m.truncated} truncated+retried")
-        if m.preemptions:
-            notes.append(f"{m.preemptions} preempted")
         flag = f"  ({', '.join(notes)})" if notes else ""
         rows.append(
             (
@@ -146,13 +134,12 @@ def _rows(suite: Suite) -> list[tuple[str, ...]]:
                 f"{statistics.median(chain.from_iterable(p.latencies for p in m.passes)):.2f}",
                 f"{max(p.slowest for p in m.passes):.2f}",
                 f"{ratio:.2f}x",
-                "—" if m.prefix_hit_rate is None else f"{m.prefix_hit_rate * 100:.0f}%",
             )
         )
     return rows
 
 
-_HEAD = ("condition", "seconds", "req/s", "median", "slowest", "vs first", "cached")
+_HEAD = ("condition", "seconds", "req/s", "median", "slowest", "vs first")
 
 
 def _table(suite: Suite, indent: str = "  ") -> list[str]:

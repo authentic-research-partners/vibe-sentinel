@@ -13,8 +13,10 @@ which is the same split ``evals/`` keeps.
 
 from __future__ import annotations
 
+import httpx
 import pytest
 
+from benchmarks import harness
 from benchmarks import report as render
 from benchmarks import suites
 from benchmarks.__main__ import _widths, build_parser
@@ -154,7 +156,7 @@ def test_a_condition_is_a_callable_payload() -> None:
 # keeps upstream.
 
 
-def _passes(seconds: float, truncated: int | None) -> list[Pass]:
+def _passes(seconds: float, truncated: int) -> list[Pass]:
     return [
         Pass(
             seconds=seconds,
@@ -166,7 +168,7 @@ def _passes(seconds: float, truncated: int | None) -> list[Pass]:
     ]
 
 
-def _canned(id_: str, seconds: float, truncated: int | None) -> Measurement:
+def _canned(id_: str, seconds: float, truncated: int) -> Measurement:
     return Measurement(
         id=id_, label=id_, width=4, requests=2, passes=_passes(seconds, truncated)
     )
@@ -174,8 +176,8 @@ def _canned(id_: str, seconds: float, truncated: int | None) -> Measurement:
 
 def _run_truncation(
     monkeypatch: pytest.MonkeyPatch,
-    fits: int | None,
-    truncates: int | None,
+    fits: int,
+    truncates: int,
     requests: int = 2,
 ) -> Suite:
     import asyncio
@@ -245,15 +247,6 @@ def test_both_arms_truncating_understates_the_cost(
     assert "both arms paid retries" in suite.note
 
 
-def test_a_backend_with_no_metrics_cannot_attribute_the_gap(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """None is not zero here either: unseen is not the same as none happened."""
-    suite = _run_truncation(monkeypatch, fits=None, truncates=None)
-    assert "NOT MEASURED" in suite.note
-    assert "publishes no metrics" in suite.note
-
-
 def test_a_condition_can_carry_its_own_budget() -> None:
     """The one request field a condition may move, and only this suite does."""
     plain = Condition(id="c", label="c", width=2, payload=suites._shared)
@@ -301,46 +294,6 @@ def test_an_arm_whose_retry_also_failed_did_not_price_a_retry(
     assert "never came back" in suite.note
 
 
-def test_an_unseen_cache_rate_is_a_dash_not_a_zero() -> None:
-    """A backend that reports nothing has not reported a cache that missed."""
-    suite = Suite(id="s", question="q", measurements=[_canned("a", 10.0, None)])
-    rendered = "\n".join(render._table(suite))
-    assert "—" in rendered
-    assert "0%" not in rendered
-
-
-def test_a_measured_cache_rate_is_pooled_across_passes() -> None:
-    """A rate of rates would weight a short pass like a long one."""
-    m = Measurement(
-        id="a",
-        label="a",
-        width=4,
-        requests=2,
-        passes=[
-            Pass(
-                seconds=1.0,
-                answered=2,
-                unanswered=0,
-                prefix_hits=90,
-                prefix_queries=100,
-                latencies=[0.5, 0.5],
-            ),
-            Pass(
-                seconds=1.0,
-                answered=2,
-                unanswered=0,
-                prefix_hits=10,
-                prefix_queries=100,
-                latencies=[0.5, 0.5],
-            ),
-        ],
-    )
-    assert m.prefix_hit_rate == 0.5
-    assert "50%" in "\n".join(
-        render._table(Suite(id="s", question="q", measurements=[m]))
-    )
-
-
 def test_a_single_pass_has_no_spread_to_report() -> None:
     """One pass cannot disagree with itself, and `±0%` would claim it did."""
     assert _canned("a", 10.0, 0).spread is None
@@ -365,37 +318,28 @@ def test_disagreeing_passes_say_so_beside_the_median() -> None:
     )
 
 
-def test_preemption_is_reported_when_the_cache_ran_out() -> None:
-    """The cliff that bounds a fan-out, named on the row it happened to.
-
-    Throughput flattens gently and noisily; preemption does not. A width can
-    be called too wide because the server evicted work, which is a reason,
-    rather than because a median moved, which on this data often is not.
-    """
-    m = Measurement(
-        id="w64",
-        label="concurrency = 64",
-        width=64,
-        requests=2,
-        passes=[
-            Pass(
-                seconds=30.0,
-                answered=2,
-                unanswered=0,
-                preemptions=7,
-                latencies=[15.0, 15.0],
-            )
-        ],
-    )
-    assert m.preemptions == 7
-    assert "7 preempted" in "\n".join(
-        render._table(Suite(id="s", question="q", measurements=[m]))
-    )
+# --- Counting a truncation ----------------------------------------------------
+#
+# Read from the response, not from the server: `finish_reason` is part of the
+# OpenAI-compatible surface every backend returns, where a server's own
+# counters are something most backends do not publish at all.
 
 
-def test_no_preemption_says_nothing() -> None:
-    """A quiet row stays quiet; zero is not worth a column of its own."""
-    rendered = "\n".join(
-        render._table(Suite(id="s", question="q", measurements=[_canned("a", 10.0, 0)]))
-    )
-    assert "preempted" not in rendered
+def _response(status: int, body: object) -> httpx.Response:
+    return httpx.Response(status, json=body)
+
+
+def test_an_answer_stopped_at_the_ceiling_is_counted() -> None:
+    body = {"choices": [{"message": {"content": "{"}, "finish_reason": "length"}]}
+    assert harness._cut_off(_response(200, body))
+
+
+def test_an_answer_that_finished_is_not() -> None:
+    body = {"choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}]}
+    assert not harness._cut_off(_response(200, body))
+
+
+def test_what_is_not_a_completion_is_not_a_truncation() -> None:
+    assert not harness._cut_off(_response(503, {"error": "busy"}))
+    assert not harness._cut_off(_response(200, {"choices": []}))
+    assert not harness._cut_off(httpx.Response(200, text="not json"))

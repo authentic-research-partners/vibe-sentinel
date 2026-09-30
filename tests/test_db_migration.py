@@ -567,3 +567,43 @@ def test_a_migrated_database_reports_no_change_for_the_state_it_gained(
     )
     probe = Probe(id="module-organization", title="t", command=["echo"])
     assert compare(baseline, current, [probe]).changes == []
+
+
+def test_v8_records_what_the_gate_did_and_keeps_every_verdict(tmp_path: Path) -> None:
+    """Before this migration the gate could only allow or refuse, and it
+    allowed everything it did not refuse — so `allow` is right for every
+    old row except the refused ones, which the migration turns into `deny`
+    from the column that recorded them. `enforced` keeps its meaning."""
+    _database_at(tmp_path, 7)
+    conn = sqlite3.connect(db_path(tmp_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        for n, command in enumerate(("rm -rf /", "rm -rf build")):
+            journal_store.record_command(
+                conn,
+                HookEvent(
+                    session_id="s",
+                    tool_name="Bash",
+                    tool_use_id=f"t{n}",
+                    tool_input={"command": command},
+                ),
+                f"2026-01-02T00:00:0{n}.000+00:00",
+            )
+        for command_id, verdict, enforced in ((1, "unsafe", 1), (2, "safe", 0)):
+            conn.execute(
+                "INSERT INTO command_reviews (command_id, reviewed_at, signals,"
+                " verdict, reason, model, reviewed, mode, enforced,"
+                " history_count, duration_ms) VALUES (?, '2026-01-02', 'x', ?,"
+                " '', 'm', 1, 'enforce', ?, 0, 0)",
+                (command_id, verdict, enforced),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert run_migration(tmp_path).success
+    with get_db(tmp_path) as db:
+        rows = {r.command: r for r in journal_store.list_reviews(db)}
+    assert rows["rm -rf /"].decision == "deny" and rows["rm -rf /"].enforced
+    assert rows["rm -rf build"].decision == "allow"
+    assert rows["rm -rf build"].verdict == "safe", "no verdict rewritten"

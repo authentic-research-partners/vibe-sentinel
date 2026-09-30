@@ -26,7 +26,7 @@ Adding a migration:
 from __future__ import annotations
 
 # Schema version — increment when adding a migration below.
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 SCHEMA_V1 = """
@@ -487,6 +487,29 @@ ALTER TABLE changes ADD COLUMN after_state TEXT NOT NULL DEFAULT '';
 """
 
 
+SCHEMA_V8 = """
+-- What the gate did about a verdict, as its own fact.
+--
+-- `enforced` recorded one thing: whether the command was refused. Under
+-- enforce the gate can now also hand a command to the person — a verdict
+-- of `unclear`, or none at all, is asked rather than allowed — and a
+-- prompt is neither a refusal nor a pass. So `decision` is `allow`,
+-- `ask` or `deny`, and `safety --list` counts how often people were
+-- asked.
+--
+-- The default is right for every row before this migration. The gate
+-- could only allow or refuse then, and it allowed everything it did not
+-- refuse; the UPDATE turns the refused rows into `deny` from the column
+-- that recorded them. `enforced` stays, meaning what it always meant.
+--
+-- Not indexed: `safety --list` filters by verdict and session, and reads
+-- this beside them.
+ALTER TABLE command_reviews ADD COLUMN decision TEXT NOT NULL DEFAULT 'allow';
+
+UPDATE command_reviews SET decision = 'deny' WHERE enforced = 1;
+"""
+
+
 MIGRATIONS: dict[int, str] = {
     1: SCHEMA_V1,
     2: SCHEMA_V2,
@@ -495,6 +518,7 @@ MIGRATIONS: dict[int, str] = {
     5: SCHEMA_V5,
     6: SCHEMA_V6,
     7: SCHEMA_V7,
+    8: SCHEMA_V8,
 }
 
 
@@ -582,6 +606,8 @@ VERIFY: dict[int, list[str]] = {
         "SELECT state FROM observations LIMIT 0",
         "SELECT before_state, after_state FROM changes LIMIT 0",
     ],
+    # This migration creates no index, so it names none in EXPECT_INDEXES.
+    8: ["SELECT decision FROM command_reviews LIMIT 0"],
 }
 
 

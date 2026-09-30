@@ -103,9 +103,26 @@ def test_no_manifest_is_not_an_empty_manifest(tmp_path: Path) -> None:
     assert rq.declared_names(tmp_path) == {"x"}
 
 
-def test_a_broken_manifest_reads_as_no_manifest(tmp_path: Path) -> None:
-    write_manifest(tmp_path, "[project\nname =")
-    assert rq.declared_names(tmp_path) is None
+def test_a_broken_manifest_is_an_error_not_an_absent_one(tmp_path: Path) -> None:
+    """It used to read as no manifest, and that is a substitute answer: no
+    manifest means nothing is declared, so no install can be undeclared.
+    With the typo that sat in this repository's own pyproject.toml,
+    `pip install reqeusts` passed triage; without it, it was flagged."""
+    write_manifest(tmp_path, "authors = authors = [\n")
+    with pytest.raises(rq.ManifestUnreadable, match="pyproject.toml could not be read"):
+        rq.declared_names(tmp_path)
+    with pytest.raises(rq.ManifestUnreadable, match="vibe-sentinel packages"):
+        rq.undeclared_installs("pip install reqeusts", tmp_path)
+
+
+def test_a_broken_manifest_costs_nothing_to_a_command_that_installs_nothing(
+    tmp_path: Path,
+) -> None:
+    """The manifest is read only for a command that installs something by
+    name, so a broken one is noticed by the one kind of command it affects."""
+    write_manifest(tmp_path, "authors = authors = [\n")
+    assert rq.undeclared_installs("ls -la", tmp_path) == ()
+    assert rq.undeclared_installs("pip install $PKG", tmp_path) == ()
 
 
 # --- what a command would install ------------------------------------------
@@ -204,3 +221,121 @@ def test_the_costly_imports_are_deferred() -> None:
         [sys.executable, "-c", code], capture_output=True, text=True, check=True
     )
     assert out.stdout.strip() == "[]"
+
+
+# --- the JavaScript package managers ---------------------------------------------
+
+
+def write_package_json(root: Path, body: str) -> None:
+    (root / "package.json").write_text(body, encoding="utf-8")
+
+
+_PACKAGE_JSON = (
+    '{"name": "scene", "dependencies": {"lodash": "^4", "@types/node": "^20"},'
+    ' "devDependencies": {"vitest": "^1"}}'
+)
+
+
+@pytest.mark.parametrize(
+    ("command", "undeclared"),
+    [
+        ("npm install lodahs", ("lodahs",)),
+        ("npm add @types/nodee", ("@types/nodee",)),
+        ("pnpm add reacct", ("reacct",)),
+        ("yarn add expresss@4", ("expresss",)),
+        ("bun add zodd", ("zodd",)),
+        ("npm i -w packages/web reacct", ("reacct",)),
+        ("cd web && npm install lodahs", ("lodahs",)),
+    ],
+)
+def test_an_npm_family_install_of_an_undeclared_name_is_found(
+    tmp_path: Path, command: str, undeclared: tuple[str, ...]
+) -> None:
+    write_package_json(tmp_path, _PACKAGE_JSON)
+    assert rq.undeclared_installs(command, tmp_path) == undeclared
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "npm i lodash",
+        "npm i --save-dev vitest",
+        "npm install",
+        "pnpm install",
+        "yarn install",
+        "bun install",
+        "npm install -g typescript",
+        "yarn global add typescript",
+        "npm i ./local-pkg",
+        "npm i github:user/repo",
+        "npm i user/repo",
+        "npm i foo@npm:bar",
+        "npx create-vite app",
+    ],
+)
+def test_a_sync_a_global_tool_or_a_non_name_is_not_undeclared(
+    tmp_path: Path, command: str
+) -> None:
+    """Re-syncing, a tool installed on purpose outside the project, and a
+    spec that is not a registry name are the npm twins of `pip install -e .`
+    and `pipx install`."""
+    write_package_json(tmp_path, _PACKAGE_JSON)
+    assert rq.undeclared_installs(command, tmp_path) == ()
+
+
+def test_no_package_json_means_nothing_to_compare_against(tmp_path: Path) -> None:
+    assert rq.undeclared_installs("npm install lodahs", tmp_path) == ()
+
+
+def test_a_broken_package_json_is_an_error_not_an_absent_one(tmp_path: Path) -> None:
+    """The same rule as a broken pyproject.toml: unreadable is not undeclared."""
+    write_package_json(tmp_path, '{"dependencies": {"lodash": }')
+    with pytest.raises(rq.ManifestUnreadable, match="package.json could not be read"):
+        rq.undeclared_installs("npm install lodahs", tmp_path)
+
+
+# --- an install nobody can read --------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "pip install reqeusts # don't worry",
+        "yarn add lodahs # it's fine",
+    ],
+)
+def test_an_install_that_will_not_split_is_unreadable_not_empty(
+    tmp_path: Path, command: str
+) -> None:
+    """bash runs both — the apostrophe is inside a comment — and shlex will
+    not split either. No names can be read, and that is a third answer: an
+    empty one is shaped exactly like a command that installs nothing."""
+    write_manifest(tmp_path, '[project]\nname = "mine"\ndependencies = []\n')
+    write_package_json(tmp_path, _PACKAGE_JSON)
+    assert rq.installs(command) == ()
+    assert rq.js_installs(command) == ()
+    assert rq.unreadable_install(command, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'git commit -m "Don\'t pin npm packages"',  # balanced: it splits
+        "echo don't",  # names no installer
+        "pip install requests",  # read, not unreadable
+    ],
+)
+def test_a_command_that_splits_or_names_no_installer_is_not_unreadable(
+    tmp_path: Path, command: str
+) -> None:
+    write_manifest(tmp_path, '[project]\nname = "mine"\ndependencies = []\n')
+    assert not rq.unreadable_install(command, tmp_path)
+
+
+def test_an_unreadable_install_with_no_manifest_reports_nothing(
+    tmp_path: Path,
+) -> None:
+    """Nowhere to read a declaration is not a declaration of nothing — the
+    same rule the readable case keeps."""
+    assert not rq.unreadable_install("pip install reqeusts # don't worry", tmp_path)
+    assert not rq.unreadable_install("pip install reqeusts # don't worry", None)

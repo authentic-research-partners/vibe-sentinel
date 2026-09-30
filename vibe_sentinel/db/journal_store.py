@@ -262,19 +262,26 @@ def save_review(
     enforced: bool,
     history_count: int,
     duration_ms: int,
+    decision: str = "",
 ) -> int | None:
     """Record one verdict. Returns None if this command already has one.
 
     A command gets one verdict — the one that was acted on. Re-running a
     review later produces a different opinion from a different model, and
     overwriting would erase what the gate actually did at the time.
+
+    ``decision`` is what the gate did — ``allow``, ``ask`` or ``deny`` — and
+    defaults to what ``enforced`` says, for the callers that only refuse.
     """
+    decision = decision or ("deny" if enforced else "allow")
+    if decision not in ("allow", "ask", "deny"):
+        raise ValueError(f"decision {decision!r} is not allow, ask or deny")
     conn.execute("BEGIN")
     try:
         cursor = conn.execute(
             "INSERT INTO command_reviews (command_id, reviewed_at, signals,"
             " verdict, reason, model, reviewed, mode, enforced, history_count,"
-            " duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            " duration_ms, decision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
             " ON CONFLICT DO NOTHING",
             (
                 command_id,
@@ -288,6 +295,7 @@ def save_review(
                 int(enforced),
                 history_count,
                 duration_ms,
+                decision,
             ),
         )
         if cursor.rowcount == 0:
@@ -338,6 +346,7 @@ def list_reviews(
             reviewed=bool(row["reviewed"]),
             mode=row["mode"],
             enforced=bool(row["enforced"]),
+            decision=row["decision"],
             history_count=row["history_count"],
             duration_ms=row["duration_ms"],
             command=row["command"],

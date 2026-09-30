@@ -15,7 +15,7 @@ import httpx
 from loguru import logger
 
 from benchmarks.harness import Condition, Suite, measure, question, report
-from vibe_sentinel.config import SentinelConfig
+from vibe_sentinel.config import DEFAULT_CONCURRENCY, SentinelConfig
 
 #: Fan-out widths swept by the concurrency suite. 1 is the baseline every
 #: speedup is against; 4 is what all four gates ship as their default; the
@@ -31,7 +31,7 @@ REQUESTS = 16
 
 #: Width for the two suites that are not sweeping it. The shipped default,
 #: so what they measure is the configuration people actually run.
-DEFAULT_WIDTH = 4
+DEFAULT_WIDTH = DEFAULT_CONCURRENCY
 
 
 def _shared(index: int) -> tuple[str, str]:
@@ -65,8 +65,8 @@ async def concurrency(
 ) -> Suite:
     """What the fan-out width is worth.
 
-    The question every ``concurrency = 4`` in the config is an unmeasured
-    answer to. A scan asks N questions and waits for all of them, so the
+    The question ``config.DEFAULT_CONCURRENCY`` is the measured answer to,
+    for one backend. A scan asks N questions and waits for all of them, so the
     metric is the wall clock of a fixed batch rather than throughput at
     saturation: what a person waits for is the last answer, not the mean.
     """
@@ -310,13 +310,7 @@ async def truncation(
     # wrong name on it is worse than no duration at all.
     fits, truncates = suite.measurements
     sent = requests * repeat
-    if truncates.truncated is None:
-        suite.note += (
-            "  NOT MEASURED: this backend publishes no metrics, so whether the "
-            "second arm truncated cannot be seen from here, and the gap below "
-            "is not attributable."
-        )
-    elif truncates.truncated < _TRUNCATING_FLOOR * sent:
+    if truncates.truncated < _TRUNCATING_FLOOR * sent:
         suite.note += (
             f"  NOT MEASURED: only {truncates.truncated} of {sent} requests in "
             f"the {budget}-token arm truncated, which moves a median by less "

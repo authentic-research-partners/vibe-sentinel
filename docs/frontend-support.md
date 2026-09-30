@@ -163,7 +163,11 @@ are the ones worth the most:
 ### Install-command parsing
 
 The `requirements.py` equivalent: `npm i`, `pnpm add`, `yarn add`, `bun add`,
-with their flag shapes. And the one Python has no counterpart for:
+with their flag shapes. That half is built: an install of a name
+`package.json` does not declare reaches `installing-undeclared-dependency`,
+the same danger pip's does, and a global tool install is not read. What is
+not built is workspace awareness — a sub-package's own `package.json` — and
+the one Python has no counterpart for:
 
 > **`npx` and `bunx` execute a registry package that no manifest declares and
 > no lockfile records.**

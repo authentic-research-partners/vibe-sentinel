@@ -81,7 +81,7 @@ Most teams match at least one of these, and the first run settles half of it: wh
 - **Stops dangerous commands before they run** — safety gate blocks `rm -rf`, undeclared installs, based on what that agent already did.
 - **Finds what's true now** — credentials at rest, dependency provenance, license policy. Reports every run until resolved.
 - **Keeps a command journal** — answers "what have the agents been doing?" with a record, not recollection.
-- **A local model does the judging, and nothing else** — the deterministic half of this tool exists to turn a repository into a question small enough for an 8B model to answer. It rates what the mechanisms already found; it never chooses what to measure, and it never leaves the machine.
+- **A local model does the judging, and nothing else** — the deterministic half of this tool exists to turn a repository into a question small enough for a small local model to answer. It rates what the mechanisms already found; it never chooses what to measure, and it never leaves the machine.
 
 **The combination necessary for intelligent, reliable, predictable vibe coding: model + agent + sentinel.** The model generates. The agent acts. The sentinel remembers what the repository is supposed to look like, records what happens, flags meaningful drift, and can stop an irreversible command before it runs.
 
@@ -197,7 +197,7 @@ One baseline shows drift at one scale, though: a directory gaining two modules a
 
 | | |
 |---|---|
-| **Hardware** | An OpenAI-compatible local backend — vLLM, Ollama, llama.cpp, LM Studio. A known-good setup is an 8B model on one NVIDIA GPU of about 20GB; on an Apple Silicon Mac it is Qwen3 14B under Ollama, or any other 12–14B local model. A scan makes a few small calls and none of them is long. A backend is required: judging is half of what this tool does, and a run that cannot reach one exits 2 rather than reporting what it managed without it. |
+| **Hardware** | A local model under Ollama, on macOS, Linux or Windows under WSL2 — or any other OpenAI-compatible backend, such as llama.cpp or LM Studio. The recommended model is Gemma 4 26B in its QAT build, about 15 GB, so 32 GB of memory or more; smaller models run and measured weaker — see [Evals](docs/evals.md). A scan makes a few small calls and none of them is long. A backend is required: judging is half of what this tool does, and a run that cannot reach one exits 2 rather than reporting what it managed without it. |
 | **Your codebase** | Untouched. This is a command you point at a repository, not a library you import into one, and it installs *beside* your project — conda, venv, uv, poetry, pyenv all left alone. |
 | **Setup** | Two installs per machine, one generated config file, one scan. The defaults measure the current directory and are usually right to start with. |
 | **Runtime** | ~52 ms per hooked tool call for the journal, which judges nothing and blocks nothing. A scan is a handful of subprocess runs and about four small model calls. |
@@ -212,7 +212,7 @@ One baseline shows drift at one scale, though: a directory gaining two modules a
 uv tool install vibe-sentinel     # beside your project, not into it
 
 # A local model is required — it decides which findings are real. Serve one
-# on any OpenAI-compatible endpoint, then point [llm] at it. See below.
+# with Ollama, or any OpenAI-compatible endpoint, then point [llm] at it.
 vibe-sentinel backend status      # ready? then everything under here works
 
 vibe-sentinel credentials         # what is true now — no history needed
@@ -233,12 +233,14 @@ Full instructions — the backend, the config, the journal, and how to route a c
 |---|---|
 | Getting started — install, backend, first scan, routing | [docs/getting-started.md](docs/getting-started.md) |
 | Gates — credentials, provenance, licences, command safety | [docs/gates.md](docs/gates.md) |
+| Threat model — what the safety controls defend against, what they do not, and the evidence | [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) |
 | Drift — probes, lenses, horizons, trends | [docs/drift.md](docs/drift.md) |
 | Use of the local model | [docs/use-of-local-model.md](docs/use-of-local-model.md) |
 | Adding a probe — the measurement, its question, and its cases | [docs/adding-a-probe.md](docs/adding-a-probe.md) |
 | Evals — how often the model's four judgements match a labelled corpus, as a rate rather than a pass | [docs/evals.md](docs/evals.md) |
 | History database | [docs/database.md](docs/database.md) |
 | Development and contributing | [docs/development.md](docs/development.md) |
+| Reporting a vulnerability | [SECURITY.md](SECURITY.md) |
 
 ## License
 

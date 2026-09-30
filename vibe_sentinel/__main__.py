@@ -628,28 +628,6 @@ def _add_backend(sub: Subparsers) -> None:
     p_bstop = _command(backend_sub, "stop", help="Run [llm] stop_command")
     p_bstop.add_argument("--config", help="Path to .vibe-sentinel.toml")
 
-    p_bmonitor = _command(
-        backend_sub,
-        "monitor",
-        help="Watch what the backend is doing — queue depth, KV cache, "
-        "prefix-cache hits, answers cut off at the token ceiling",
-    )
-    p_bmonitor.add_argument(
-        "--interval",
-        type=float,
-        default=2.0,
-        help="Seconds between ticks (default: 2.0)",
-    )
-    p_bmonitor.add_argument(
-        "--count",
-        type=int,
-        default=1,
-        help="Ticks to print, then stop (default: 1, a single snapshot). "
-        "The counters are cumulative, so two ticks tell you more than one; "
-        "give a large number and interrupt with Ctrl-C to watch a scan",
-    )
-    p_bmonitor.add_argument("--config", help="Path to .vibe-sentinel.toml")
-
 
 #: Every subcommand, in the order ``--help`` prints them. A command
 #: that is not here does not exist: there is one list, and adding to it

@@ -136,6 +136,21 @@ class Matrix(BaseModel):
         return sorted(seen)
 
 
+def enforce_decision(verdict: str) -> str:
+    """What ``enforce`` does with a verdict under ``no_verdict = "ask"``.
+
+    The hook's rule, restated for the evals that price it: ``unsafe`` is
+    refused, a verdict that is not one — ``unclear``, or none in time — is
+    asked, and ``safe`` passes. Kept beside the metrics rather than imported
+    from the hook, whose import graph is a budget.
+    """
+    if verdict == "unsafe":
+        return "refused"
+    if verdict in ("unclear", "unreviewed", "unanswered"):
+        return "asked"
+    return "allowed"
+
+
 class Outcome(BaseModel):
     """One case, under one measurement. The row a person reads to debug."""
 

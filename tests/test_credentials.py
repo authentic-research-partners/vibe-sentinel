@@ -379,7 +379,7 @@ def test_a_candidate_nobody_judged_fails_the_run(project: Path) -> None:
         "http://127.0.0.1:5001/v1",
         "http://[::1]:5001/v1",
         "http://0.0.0.0:8000/v1",
-        "http://vllm.localhost/v1",
+        "http://llm.localhost/v1",
     ],
 )
 def test_a_local_endpoint_is_allowed(endpoint: str) -> None:
