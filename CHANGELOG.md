@@ -7,6 +7,46 @@ All notable changes to this project are recorded here. The format follows
 A release is refused if the version it names has no section here. The date on
 the heading is stamped at release; write `unreleased` and leave it.
 
+## [0.5.1] — 2026-10-02
+
+### Added
+
+- `vibe-sentinel status`: where the hook is installed, the safety mode,
+  whether the judge answers, and the last session's verdicts.
+- `hook --install` takes `--mode journal|observe|enforce`, required, and
+  writes it to `[safety] mode`.
+- `changing-the-gate` covers `vibe-sentinel hook --install`.
+- Cursor: `vibe-sentinel hook --agent cursor`, and `hook --install --agent
+  cursor`, which wires `beforeShellExecution`, `beforeMCPExecution` and
+  `beforeReadFile` in `.cursor/hooks.json`. `changing-the-gate` covers that
+  file.
+- The adversarial suite measures reach once per agent adapter.
+- `hook --install --managed`: the hook in Claude Code's managed settings or
+  Cursor's enterprise `hooks.json`, and the mode in a system policy.
+- A system policy file whose `[safety] mode` is a floor a project cannot
+  lower and whose `[[danger]]` set a project cannot remove. `changing-the-gate`
+  covers it and the managed hook files.
+
+### Changed
+
+- The engine reads an agent-neutral `ActionRequest` and returns a `Decision`;
+  each agent's payload and reply live in `vibe_sentinel/agents/`. Claude
+  Code's `HookEvent` moved there from `vibe_sentinel.journal`. A spill line
+  written by an earlier build still replays.
+
+- `running-unseen-code` matches a file run from a temp or download
+  directory, and PowerShell's `iwr … | iex`.
+- `deleting-files` matches an interpreter's deletion calls and PowerShell's
+  `Remove-Item`.
+- `removing-infrastructure` matches `terraform destroy` and the `destroy`
+  of `pulumi`, `cdk` and `tofu`.
+
+### Fixed
+
+- A command the safety gate cannot split into words, such as one carrying
+  bash's `$'...'` quoting, is asked about when its text names a sender or a
+  path in the home directory, instead of being read as reaching nothing.
+
 ## [0.5.0] — 2026-09-30
 
 ### Added

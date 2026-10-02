@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vibe-sentinel"
-version = "0.5.0"
+version = "0.5.1"
 description = "Safeguards a codebase against the problems AI coding agents introduce: structural drift, secrets at rest, unvetted dependencies, and dangerous commands."
 requires-python = ">=3.13,<3.14"
 license = "MIT"
@@ -147,19 +147,16 @@ select = [
 "vibe_sentinel/backend.py" = ["T201"]
 # Probes speak a stdout protocol; print() is how they emit it.
 "vibe_sentinel/probes/*.py" = ["T201"]
-# Release gates run from the terminal; their report IS stdout. They are
-# also deliberately stdlib-only — a gate that audits the environment
-# should not import from it, so TID251's pydantic-over-dataclasses rule
-# (which exists for package models that cross boundaries) is waived for
-# their local frozen records.
-"scripts/*.py" = ["T201", "TID251"]
 # The one module in the package that may use dataclasses: the hook
-# payload's models. Same shape of reason as above — the PreToolUse hook
+# payload's models. The PreToolUse hook
 # runs once per tool call, and pydantic alone cost ~55 ms of it — for
 # validation this boundary never wants. It wants the opposite: a payload
 # field of an unexpected type must cost that field, not the whole event.
 # Full justification in vibe_sentinel/journal.py's docstring.
 "vibe_sentinel/journal.py" = ["TID251"]
+# Claude Code's payload, moved out of journal.py into its adapter: the same
+# boundary, the same per-call cost, the same reason.
+"vibe_sentinel/agents/claude_code.py" = ["TID251"]
 # Same reason again: `safety.py` decides whether to escalate in front of
 # every tool call, so the danger set has to load without building a
 # pydantic model. Its docstring carries the justification.

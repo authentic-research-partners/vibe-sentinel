@@ -94,6 +94,9 @@ LAYERS: tuple[tuple[str, frozenset[str]], ...] = (
                 "policy",
                 "db.connection",
                 "db.journal_store",
+                "agents",
+                "agents.claude_code",
+                "agents.cursor",
             }
         ),
     ),
@@ -127,7 +130,7 @@ LAYERS: tuple[tuple[str, frozenset[str]], ...] = (
     ),
     (
         "composition",
-        frozenset({"gates", "engine", "report", "hook", "db"}),
+        frozenset({"gates", "engine", "report", "hook", "db", "protection"}),
     ),
     (
         "entry",
@@ -297,3 +300,40 @@ def test_the_foundation_depends_on_nothing() -> None:
 def test_no_layer_is_empty(name: str) -> None:
     """A layer nobody is in is a layer nobody has to think about."""
     assert LAYERS[_RANK[name]][1]
+
+
+#: What reads an ``ActionRequest`` and decides, and so may know no agent's
+#: field names: the request and decision types, the journal, the gate.
+ENGINE = frozenset({"journal", "db.journal_store", "safety", "requirements"})
+
+#: Where an agent's adapter may be used: the hook that dispatches to one,
+#: the commands that install one or report what one wired, and the
+#: adapters themselves.
+ADAPTER_USERS = frozenset({"hook", "cli", "protection", "report", "__main__"})
+
+
+def _adapters(targets: set[str]) -> set[str]:
+    return {t for t in targets if t == "agents" or t.startswith("agents.")}
+
+
+def test_the_engine_knows_no_agent() -> None:
+    """The boundary step 3 of the plan exists to make: a second agent costs
+    an adapter file, never a branch in the gate. An engine module that
+    imports an adapter has learned one agent's field names."""
+    graph = _graph()
+    leaks = {m: _adapters(graph[m]) for m in ENGINE if _adapters(graph[m])}
+    assert not leaks, f"engine modules importing an agent adapter: {leaks}"
+
+
+def test_only_the_rim_uses_an_adapter() -> None:
+    graph = _graph()
+    users = {
+        m
+        for m, targets in graph.items()
+        if _adapters(targets) and not (m == "agents" or m.startswith("agents."))
+    }
+    assert users <= ADAPTER_USERS, (
+        f"adapters used outside the rim: {sorted(users - ADAPTER_USERS)}. "
+        f"Read the agent's payload in vibe_sentinel/agents/ and pass the "
+        f"engine an ActionRequest."
+    )

@@ -34,6 +34,7 @@ from vibe_sentinel import __main__ as main_mod
 from vibe_sentinel.__main__ import main
 from vibe_sentinel.db import journal_store
 from vibe_sentinel.db.connection import db_path, get_db, init_db
+from vibe_sentinel.agents.claude_code import HookEvent
 
 TINY_PROBE = "import json; print(json.dumps({'observations': [], 'summary': 'ok'}))"
 
@@ -462,10 +463,211 @@ def test_hook_print_config_is_the_settings_fragment(
 def test_hook_install_writes_settings_and_is_idempotent(
     project: Path, capfd: pytest.CaptureFixture[str]
 ) -> None:
-    assert main(["hook", "--install", str(project)]) == 0
+    assert main(["hook", "--install", str(project), "--mode", "journal"]) == 0
     assert "installed" in capfd.readouterr().out
-    assert main(["hook", "--install", str(project)]) == 0
+    assert main(["hook", "--install", str(project), "--mode", "journal"]) == 0
     assert "already installed" in capfd.readouterr().out
+
+
+def test_install_without_a_mode_explains_and_writes_nothing(
+    project: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """The state is chosen, never inherited: no mode, no install."""
+    assert main(["hook", "--install", str(project)]) == 2
+    out = capfd.readouterr().out
+    for choice in ("journal", "observe", "enforce"):
+        assert f"--mode {choice}" in out
+    assert not (project / ".claude" / "settings.json").exists()
+    assert not (project / ".vibe-sentinel.toml").exists()
+
+
+def test_install_writes_the_chosen_mode(
+    project: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    from vibe_sentinel.safety import configured_safety
+
+    assert main(["hook", "--install", str(project), "--mode", "observe"]) == 0
+    assert configured_safety(project)[0] == "observe"
+    assert main(["hook", "--install", str(project), "--mode", "journal"]) == 0
+    assert configured_safety(project)[0] == "off"
+    assert "mode = 'off'" in capfd.readouterr().out
+
+
+def _record_reviews(project: Path, verdicts: tuple[str, ...]) -> None:
+    """One recorded agent call per verdict, each with its review."""
+    with get_db(project) as conn:
+        for i, verdict in enumerate(verdicts):
+            command_id = journal_store.record_command(
+                conn,
+                HookEvent(
+                    hook_event_name="PreToolUse",
+                    session_id="s1",
+                    tool_use_id=f"t{i}",
+                    tool_name="Bash",
+                    cwd=str(project),
+                    tool_input={"command": f"cmd {i}"},
+                ).request(),
+                "2026-10-02T00:00:00+00:00",
+            )
+            assert command_id is not None
+            journal_store.save_review(
+                conn,
+                command_id=command_id,
+                reviewed_at="2026-10-02T00:00:00+00:00",
+                signals="x",
+                verdict=verdict,
+                reason="",
+                model="m",
+                reviewed=True,
+                mode="observe",
+                enforced=False,
+                history_count=0,
+                duration_ms=1,
+            )
+
+
+def test_install_explains_with_the_recorded_numbers(
+    project: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    _record_reviews(project, ("unsafe", "unclear", "safe", "safe"))
+    assert main(["hook", "--install", str(project)]) == 2
+    out = capfd.readouterr().out
+    assert "4 reviewed call(s)" in out
+    assert "1 would have been refused, 1 asked about, 2 allowed" in out
+
+
+def test_install_gives_no_preview_from_settings_it_could_not_read(
+    project: Path, capfd: pytest.CaptureFixture[str], logged: list[str]
+) -> None:
+    """An unreadable system policy leaves no_verdict unknown. A preview
+    computed from an assumed value would read like this project's own."""
+    from vibe_sentinel import paths
+
+    _record_reviews(project, ("unclear", "safe"))
+    policy = paths.system_policy_path()
+    policy.parent.mkdir(parents=True, exist_ok=True)
+    policy.write_text("[safety\n", encoding="utf-8")
+
+    assert main(["hook", "--install", str(project)]) == 2
+    out = capfd.readouterr().out
+    assert "would have been refused" not in out
+    assert "could not be read" in out
+    assert any("policy.toml" in m for m in logged)
+
+
+# --- status ----------------------------------------------------------------
+
+
+@pytest.fixture
+def status_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A home directory nobody's real settings live in, and a judge that
+    answers without a backend."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+
+    from vibe_sentinel import protection
+
+    async def answering(config: object) -> tuple[bool, str]:
+        return True, "serving: the-judge"
+
+    monkeypatch.setattr(protection, "check_endpoint", answering)
+    return home
+
+
+def test_status_says_nothing_is_installed_in_those_words(
+    project: Path, status_home: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["status", str(project)]) == 1
+    out = capfd.readouterr().out
+    assert "NOT INSTALLED" in out
+    assert "nothing is recorded" in out
+
+
+def test_status_names_where_the_hook_is_and_the_mode(
+    project: Path, status_home: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["hook", "--install", str(project), "--mode", "enforce"]) == 0
+    capfd.readouterr()
+    assert main(["status", str(project)]) == 0
+    out = capfd.readouterr().out
+    assert "Claude Code, project" in out
+    assert "installed, matcher '*'" in out
+    assert "mode enforce: refuses an unsafe call" in out
+    assert "no_verdict = ask" in out
+    assert "answering" in out
+
+
+def test_status_finds_a_hook_in_user_settings(
+    project: Path, status_home: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    settings = status_home / ".claude" / "settings.json"
+    settings.parent.mkdir()
+    settings.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "Bash",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "/opt/bin/vibe-sentinel hook",
+                                }
+                            ],
+                        }
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert main(["status", str(project)]) == 0
+    assert "installed, matcher 'Bash'" in capfd.readouterr().out
+
+
+def test_status_does_not_read_a_broken_settings_file_as_no_hook(
+    project: Path, status_home: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    (project / ".claude").mkdir()
+    (project / ".claude" / "settings.json").write_text("{not json", encoding="utf-8")
+    assert main(["status", str(project)]) == 1
+    assert "UNREADABLE" in capfd.readouterr().out
+
+
+def test_status_fails_when_the_gate_is_on_and_the_judge_is_silent(
+    project: Path,
+    status_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    from vibe_sentinel import protection
+
+    async def silent(config: object) -> tuple[bool, str]:
+        return False, "connection refused"
+
+    monkeypatch.setattr(protection, "check_endpoint", silent)
+    assert main(["hook", "--install", str(project), "--mode", "observe"]) == 0
+    capfd.readouterr()
+    assert main(["status", str(project)]) == 1
+    out = capfd.readouterr().out
+    assert "NOT ANSWERING" in out
+    assert "unreviewed" in out
+
+
+def test_status_does_not_read_a_broken_mode_as_off(
+    project: Path,
+    status_home: Path,
+    capfd: pytest.CaptureFixture[str],
+    logged: list[str],
+) -> None:
+    assert main(["hook", "--install", str(project), "--mode", "observe"]) == 0
+    _config(project, '[safety]\nmode = "enfroce"\n')
+    capfd.readouterr()
+    assert main(["status", str(project)]) == 2, "a misspelt mode is an error"
+    assert "mode off" not in capfd.readouterr().out
+    assert any("enfroce" in m for m in logged)
 
 
 # --- safety ----------------------------------------------------------------

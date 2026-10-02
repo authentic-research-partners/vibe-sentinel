@@ -1,246 +1,243 @@
 # Vibe Sentinel
 
-*A necessary component for vibe coding beyond the prototype.*
+Vibe Sentinel is a local-first security and governance layer for AI coding
+agents. It records agent activity, can enforce declared policies before tool
+execution, flags credential and dependency-provenance risks, and tracks
+structural changes across the repository's history.
 
-Frontier models are powerful, but they are not stable engineering controls. Their behavior can change between versions, and coding agents have a different job: make the change you asked for. Neither is responsible for remembering what your codebase is supposed to look like over time.
+Measurements are deterministic; your configured local model, such as Gemma,
+judges questions that require context. Claude Code and Cursor are the coding
+agent integrations, not the judge. Their hooks connect proposed actions to the
+same review engine; installation requires an explicit choice of journalling,
+observation or enforcement. Policy decisions and findings remain auditable.
 
-Vibe Sentinel adds an independent layer around that workflow. It uses deterministic checks together with a local, pinned model from a different model family. The machinery finds the facts; the model only judges the small questions that require context.
+## Why use it?
 
-There are three main pieces:
+An agent's task is to make the requested change. Your responsibility extends
+to what it runs, what it brings into the project, and what repeated changes
+leave behind. Reviewing the final diff is important, but does not answer all
+three questions.
 
-**Probes measure change.**  
-They record facts about your codebase on every scan: comment-to-code ratios, file sizes, module counts, dependency versions, coupling, or anything else you choose to measure. Those observations build a history, so Vibe Sentinel can see not only what changed since the last accepted baseline, but also slower movement over weeks or months.
+For a developer, Vibe Sentinel adds checks at those different points:
 
-A probe does not decide whether a change is good or bad. It just measures it.
+- **Before execution:** a deletion, upload or undeclared install can matter
+  before there is a commit to review. The optional safety gate reviews flagged
+  actions against declared dangers and recent command history.
+- **In the working tree and environment:** a credential can already be present,
+  an import can name an undeclared dependency, or an installed package can
+  change without a source diff. State gates report current findings; dependency
+  measurements record version and origin changes in the audited environment.
+- **Across weeks of edits:** each change can look reasonable while a directory
+  becomes a coupling hub or helpers accumulate somewhere they do not belong.
+  Recorded measurements and project-specific questions make cumulative movement
+  available for review, instead of relying on memory.
 
-**Lenses decide what that change means for your project.**  
-A lens watches one or more probes and asks the local model a question in your own words.
+For a CTO or engineering lead, the value is making expectations explicit and
+decisions inspectable. Declare which actions need scrutiny, which licences are
+acceptable, and which structural changes matter to your team. Built-ins cannot
+know which database is production or which directory must stay thin. Custom
+rules and questions let the checks reflect those distinctions.
 
-A file growing substantially may be perfectly normal. A directory steadily collecting unrelated code may not be. The measurements alone cannot know the difference, because that depends on how your repository is supposed to work.
+Exceptions also leave a decision: a scoped pin requires a reason and verification
+date, rather than silently hiding a finding. The local history keeps recorded
+tool requests, command reviews and repository measurements. It gives a team
+evidence to discuss when reviewing agent-assisted work—not a score claiming
+that the developers or their code are safe.
 
-The same probe can feed several lenses, and one lens can look across several probes. The lens does not search the repository for new problems; it can only judge changes the measurements already found.
+## What it does
 
-**Gates check what is true right now.**  
-They do not need history or a baseline. They can detect things such as credentials in the working tree, undeclared or suspicious dependencies, and licenses that violate your policy. Because these are current states rather than drift, gates work from the first run and keep reporting a finding until it is resolved or explicitly accepted.
-
-The **safety gate** goes one step further. It runs before an AI agent executes a command. It can use the command and the agent's recent history to decide whether an action is dangerous — for example, whether `rm -rf $TARGET` is deleting a build directory or something much more important. In `enforce` mode, it can stop the command before it runs. Blocking is off by default.
-
-So the basic model is simple:
-
-**Probes measure change. Lenses decide whether the change matters. Gates check the current state. The safety gate can stop an unsafe action.**
-
-Vibe Sentinel ships with the machinery, built-in probes and gates, and example lenses. But the questions that matter specifically to your repository are yours to define. Your architecture, your exceptions, and your risks are things a generic rule set cannot know.
-
-## Table of Contents
-
-- [GenAI-driven codebase maintenance and development challenges](#genai-driven-codebase-maintenance-and-development-challenges)
-  - [Invisible Structural Drift](#invisible-structural-drift)
-  - [Immediate Safety Risks](#immediate-safety-risks)
-  - [Supply Chain & Provenance Issues](#supply-chain--provenance-issues)
-- [Who Is Affected?](#who-is-affected)
-- [How Vibe Sentinel Helps](#how-vibe-sentinel-helps)
-- [What It Is Not](#what-it-is-not)
-- [How impactful are issues with uncontrolled GenAI development?](#how-impactful-are-issues-with-uncontrolled-genai-development)
-- [How Vibe Sentinel Works](#how-vibe-sentinel-works)
-- [What Vibe Sentinel can find and report](#what-vibe-sentinel-can-find-and-report)
-- [What It Costs to Adopt](#what-it-costs-to-adopt)
-- [Getting Started](#getting-started)
-- [Documentation](#documentation)
-- [License](#license)
-
-## GenAI-driven codebase maintenance and development challenges
-
-### Invisible Structural Drift
-- **Hundreds of "reasonable" edits**: Coding agents reshape your codebase quietly—directories grow past their purpose, code lands in wrong layers, modules become coupling hubs. No single commit looks wrong, but the cumulative effect is.
-- **Shifting conventions**: How a model splits modules, places helpers, chooses abstractions—those live in its weights. Upgrade the model, and your style guide changes under you, commit by commit.
-
-### Immediate Safety Risks
-- **Dangerous actions**: `rm -rf`, `curl | sh`, force-pushes, installing undeclared packages. These leave no diff to review.
-
-### Supply Chain & Provenance Issues
-- **Hallucinated packages**: Generated code references package names that do not exist, at measurable rates—registrable by anyone who sees the output.
-- **Malicious software**: Dependencies with suspicious or known-bad provenance.
-- **Versions that move on their own**: An agent downgrades a package to make an error stop, or a resolver picks differently. The manifest still says what it said and the lock file is untouched, so nothing in the repository records what you are actually running.
-- **Poisonous licenses**: AGPL or other disallowed licenses in your dependency tree.
-- **Exposed credentials**: Secrets committed before you started looking.
-
-## Who Is Affected?
-
-**Use Vibe Sentinel if an agent writes to your repository.** This includes Claude Code, Cursor, Copilot Chat, or anything else that commits code, installs packages, or runs shell commands in a loop you do not read call by call. That last condition is the entire requirement: if you already review every agent action individually, you are already serving as the sentinel yourself.
-
-**Use it if you lead a team that has adopted coding agents.** Six months of reasonable edits produces a codebase layout nobody chose, and this only becomes apparent when it is load-bearing and expensive to fix. A recorded baseline makes that cumulative change visible while it is still cheap to address, and the command journal answers *what have the agents been doing* with a record rather than a recollection.
-
-**Use it if you are responsible for what the agents pull in** — security, platform, whoever owns the supply chain. Generated code references packages that do not exist, at the rates shown above, and those names are registrable by whoever else reads the same output. The licence that arrives with a lockfile bump and the key already sitting in the tree get in the same way: nobody decided on any of them.
-
-Most teams match at least one of these, and the first run settles half of it: what is *true* of the tree needs no history. Drift is the other half, and it needs a second scan — which is the argument for taking the first one now.
-
-## How Vibe Sentinel Helps
-
-- **Records what your repository looks like** — establishes a baseline of structure, dependencies, patterns.
-- **Measures drift** — flags when directories, modules, comment ratios, coupling move beyond your tolerances, and when an installed dependency is at a version or from a source it was not at yesterday.
-- **Stops dangerous commands before they run** — safety gate blocks `rm -rf`, undeclared installs, based on what that agent already did.
-- **Finds what's true now** — credentials at rest, dependency provenance, license policy. Reports every run until resolved.
-- **Keeps a command journal** — answers "what have the agents been doing?" with a record, not recollection.
-- **A local model does the judging, and nothing else** — the deterministic half of this tool exists to turn a repository into a question small enough for a small local model to answer. It rates what the mechanisms already found; it never chooses what to measure, and it never leaves the machine.
-
-**The combination necessary for intelligent, reliable, predictable vibe coding: model + agent + sentinel.** The model generates. The agent acts. The sentinel remembers what the repository is supposed to look like, records what happens, flags meaningful drift, and can stop an irreversible command before it runs.
-
-## What It Is Not
-
-**It is not a linter, and it never judges whether your code is correct or good.** It measures how the codebase is *organized*, records that shape, and reports when that shape moves. It replaces nothing you already run: a linter, a type checker, a SAST scanner and a review process all read individual changes, which is the one thing this tool does not look at.
-
-**It is not a vulnerability scanner.** It records which version of each dependency is installed and reports when one moves; it never asks whether that version has a published CVE. That question is answered well already — pip-audit, Dependabot, osv-scanner — and its answer is true of a repository no agent has ever touched, which is the line everything here sits on the other side of. Worth knowing what those tools send in order to answer it: pip-audit queries an index once per installed package, so one run hands a third party the name and exact version of everything on the machine. This tool reads the same set through `importlib.metadata` and tells nobody.
-
-It judges two things, and neither of them is your code. The **safety gate** judges an agent's *action* before it runs — whether `rm -rf "$DIR"` is about to remove a build directory or a home directory is a question about what will happen, not about how the command is written. The **credentials gate** judges a *fact about the tree* — whether a string sitting in it would open something. Both have answers that do not depend on anyone's taste.
-
-
-## How impactful are issues with uncontrolled GenAI development?
-
-These results come from controlled research settings, not ordinary developer-session telemetry. They demonstrate the failure modes Vibe Sentinel is designed to address; they do not mean the same rates occur in every coding workflow.
-
-| Finding | Study context |
-|---|---|
-| **54.7–84.7% harmful safety-violation rate** | [Saber](https://arxiv.org/html/2606.01317v1) evaluated 13 coding-capable models across 716 executable tasks in Docker-sandboxed project workspaces. |
-| **82.5% harmful safety-violation rate when workspace warnings mattered** | Saber's contextual-warning scenario required agents to notice local evidence that made direct execution unsafe. |
-| **74.83% realized harm without a command guard** | [CARE](https://arxiv.org/html/2607.21642v2) tested 600 agent-generated, attack-intent commands in the RedCode-gen benchmark; 449 passed and executed successfully without a guard. |
-| **At least 5.2% vs. 21.7% hallucinated packages** | [Spracklen et al.](https://arxiv.org/abs/2406.10279) reported these averages for commercial and open-source models across 576,000 generated code samples. |
-
-## How Vibe Sentinel Works
-
-Three things measure, and none of them needs a model to do it. The local model is then asked one narrow question about what was found — it can rate, adjudicate or explain, and it can never add a finding the mechanism did not produce or drop one it did.
-
-```mermaid
-flowchart TB
-  CFG[".vibe-sentinel.toml<br/>· rules/*.toml"]
-  H["<b>hook</b><br/>an action, before it runs"]
-  P["<b>probes</b><br/>what moved since the baseline"]
-  G["<b>gates</b><br/>what is true of the tree now"]
-  M["the <b>local model</b> judges what one of the three found —<br/>never what to measure, and never skipped"]
-  DB[("<b>history.db</b><br/>every run recorded, never rebuilt")]
-  OUT["deny a command · report<br/>--update accepts drift · a pin settles a gate finding"]
-  CFG -- "dangers" --> H
-  CFG -- "probes · lenses" --> P
-  CFG -- "secrets · licence policy" --> G
-  H & P & G --> M --> OUT
-  H & P & G --> DB
-```
-
-What separates the checks is *when* the answer arrives, and whether the check can stop anything by itself.
-
-| When | Check | What it catches | Command |
-|---|---|---|---|
-| **Before the command runs** | Safety gate | Dangerous shell operations, and installs of package names no manifest declares, judged against what that agent already ran. The only check that can refuse an action — and it ships off by default | `vibe-sentinel safety` |
-| **As the agent works** | Command journal | Nothing. It records every tool call as it happens, which is what makes the review above answerable | `vibe-sentinel hook --install` |
-| **From the first run** | Credentials at rest | Keys and passwords in source files, `.env` files, credential stores, and state files | `vibe-sentinel credentials` |
-| | Dependency provenance | Phantom imports, undeclared dependencies, and suspicious package names | `vibe-sentinel packages` |
-| | License policy | Dependencies with unexpected or disallowed licenses | `vibe-sentinel licenses` |
-| **From the second run** | Structural drift | Directories, modules, code patterns, and the installed version and origin of every dependency, moving away from the recorded baseline — over a week or a month, the movement too slow for any single comparison, and the fitted direction no comparison of two points can show | `vibe-sentinel scan` |
-
-Every one of them exits `1` when it found something, and only the safety gate stops anything on its own. The rest stop nothing by themselves; routing one into a pre-commit hook, a CI job, or back into the coding session is what makes an exit code block something — see [Getting Started](docs/getting-started.md#routing-it-somewhere).
-
-The division of labour is the same in each case. A deterministic mechanism finds the facts; the model is asked one question about them.
-
-| Check | The mechanism decides | The model is asked |
+| Piece | Question | Result |
 |---|---|---|
-| `scan` (drift) | `compare()` produces the change list | how significant each change is |
-| `safety` | triage selects which commands are worth a look | one question per matched danger, with that agent's own history |
-| `credentials` | the rules find the candidate secrets | whether a candidate is live, from a prefix and its shape |
-| `licenses` | the resolver settles the SPDX expression | to draft the note on a pin, after the gate has decided |
-| `packages` | the declared graph and the installed set | whether two installed names an edit apart are two packages or one misspelling |
+| **Probes** | What changed? | Keyed measurements compared with an accepted baseline, older runs and fitted trends |
+| **Lenses** | Does that change matter here? | A severity and explanation, using questions your project declares |
+| **State gates** | What is true now? | Credentials, dependency provenance and licence-policy findings, reported on every scan |
+| **Command safety** | Should this action proceed? | A review against the agent's recent command history, before execution |
 
-That is what keeps the output reproducible, and why the model can be small and local. It is pinned, and from a different family than the one changing the codebase, so the measuring instrument stays independent of the thing it measures.
+Six built-in probes measure commentary ratios, module organization, discarded
+exceptions, structural patterns, file sizes, and installed dependency versions
+and origins. A custom probe can be any command that prints the observation
+protocol. Lenses supply project context: growth in a directory meant to stay
+thin can mean something different from growth in a directory designed to expand.
 
-The rules are yours for a related reason. A rule published widely enough enters the next training corpus, and a model trained on it writes code that satisfies it — at which point the rule stops measuring what it stood for. The built-in probes, dangers, secrets and lenses are a starting point rather than the answer: a rule you write layers over them, or replaces one by id, and what this tool then checks in your repository is something no training run has seen. One or two live in `.vibe-sentinel.toml`; past that, `rule_files` under `[probes]`, `[drift]`, `[safety]` and `[credentials]` takes a glob — `rules/*.toml` — and one directory holds all four kinds, because each loader reads its own half of a file.
+The measurements and comparison are reproducible. Model ratings can vary.
+A lens cannot add or remove a measured change. Credential and package-name
+reviews work differently: the model adjudicates candidates the rules found.
 
-So are the questions. A `[[danger]]` is a command shape the safety gate stops on and a `[[secret]]` is a key format the credentials gate looks for; each of those, like a `[[lens]]`, carries the question the model is actually asked about a match, and the drift, licence and package passes take a standing `guidance` note in front of theirs. A shipped list of verbs cannot know which of your database hosts is production, and a shipped question cannot know that two of your package names are meant to look alike.
+![Vibe Sentinel: declared policy guides command safety, state gates and structural drift. Command reviews can allow, ask or deny; scans report findings and changes. Local history records tool requests, verdicts and measurements, while pins and baseline updates make acceptance explicit.](docs/images/vibe-sentinel-overview.svg)
 
-## What Vibe Sentinel can find and report
+History supplies context for later reviews and comparisons. Pins record scoped
+exceptions in policy; accepting a baseline is a separate, deliberate decision.
 
-A **state** is what is true of the tree right now: this dependency is AGPL, this key is in the working directory, this import resolves to nothing. It needs no history, so it is answerable the first time you run the tool — and it is as true on the two-hundredth scan as on the first, which is why it is reported on every run.
+## What the findings look like
+
+A state needs no history. A credential already present on the first scan is
+still reported on later scans:
 
 ```text
 State
-  licenses: clean — 76 package(s) accepted, 0 finding(s); project licence MIT
-  packages: clean — 76 installed, 13 declared in uv:.venv; 0 finding(s)
   credentials: 1 failing — 105 file(s) read, 18 candidate(s), 1 failing
 
   [credentials] src/config.py — A cloud access key id  (tracked)
       | 12: AWS_ACCESS_KEY_ID = "<redacted: 20 chars, entropy 3.7>"
       -> cloud-access-key: the prefix and entropy are consistent with an issued key
-
-1 finding(s) stand. These are states, not drift: each one is reported
-again on every scan until the cause is removed or a pin records the decision.
 ```
 
-**Only a pin clears one, and a pin is not an ignore.** It is scoped to the rules it names, and `reason` and `verified` are required — so what a cleared finding leaves behind is a dated record of somebody having looked, rather than a suppression. Values are never printed, logged, or written to the history database; the excerpt above is what you see, and the model that judged it saw a short prefix and a shape. [Gates](docs/gates.md) has what each of the four checks does, how to configure the rules, and what clears a finding.
+Credential reviews estimate whether a candidate is real from redacted context;
+they do not test whether a key works against its provider. Remove the cause or
+record a scoped pin with a reason and verification date. Changing the drift
+baseline does not settle a gate finding.
 
-A **transition** is the other kind of finding: this directory gained four modules, this file doubled, this package's commentary ratio halved — or an installed dependency is at a different version than it was yesterday, which no diff shows, because a declared constraint lives in your manifest and a lock file lives in your repository but the version actually installed lives in neither. Reporting it once, when it happens, is right — and `scan --update` accepts it and moves the baseline.
+Drift needs a previous measurement:
 
 ```text
 Drift since 2026-09-01T15:59:11+00:00
-  + [high] new: vibe_sentinel/helpers: 14 comment lines / 14 code lines across 3 file(s)
-      A new directory with a commentary ratio of 1.0 appears, sharply
-      diverging from the codebase's overall 0.154 ratio.
-  + [high] new: vibe_sentinel/helpers: 3 module(s), 36 lines
-      The 'helpers' directory appears with 3 modules, suggesting a structural
-      shift to organize functionality previously scattered elsewhere.
-  + [medium] new: vibe_sentinel/helpers: 2 of 3 handler(s) discard the error
-      Two of the three handlers in the new directory discard what they
-      catch, against 0.12 for the package as a whole.
-
-vibe-sentinel: 5 change(s), 5 worth attention.
+  + [high] new: src/helpers: 3 module(s), 36 lines
+      A new helpers directory changes where shared code lives.
+  ~ [medium] version:requests: 2.32.5 -> 2.28.0
+      The installed version changed between scans.
 ```
 
-One baseline shows drift at one scale, though: a directory gaining two modules a week is under every tolerance between consecutive scans and a reorganization by Christmas. So a scan reads the same recorded series three ways — against the baseline, against the run a week or a month back, and as a fitted direction across many runs. What gets measured is yours: a **probe** is a command with declared parameters that prints JSON, and a **lens** is a question about the resulting report, asked in your own words. Six probes ship. [Drift](docs/drift.md) has the protocol, the horizons and trends in full, and what the thresholds were measured against.
+These are illustrative excerpts. Every scan is recorded; `scan --update`
+deliberately accepts the current measurements as the new baseline. Week and
+month comparisons and fitted trends expose slower movement without changing
+the baseline or independently failing a scan.
 
-## What It Costs to Adopt
+## Before an agent runs a command
 
-| | |
+The journal records tool calls before execution. The safety gate uses that
+history to review actions such as deletion, force-pushing, undeclared installs,
+uploads and changes to its own policy.
+
+The hook integrates with **Claude Code** and **Cursor**. Under Cursor it gates
+shell commands, MCP tools and file reads, but not file edits; the table in
+[Gates](docs/gates.md#which-agents-and-what-each-lets-the-gate-do) says what each
+agent lets it see. Scans can be used alongside other agents, but those agents do
+not automatically call this hook.
+
+Hook installation requires `--mode journal|observe|enforce`; without a mode,
+it explains the choices and writes nothing. `journal` records requests without
+safety review, `observe` also records verdicts without intervening, and `enforce`
+denies unsafe calls. An unclear or missing verdict asks for permission by
+default; Cursor file reads are denied instead because that event cannot ask.
+Some declared rules settle a verdict without a model call. An explicit
+`no_verdict = "allow"` can permit unjudged calls unless a system policy requires
+`ask`. Without a declared project or system mode, safety remains off.
+
+Run `vibe-sentinel status` to see hook locations, the effective safety mode,
+whether the judge answers, and the last session's verdicts. No installed hook
+is reported as `NOT INSTALLED`; unreadable settings are reported as unreadable,
+not mistaken for an absent hook.
+
+For centrally administered machines, `hook --install --managed --mode enforce`
+installs managed hooks and sets a system-policy minimum that projects cannot
+lower. System danger rules cannot be removed or overridden by project rules.
+This protection depends on administrator-owned hook and policy files: without
+permission to write them, installation prints the pending files and exits 2.
+See [managed installation](docs/gates.md#out-of-the-agents-reach) for paths and
+setup. It does not remove the agent's user privileges or prevent elevation;
+on WSL, the user-writable Claude Code managed-settings directory does not
+provide the same protection.
+
+Managed configuration protects policy from project-level changes; it does not
+make the gate a sandbox. The gate does not see every possible spelling of an
+action, and a model can be wrong. See the
+[threat model](docs/THREAT_MODEL.md) for measured coverage and remaining gaps.
+
+The journal records requests before execution, not proof that an action ran or
+succeeded. A local record in the agent's trust domain is not a tamper-proof audit
+trail. Keep independent access controls, sandboxing and protected logs where
+your risk requires them.
+
+## Evidence and limits
+
+Controlled research demonstrates relevant failure modes; these rates are not
+ordinary developer-session telemetry or measurements of Vibe Sentinel:
+
+| Finding | Study context |
 |---|---|
-| **Hardware** | A local model under Ollama, on macOS, Linux or Windows under WSL2 — or any other OpenAI-compatible backend, such as llama.cpp or LM Studio. The recommended model is Gemma 4 26B in its QAT build, about 15 GB, so 32 GB of memory or more; smaller models run and measured weaker — see [Evals](docs/evals.md). A scan makes a few small calls and none of them is long. A backend is required: judging is half of what this tool does, and a run that cannot reach one exits 2 rather than reporting what it managed without it. |
-| **Your codebase** | Untouched. This is a command you point at a repository, not a library you import into one, and it installs *beside* your project — conda, venv, uv, poetry, pyenv all left alone. |
-| **Setup** | Two installs per machine, one generated config file, one scan. The defaults measure the current directory and are usually right to start with. |
-| **Runtime** | ~52 ms per hooked tool call for the journal, which judges nothing and blocks nothing. A scan is a handful of subprocess runs and about four small model calls. |
-| **What leaves the machine** | Nothing. A credential excerpt refuses any endpoint that is not loopback, whatever the config says. The one exception is opt-in: `packages --online` asks a package index about names already flagged, and about the dependencies your `pyproject.toml` states publicly — never about the installed set. |
-| **What it replaces** | Nothing — see [What It Is Not](#what-it-is-not). |
+| 54.7–84.7% harmful safety-violation rate | [Saber](https://arxiv.org/html/2606.01317v1): 13 coding-capable models, 716 executable tasks in sandboxed project workspaces |
+| 74.83% realized harm without a command guard | [CARE](https://arxiv.org/html/2607.21642v2): 600 attack-intent commands in RedCode-gen |
+| At least 5.2% vs. 21.7% hallucinated packages | [Spracklen et al.](https://arxiv.org/abs/2406.10279): commercial and open-source models across 576,000 generated samples |
 
-**Pre-1.0.** The CLI and the `.vibe-sentinel.toml` format may change between minor versions. The history database migrates rather than breaks.
+Vibe Sentinel's own [evals](docs/evals.md) measure its rules, prompts and verdicts
+against labelled cases. Results are specific to the corpus, model and setup;
+they are not guarantees about arbitrary commands.
 
-## Getting Started
+It is **not a linter, code-quality reviewer or vulnerability scanner**.
+Keep your tests, type checker, code review and CVE tools. It records installed
+version changes but does not look up vulnerabilities in those versions.
+
+## What adoption requires
+
+| Area | Cost or boundary |
+|---|---|
+| Runtime | Python 3.13; install beside your project with `uv tool`, or inside the environment you want audited |
+| Model | A reachable OpenAI-compatible backend. The documented Gemma 4 26B QAT setup uses about 15 GB for the model; plan for 32 GB memory or more. Smaller models have different measured tradeoffs |
+| Latency | Journalling measured about 52 ms per call. Flagged commands may require model review, with an 8-second default safety timeout; cold loading can exceed it |
+| Environment scope | `packages`, `licenses` and `dependency-versions` inspect the interpreter running them. A separate tool environment measures its own installed packages |
+| Platforms | Linux, macOS and Windows under WSL2; native Windows is untested |
+| Privacy | Local inference by default. A remote model endpoint is configurable; credential excerpts require an additional explicit override. Package-index lookups require `--online` |
+
+Use a judge from a different model family if you want a separate perspective
+from the coding agent. Record the model you evaluated; a model name alone does
+not verify immutable weights.
+
+Vibe Sentinel is a CLI, not a library you need to import into your application.
+It writes configuration and local history rather than rewriting your source.
+Choose its execution environment deliberately: installation beside a project
+does not automatically audit that project's installed dependencies.
+
+**Pre-1.0:** the CLI and configuration format may change between minor versions.
+The history database uses versioned migrations.
+
+## Getting started
+
+**Development-version features:** explicit install modes, `status`, Cursor
+support and managed policy are implemented in this checkout but not yet
+released in the published 0.5.0 package. The commands below require this
+development version; use the [development setup](docs/development.md#setup)
+when working from this checkout. Released-package installation and backend
+setup are covered in [Getting Started](docs/getting-started.md).
 
 ```bash
-uv tool install vibe-sentinel     # beside your project, not into it
-
-# A local model is required — it decides which findings are real. Serve one
-# with Ollama, or any OpenAI-compatible endpoint, then point [llm] at it.
-vibe-sentinel backend status      # ready? then everything under here works
-
-vibe-sentinel credentials         # what is true now — no history needed
-vibe-sentinel scan                # the gates, plus the baseline for next time
-vibe-sentinel hook --install      # start the journal
+vibe-sentinel backend status
+vibe-sentinel scan
+# Choose the integration for the agent you use:
+vibe-sentinel hook --install --mode observe
+# Or, for Cursor:
+vibe-sentinel hook --install --agent cursor --mode observe
+vibe-sentinel status
 ```
 
-A run that cannot reach a model exits `2` and names the fix, rather than
-reporting the mechanical half as though it were the whole answer — which is a
-report of unjudged candidates, and that is shaped exactly like a report of a
-clean tree.
+The first scan records a baseline and runs state gates; licence enforcement
+requires a policy. Missing required model answers fail the scan instead of
+producing an apparently completed review. To block commits or CI, route the
+scan's exit code into that workflow. Only the installed safety hook can
+intervene directly in agent actions.
 
-Full instructions — the backend, the config, the journal, and how to route a check into pre-commit or CI — are in [Getting Started](docs/getting-started.md).
+For a team rollout, start with a baseline, state-gate policies and the journal.
+Use safety `observe` mode to review verdicts on your workflow before choosing
+`enforce`. Use managed installation where projects must not weaken a centrally
+declared policy, and verify the effective setup with `status`. Assign
+responsibility for findings and exceptions, route scan failures into the review
+or CI process, and back up the history. Installing the package alone does not
+establish an enforced team policy.
 
 ## Documentation
 
-| Topic | File |
+| Topic | Guide |
 |---|---|
-| Getting started — install, backend, first scan, routing | [docs/getting-started.md](docs/getting-started.md) |
-| Gates — credentials, provenance, licences, command safety | [docs/gates.md](docs/gates.md) |
-| Threat model — what the safety controls defend against, what they do not, and the evidence | [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) |
-| Drift — probes, lenses, horizons, trends | [docs/drift.md](docs/drift.md) |
-| Use of the local model | [docs/use-of-local-model.md](docs/use-of-local-model.md) |
-| Adding a probe — the measurement, its question, and its cases | [docs/adding-a-probe.md](docs/adding-a-probe.md) |
-| Evals — how often the model's four judgements match a labelled corpus, as a rate rather than a pass | [docs/evals.md](docs/evals.md) |
-| History database | [docs/database.md](docs/database.md) |
-| Development and contributing | [docs/development.md](docs/development.md) |
-| Reporting a vulnerability | [SECURITY.md](SECURITY.md) |
+| Installation, backend and first scan | [Getting started](docs/getting-started.md) |
+| Credentials, provenance, licences and command safety | [Gates](docs/gates.md) |
+| Coverage and residual risks | [Threat model](docs/THREAT_MODEL.md) · [Control mapping](docs/CONTROL_MAPPING.md) |
+| Probes, lenses, horizons and trends | [Drift](docs/drift.md) |
+| Model responsibilities and failures | [Use of the local model](docs/use-of-local-model.md) |
+| Custom measurements, questions and cases | [Adding a probe](docs/adding-a-probe.md) |
+| Measured quality and latency | [Evals](docs/evals.md) · [Benchmarks](benchmarks/README.md) |
+| Backups, migration and maintenance | [History database](docs/database.md) |
+| Contributing | [Development](docs/development.md) |
+| Frontend support and proposed extensions | [Frontend exploration](docs/frontend-support.md) |
+| Reporting a vulnerability | [Security](SECURITY.md) |
 
 ## License
 

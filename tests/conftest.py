@@ -67,6 +67,35 @@ _DULL: dict[str, dict[str, object]] = {
 
 
 @pytest.fixture(autouse=True)
+def system_dir(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """Where this test's system locations are: the system policy, Claude
+    Code's managed hook file, Cursor's enterprise hooks.
+
+    Never the real ones. A test that read this machine's system policy would
+    pass or fail by what an administrator wrote, and one that installed a
+    managed hook would install it for every session on the machine. A test
+    that needs a system policy writes one here; nothing is here otherwise.
+    """
+    from vibe_sentinel import paths
+
+    root = tmp_path_factory.mktemp("system")
+    monkeypatch.setattr(
+        paths, "system_policy_path", lambda: root / "vibe-sentinel" / "policy.toml"
+    )
+    monkeypatch.setattr(
+        paths,
+        "claude_managed_hook_path",
+        lambda: root / "ClaudeCode" / "managed-settings.d" / "vibe-sentinel.json",
+    )
+    monkeypatch.setattr(
+        paths, "cursor_enterprise_hooks_path", lambda: root / "Cursor" / "hooks.json"
+    )
+    return root
+
+
+@pytest.fixture(autouse=True)
 def stub_model(monkeypatch: pytest.MonkeyPatch) -> None:
     """Answer every model call, so no test needs a backend running."""
 

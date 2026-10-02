@@ -14,13 +14,23 @@ curl -LsSf https://astral.sh/uv/install.sh | sh                                 
 powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"  # Windows
 
 # the tool, once per machine
-uv tool install vibe-sentinel
-# or, from a clone of this repo: uv tool install .
+uv tool install --with-executables-from ast-grep-cli vibe-sentinel
+# or, from a clone: uv tool install --with-executables-from ast-grep-cli .
 ```
 
 `uv tool` fetches the 3.13 interpreter it needs and the probes run under it, so whatever Python your project runs on is left alone. If you already use pipx, `pipx install --python 3.13 vibe-sentinel` does the same.
 
-Two checks are exceptions by design: `packages` and `licenses` read the installed distributions of the interpreter executing them, because what is installed is what will actually run — see [gates.md](gates.md). When run beside your project, they report on the tool's own dependencies rather than yours, so run those two from the environment you want audited — the second install method below.
+`ast-grep-cli` supplies the executable required by the built-in `pattern-census`
+probe. `--with-executables-from` exposes its command on PATH as described in
+[uv's tool documentation](https://docs.astral.sh/uv/concepts/tools/#installing-executables-from-additional-packages).
+If ast-grep is already on PATH, omit that option. With pipx, install
+`ast-grep-cli` as a separate tool. A default scan without ast-grep records
+`pattern-census` as unmeasured.
+
+Three checks inspect the running interpreter's environment: `packages`,
+`licenses`, and the `dependency-versions` probe. A separate tool install reads
+its own installed dependencies, not those of the repository you point it at.
+Use the environment install below to audit your project's installed set.
 
 If your project's own environment is already on Python 3.13 and you would rather have the tool inside it — to run it in CI alongside your other dev dependencies, for example — activate that environment and install there instead:
 
@@ -137,9 +147,8 @@ its alibi.
 
 Only those four. The probes, the policies and the thresholds have no variable:
 they are statements about the project, identical on every machine, and a second
-way to set one would be a second answer to a question that has one. Nor does
-`allow_remote_model` — the credentials gate refuses a non-loopback endpoint
-whatever is set, and that refusal is not reachable by exporting something.
+way to set one would be a second answer to a question that has one. `allow_remote_model` also has no environment override: permitting credential
+excerpts to reach a remote endpoint requires an explicit credential-policy edit.
 
 Setting one to nothing (`export VIBE_SENTINEL_LLM_MODEL=`) is how a shell says
 "no value", so it leaves the file's setting standing.
@@ -192,8 +201,8 @@ A backend is required. Rating a change and adjudicating a credential candidate a
 
 ## 3. Find out what is true now
 
-These checks need no config file and no history — they answer on this run,
-against the backend from step 2:
+These checks need no history. Credentials and packages have defaults; licences
+require an acceptance policy, described in [Gates](gates.md#licence-policy):
 
 ```bash
 vibe-sentinel credentials     # keys and passwords sitting in the tree
@@ -201,12 +210,16 @@ vibe-sentinel packages        # imports that resolve to nothing, undeclared deps
 vibe-sentinel licenses        # dependencies your policy would not accept
 ```
 
-Each exits `0` clean, `1` with findings, `2` if the run itself failed — and a
-backend it cannot reach is a run that failed. `credentials` puts every candidate
-to the model, because deciding which pattern hits are real is half of what it
-does; `packages` asks only about two installed names one edit apart; `licenses`
-resolves without asking anyone and uses the model only for the note on a drafted
-pin. There is no flag that skips them. Whatever they find is what you would have shipped: remove the cause, or record a pin. A pin does not remove the finding — the gate still finds it and the report still prints it in a band of its own; what changes is that it stops counting towards the exit code, so the next person sees both the finding and the decision somebody made about it. What each check looks for, and what a pin must carry, are in [gates.md](gates.md).
+Each exits `0` with no failing findings, `1` with findings, and `2` if the run
+failed. Credentials need the model only for candidates not already settled by
+policy or declared verdicts; unanswered candidates fail the run. Packages ask
+about similar installed names: unusable individual answers leave findings,
+while a connection failure exits 2. Licences resolve mechanically and use the
+model only for a requested pin draft.
+Findings can include untracked files and development dependencies, so they do
+not by themselves describe a release artifact. Remove the cause or record a
+scoped pin after review. A pin keeps the finding visible while accepting it for
+the exit code; [Gates](gates.md#pins-are-not-ignores) explains the required fields.
 
 ## 4. Record the baseline
 
@@ -222,11 +235,21 @@ The config declares which probes run and where they point; the defaults measure 
 ## 5. Wire in the journal
 
 ```bash
-vibe-sentinel hook --install     # records every tool call to .claude/settings.json
+vibe-sentinel hook --install --mode observe   # wires .claude/settings.json, sets [safety] mode
+vibe-sentinel status                          # what is protecting the repository now
 vibe-sentinel commands --sessions
 ```
 
-Recording is all it does, at ~52 ms per hooked tool call. The safety gate that reads the journal ships as `off`; turn it on with `[safety] mode = "observe"` to see verdicts without blocking anything, and `"enforce"` when you want it to refuse commands.
+The hook records calls in `.vibe-sentinel/history.db`, at about 52 ms per call
+in the recorded measurements. `--mode` is required, because what the hook does is a choice rather than something inherited:
+
+- `journal` records every tool call and judges none.
+- `observe` judges each flagged call and records the verdict, and blocks nothing.
+- `enforce` refuses an unsafe call and asks you about one with no verdict.
+
+Start with `observe`. It measures how often the gate would stop work on your own traffic before anything is stopped; `vibe-sentinel hook --install` with no mode prints what enforce would have done with the verdicts recorded so far. `vibe-sentinel status` says where the hook is installed, which mode is in force, whether the judge answers, and how the last session's calls were judged — and says plainly when no hook is installed.
+
+An agent cannot make this choice for you: `vibe-sentinel hook --install` run by an agent is refused under `enforce`, like an edit to the config.
 
 ## 6. Check for drift later
 
@@ -239,7 +262,9 @@ A scan that finds drift does not become the new baseline. `scan --update` accept
 
 ## Routing it somewhere
 
-None of the checks stops anything on its own; each exits `1` when it has findings, and that is the whole interface. A check becomes a gate when you route it:
+The scan and standalone state gates report through exit codes; the installed
+safety hook can directly ask about or deny agent calls under `enforce`.
+Route a scan or state gate into a workflow to make its findings block work:
 
 | Where | How |
 | --- | --- |

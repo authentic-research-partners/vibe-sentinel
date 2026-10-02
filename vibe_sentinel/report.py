@@ -19,7 +19,6 @@ import textwrap
 from typing import TYPE_CHECKING
 
 from vibe_sentinel.journal import (
-    HOOK_EVENT_FIELDS,
     AgentSessionRecord,
     CommandRecord,
     ReviewRecord,
@@ -37,6 +36,7 @@ from vibe_sentinel.trends import ANOMALY_MIN_RUNS, ANOMALY_Z, SIGNIFICANCE
 if TYPE_CHECKING:  # pragma: no cover - annotations only, never imported
     from vibe_sentinel.credentials import Adjudication, Policy, Secret
     from vibe_sentinel.db.maintenance import DatabaseSize, HealthReport, PruneResult
+    from vibe_sentinel.protection import Protection
 
 _SEVERITY_RANK = {"high": 0, "medium": 1, "low": 2, "info": 3}
 _KIND_MARK = {
@@ -716,6 +716,8 @@ def render_observed_fields(scanned: int, fields: list[tuple[str, int]]) -> None:
         print("No commands recorded yet — nothing to check the payload against.")
         return
 
+    from vibe_sentinel.agents.claude_code import HOOK_EVENT_FIELDS
+
     declared = set(HOOK_EVENT_FIELDS) - {"tool_input"}
     seen = dict(fields)
     print(f"Payload fields carrying a value, over the last {scanned} event(s):\n")
@@ -1039,7 +1041,7 @@ def render_pattern_match(
     """
     if scanned == 0:
         print("No commands recorded yet, so there is nothing to try it against.")
-        print("  Install the hook first: vibe-sentinel hook --install")
+        print("  Install the hook first: vibe-sentinel hook --install --mode observe")
         return
 
     already = sum(1 for _, flagged in matched if flagged)
@@ -1203,3 +1205,89 @@ def render_secret_rules(secrets: tuple[Secret, ...]) -> None:
             if origin:
                 print(origin)
     print(f"\n{len(secrets)} rule(s) active.")
+
+
+def render_protection(report: Protection, meaning: dict[str, str]) -> None:
+    """``vibe-sentinel status``: what protects this repository, part by part.
+
+    No hook anywhere is said in those words and first, because it is the one
+    state that must never read as quiet: with no hook, nothing below it is
+    recording anything.
+    """
+    print("Hook")
+    if not report.installed:
+        print(
+            "  NOT INSTALLED — no agent's tool calls are recorded or judged here.\n"
+            "  Install it with: vibe-sentinel hook --install --mode observe"
+        )
+    for site in report.sites:
+        where = f"{site.agent}, {site.scope}: {site.path}"
+        if site.error:
+            print(f"  {where}\n    UNREADABLE — {site.error}")
+        elif site.matchers:
+            matchers = ", ".join(repr(m) for m in site.matchers)
+            label = "events" if site.agent == "Cursor" else "matcher"
+            print(f"  {where}\n    installed, {label} {matchers}")
+        elif site.present:
+            print(f"  {where}\n    no hook")
+    for agent, n in report.repeated.items():
+        print(
+            f"  {agent}'s hook is installed at {n} levels, so each call runs it "
+            f"{n} times. Keep the managed or enterprise one and remove the rest."
+        )
+    print()
+
+    print("System policy")
+    if report.system_error:
+        print(f"  UNREADABLE — {report.system_error}")
+    elif not report.system_present:
+        print(
+            f"  none at {report.system_path}: the project's own config is all there is"
+        )
+    else:
+        floor = report.system_mode or "not set"
+        print(f"  {report.system_path}")
+        print(
+            f"    mode floor {floor}, no_verdict {report.system_no_verdict or 'not set'}, "
+            f"{report.system_dangers} danger(s) no project can remove"
+        )
+    print()
+
+    print("Safety gate")
+    if report.mode_error:
+        print(f"  UNREADABLE — {report.mode_error}")
+    else:
+        if report.installed:
+            print(f"  mode {report.mode}: {meaning.get(report.mode, '')}")
+        else:
+            print(
+                f"  mode {report.mode}, with no hook to apply it: nothing is recorded"
+            )
+        if report.mode == "enforce":
+            print(f"  no_verdict = {report.no_verdict}")
+    print()
+
+    print("Judge")
+    state = "answering" if report.judge_reachable else "NOT ANSWERING"
+    print(f"  {report.model} at {report.endpoint}: {state} — {report.judge_detail}")
+    if not report.judge_reachable and report.mode not in ("", "off"):
+        print(
+            "  With no answer the gate records 'unreviewed' and, under enforce, "
+            "asks you. Check it with: vibe-sentinel backend status"
+        )
+    print()
+
+    print("Last session")
+    if report.journal_error:
+        print(f"  UNREADABLE — {report.journal_error}")
+    elif not report.session_id:
+        print("  no verdicts recorded yet")
+    else:
+        reviewed = sum(report.session_counts.values())
+        print(
+            f"  {report.session_id}: {report.session_commands} tool call(s), "
+            f"{reviewed} reviewed"
+        )
+        for key, n in sorted(report.session_counts.items(), key=lambda kv: -kv[1]):
+            verdict, decision = key.split("/", 1)
+            print(f"    {n:>4}  {verdict}, {decision}")

@@ -1,12 +1,16 @@
 # Frontend support — design exploration
 
-**Status: mostly exploration.** Two pieces of this have shipped and are marked
+**Status: mostly exploration.** Three pieces of this have shipped and are marked
 below; everything else records what TypeScript/JavaScript and React support
 *could* look like, and why each piece would earn its place under the rules the
 rest of the tool already follows. Read [drift.md](drift.md) and
 [gates.md](gates.md) first; the vocabulary here is theirs.
 
 **Shipped so far:**
+
+- **Undeclared npm-family installs** — names passed to npm, pnpm, yarn and bun
+  are checked against the root `package.json`. Workspace manifests and
+  `npx`/`bunx` execution are not covered.
 
 - **Dangers for the JavaScript toolchain** — publishing, deploying, forcing a
   resolution, exposing a dev server, with lock file and dependency tree as
@@ -18,7 +22,7 @@ rest of the tool already follows. Read [drift.md](drift.md) and
 
 Deliberately not shipped with them: a danger on `npx`. The question worth
 asking is whether the package it runs is one any manifest declares, which
-needs the npm side of the manifest reader below — a pattern alone fires on
+needs executable-resolution handling beyond the shipped install parser — a pattern alone fires on
 `npx tsc`, which is ordinary work.
 
 ## Table of Contents
@@ -50,23 +54,25 @@ More than it looks like. The core carries no language assumption:
   the marker table, the category machinery and the SPDX `AND`/`OR` evaluator
   in `licenses.py` read strings. Only the *source* of those strings is
   Python-specific.
-- **`file-length` works today** with `CATEGORIES` and `FILE_GLOB` pointed at
-  `*.ts,*.tsx`.
+- **`file-length` works today** with `CATEGORIES = "code=*.ts,*.tsx"`.
+  It has no `FILE_GLOB` parameter.
 - **The journal and the safety gate are already ecosystem-agnostic** — they
   judge shell commands, and a `[[danger]]` is a regex plus a question in your
   own words.
 
 ## Where the Python coupling actually lives
 
-Five places, and only five:
+The remaining Python-specific readers are:
 
 | Module | The assumption |
 |---|---|
 | `packages.py` | `importlib.metadata` for the installed set, `pyproject.toml` for the declared set |
 | `probes/dependencies.py` | `importlib.metadata` for versions and origins |
-| `requirements.py` | `pyproject.toml` shapes, and pip/uv/poetry argv parsing |
 | `licenses.py` | Trove classifiers and `importlib.metadata` — but *only* as the input source |
 | `probes/{comments,modules,handlers}.py` | Python's `ast` and `tokenize` |
+
+`requirements.py` also reads root `package.json` declarations for the safety
+gate; that does not add npm installed-set auditing to `packages.py`.
 
 Everything else — `engine.py`, `inventory.py`, `compare()`, `trends.py`,
 `horizons.py`, the database, the pin machinery, the report — is indifferent to
@@ -153,8 +159,7 @@ your machine.
 ### Declared set
 
 `package.json` `dependencies` / `devDependencies` / `peerDependencies` /
-`optionalDependencies`, plus `workspaces`. The two fields with no pip analogue
-are the ones worth the most:
+`optionalDependencies`, plus `workspaces`. The override fields are a separate proposed measurement:
 
 - **`overrides` / `resolutions`.** An agent silences a peer-dependency
   conflict by pinning a transitive package. One line, in a field nobody

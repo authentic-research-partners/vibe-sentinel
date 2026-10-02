@@ -90,8 +90,9 @@ it.
 - **The hook's import graph is a budget.** `vibe-sentinel hook` runs once per
   tool call, so it loads neither pydantic, loguru, nor httpx, and a test asserts
   they stay out.
-- **Pydantic, not dataclasses** (`dataclasses` is banned in ruff config), and
-  **loguru, not logging**. `print()` only where stdout is the output channel.
+- **Pydantic for boundary schemas; loguru for logging.** The journal payload
+  and safety danger models have explicit dataclass exceptions to keep the hook's
+  import cost low. `print()` belongs only in declared output modules.
 - **A failed probe is recorded, not raised** — one broken template must not lose
   the other probes' measurements.
 - **A structural check resolves every unknown the quiet way.**
@@ -112,7 +113,8 @@ language-agnostic — a probe is any command that prints the JSON protocol, and 
 journal and most of the safety gate match command text. The shipped probes
 that parse code (`commentary-ratio`, `module-organization`,
 `silent-exceptions`) and the `licenses` and `packages` gates are Python-only,
-and so is the `undeclared-install` danger, which reads `pyproject.toml`;
+while `undeclared-install` reads both `pyproject.toml` and root `package.json`
+for Python and npm-family installs;
 a danger may instead carry `requires`, naming one file that must be at the root
 for it to apply at all — which is how the npm entries stay out of a Python
 repository's set rather than sitting in it unable to match;

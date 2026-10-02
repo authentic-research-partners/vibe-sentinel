@@ -22,7 +22,7 @@ from vibe_sentinel.db.migration import (
     cleanup_old_backups,
     list_backups,
 )
-from vibe_sentinel.journal import HookEvent
+from vibe_sentinel.agents.claude_code import HookEvent
 from vibe_sentinel.schemas import DriftReport, Observation, ProbeResult, Snapshot
 
 
@@ -74,7 +74,9 @@ def _journal(project: Path, entries: list[tuple[str, int]]) -> None:
     """Record ``(command, age_in_days)`` pairs into the journal."""
     with get_db(project) as conn:
         for command, age in entries:
-            journal_store.record_command(conn, _event(command), _days_ago(age))
+            journal_store.record_command(
+                conn, _event(command).request(), _days_ago(age)
+            )
         # record_command stamps the actor with "now"; age the row so the
         # session sweep can see it as old too.
         oldest = min(age for _, age in entries)

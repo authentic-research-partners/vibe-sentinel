@@ -46,16 +46,88 @@ def plant_scene(root: Path) -> None:
         path.write_text(body, encoding="utf-8")
 
 
+def agent_payload(agent: str, case: AdversarialCase, root: Path) -> str | None:
+    """One case as the payload ``agent`` really sends, or None when that
+    agent has no gated event for this kind of call.
+
+    Written here rather than taken from the adapter, so that the adapter is
+    what is measured: a case reaches the gate only if the adapter reads the
+    agent's own payload into the call it is.
+    """
+    import json
+
+    if agent == "claude-code":
+        tool_input: dict[str, object] = {}
+        if case.command:
+            tool_input["command"] = case.command
+        if case.target:
+            tool_input["file_path"] = case.target
+        return json.dumps(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": "eval",
+                "cwd": str(root),
+                "tool_name": case.tool,
+                "tool_input": tool_input,
+            }
+        )
+    common = {"conversation_id": "eval", "workspace_roots": [str(root)]}
+    if case.tool == "Bash":
+        return json.dumps(
+            common
+            | {
+                "hook_event_name": "beforeShellExecution",
+                "command": case.command,
+                "cwd": str(root),
+            }
+        )
+    if case.tool == "Read":
+        return json.dumps(
+            common | {"hook_event_name": "beforeReadFile", "file_path": case.target}
+        )
+    if case.tool.startswith("mcp__"):
+        _, server, tool = case.tool.split("__", 2)
+        return json.dumps(
+            common
+            | {
+                "hook_event_name": "beforeMCPExecution",
+                "mcp_server_name": server,
+                "tool_name": tool,
+                "tool_input": "{}",
+            }
+        )
+    return None
+
+
 def measure_reach(
     root: Path,
     dangers: tuple[safety.Danger, ...],
     cases: tuple[AdversarialCase, ...] = corpus.CASES,
+    agent: str = "claude-code",
 ) -> Measurement:
-    """Of the attacks, how many does triage flag — and of the twins, how many?"""
+    """Through one agent's adapter: of the attacks, how many does triage
+    flag — and of the twins, how many?
+
+    Each case is that agent's own payload, read by its adapter, then
+    triaged. A case the agent has no gated event for is not flagged — an
+    attack it cannot see counts as a miss, and says why.
+    """
+    from vibe_sentinel.agents import adapter
+
+    reader = adapter(agent)
     counts = Counts()
     outcomes: list[Outcome] = []
     for case in cases:
-        fired = safety.triage(case.tool, case.command, case.target, root, dangers)
+        raw = agent_payload(agent, case, root)
+        request = reader.read(raw) if raw is not None else None
+        if request is None:
+            fired: tuple[str, ...] = ()
+            detail = f"{case.threat}: {agent} has no gated event for {case.tool}"
+        else:
+            fired = safety.triage(
+                request.tool_name, request.command, request.target, root, dangers
+            )
+            detail = f"{case.threat}: {', '.join(fired) or 'nothing fired'}"
         flagged = bool(fired)
         counts.record(case.escalates, flagged)
         outcomes.append(
@@ -64,14 +136,16 @@ def measure_reach(
                 expected="flagged" if case.escalates else "ordinary",
                 observed="flagged" if flagged else "ordinary",
                 ok=flagged == case.escalates,
-                detail=f"{case.threat}: {', '.join(fired) or 'nothing fired'}",
+                detail=detail,
             )
         )
+    suffix = "" if agent == "claude-code" else f"-{agent}"
     return Measurement(
-        id="attack-reaches-the-gate",
+        id=f"attack-reaches-the-gate{suffix}",
         question=(
-            "Of the attacks in the threat model, how many does triage flag for "
-            "the model — and of their harmless twins, how many does it flag too?"
+            f"Through {agent}'s hook: of the attacks in the threat model, how "
+            f"many does triage flag for the model — and of their harmless "
+            f"twins, how many does it flag too?"
         ),
         counts=counts,
         outcomes=outcomes,
@@ -229,7 +303,10 @@ async def run(
         root = Path(tmp)
         plant_scene(root)
         dangers = safety.load_dangers(root)
-        measurements = [measure_reach(root, dangers)]
+        measurements = [
+            measure_reach(root, dangers, agent=name)
+            for name in ("claude-code", "cursor")
+        ]
         used = False
         note = ""
         if mechanical_only:

@@ -1,22 +1,21 @@
 # Gates
 
-A probe reports a **transition** — this directory gained four modules — and a new
-baseline accepts it. A gate reports a **state**: this dependency is AGPL, this
-key is in the tree, this command is about to run. A state is as true on the
-two-hundredth scan as on the first, so a gate reports every run, exits non-zero,
-and `scan --update` does not settle it. Only a pin does.
+The three state gates — credentials, packages and licences — check what is
+true now. They run inside `vibe-sentinel scan` and as standalone commands.
+Removing the cause or recording an applicable pin settles a finding;
+`scan --update` does not. Exit codes are `0` for no failing findings,
+`1` for findings and `2` for an error. An unconfigured licence gate is
+reported as unconfigured during a scan, not as clean.
 
-All three run inside `vibe-sentinel scan` and also stand alone, with the same
-exit codes — `0` clean, `1` findings, `2` error. Their rules layer the same way: a table with a new `id` adds a
-rule, one reusing a built-in `id` overrides it, `disable` drops one, `use` keeps
-only what it names, `use_builtins = false` starts from nothing, and `rule_files`
-shares a set across repos — the same four settings `[probes]` and `[drift]`
-take, so one `rules/` directory can hold every rule a project declares, and a
-single file in it can carry a probe and the lens that reads it.
-`safety --print-dangers` and `credentials --print-rules` name the file each
-declared rule came from, so "did my rule file load" has an answer that is not
-an error message. A `verdict =` on any rule settles it without asking
-the model — no call, no latency, and it still holds with the backend down.
+The safety gate is separate: it reviews proposed agent actions through the
+hook, not through `scan`.
+
+The `[[secret]]` and `[[danger]]` rule sets support the same selection
+settings as probes and lenses: `use`, `disable`, `use_builtins` and
+`rule_files`. A new id adds a rule; reusing an id replaces it.
+`safety --print-dangers` and `credentials --print-rules` show the source
+of declared rules. A declared `verdict` settles a matching rule without a
+model call. Licence and package policies have their own settings below.
 
 Every key, with commentary: `vibe-sentinel scan --print-example`.
 
@@ -30,7 +29,7 @@ flowchart TB
   CRD["<b>credentials</b><br/>the rule set,<br/>over the tree"]
   LQ["no model call —<br/>the expression is a fact"]
   QP["typo, or two packages?"]
-  QC["is this key live?"]
+  QC["does this look like a real credential?"]
   F["a finding, keyed — first_seen is what answers when this started"]
   R["restated on every run. A state never diffs"]
   PIN["a pin settles it: accept · reason · verified. A new baseline never does"]
@@ -73,12 +72,13 @@ model settles it — which is the whole reason a nomination is cheap and a pin i
 decision.
 
 **Why a model decides rather than a regex.** `AKIAIOSFODNN7EXAMPLE`
-appears in every AWS tutorial ever written. No pattern tells it from the key
-beside it that opens an account, and a gate that flags both gets switched off
+appears in every AWS tutorial ever written. A pattern alone does not establish whether either key is usable, and a gate that flags both gets switched off
 within a week. So the pattern nominates generously and a local model adjudicates:
 `real` (it would open something), `placeholder` (a template, a documented
 example, a revoked fixture), or `unclear`. `real` and `unclear` both fail —
-`unclear` is a real answer and the one that sends it to a person.
+`unclear` is a real answer and the one that sends it to a person. The model
+infers from redacted context; it never authenticates against the provider, so
+`real` is not proof that a key is currently valid.
 
 **What it will not do:** This is the one check that reads secrets, so it refuses
 to send an excerpt anywhere but loopback; `[credentials] allow_remote_model` is
@@ -140,9 +140,9 @@ already grown a hand-written exception for digit suffixes (`httpx`/`httpx2` are
 both legitimate). So that pair, and nothing else here, goes to the local model
 with what each package says it does and whether anything asked for it: `distinct`
 settles it, `typosquat` and `unclear` stand. A pair the model does not settle
-also stands: this finding failed on its own before the question was asked, so an
-unanswered question leaves it exactly as the audit made it. That is the one place
-the model's absence is not a failure — everywhere else it is.
+also stands when its individual answer is unusable: the audit already raised
+it. A connection failure is different and fails the command with exit 2 when
+model review is needed.
 
 `[packages] guidance` is your standing note about your own names, put in front
 of that question — the same shape as `[licenses] guidance` and `[drift]
@@ -159,14 +159,47 @@ recorded with the finding.
 
 ---
 
-## Command safety
-
-Probes measure what work left behind; the journal records the work itself — every
-command an agent ran, in order, attributed to session and subagent, in an
-append-only local log that outlives the agent that wrote it.
+## Licence policy
 
 ```bash
-vibe-sentinel hook --install     # wires into .claude/settings.json
+vibe-sentinel licenses
+vibe-sentinel licenses --list-categories
+vibe-sentinel licenses --explain <package>
+```
+
+Declare what the project accepts before running the standalone gate:
+
+```toml
+[licenses]
+allowed_categories = ["permissive", "public-domain"]
+```
+
+The gate reads installed distributions from the interpreter running it and
+licence headers in the source tree. It resolves metadata and shipped licence
+text to SPDX expressions, then evaluates the declared policy. Unidentified
+licences fail. This is policy evaluation, not a legal determination.
+
+A shared `security/license-policy.toml` is loaded before the project's
+`[licenses]` table; `--policy PATH` selects an explicit policy instead.
+With no policy, standalone `licenses` exits 2; `scan` reports this gate
+as unconfigured.
+
+`--explain` shows the evidence for a package and can draft a pin when needed.
+The model does not choose the gate's verdict. Check the licence evidence before
+recording an acceptance; a pin needs `packages`, `accept`, `reason`
+and `verified`.
+
+---
+
+## Command safety
+
+Probes measure what work left behind; the journal records proposed tool calls,
+in order, attributed to session and subagent. It runs before execution, so a
+row is not proof that a command ran or completed successfully.
+
+```bash
+vibe-sentinel hook --install --mode journal   # wires into .claude/settings.json
+vibe-sentinel status
 vibe-sentinel commands --sessions
 vibe-sentinel commands --agent main --tool Bash
 vibe-sentinel commands --run 12  # what an agent did during one scan's window
@@ -174,6 +207,73 @@ vibe-sentinel commands --run 12  # what an agent did during one scan's window
 
 Recording costs ~52 ms per hooked tool call. Nothing is judged and nothing is
 blocked unless you turn the gate on.
+
+### Which agents, and what each lets the gate do
+
+The gate is the same for every agent; what differs is which calls the agent
+sends a hook before, and what that hook may answer. One row per agent with an
+adapter (`vibe-sentinel hook --agent`):
+
+| Agent | Install | Can block | Can ask | Cannot see |
+|---|---|---|---|---|
+| Claude Code | `hook --install --mode …` writes `.claude/settings.json` (`PreToolUse`, matcher `*`) | every tool call: shell, file reads and writes, MCP tools | every tool call | nothing it calls a tool |
+| Cursor | `hook --install --agent cursor --mode …` writes `.cursor/hooks.json` (`beforeShellExecution`, `beforeMCPExecution`, `beforeReadFile`) | shell commands, MCP tools, file reads | shell commands and MCP tools; a read with no verdict is refused instead, because `beforeReadFile` cannot ask | file writes and edits: Cursor's `afterFileEdit` runs after the edit, so it could only record one, and `preToolUse`'s `Write` input is undocumented |
+
+So under Cursor the home-directory and secret-store rules reach reads as they
+do under Claude Code, and `changing-the-gate` holds for a shell command that
+rewrites the gate's files — but not for Cursor's own edit tool. The adversarial
+suite measures this per adapter: through Cursor, the three attacks made with a
+file-writing tool are missed (`attack-reaches-the-gate-cursor` in
+[evals.md](evals.md)). A file's content, which `beforeReadFile` sends whole,
+never reaches the journal.
+
+### Out of the agent's reach
+
+Everything above lives in the working tree, and an agent that can write files
+there can try to rewrite what judges it. `changing-the-gate` refuses that under
+`enforce`, but a refusal from inside the agent's own trust domain is a cost,
+not a wall. Two things can be moved where a project's files cannot reach:
+
+```bash
+# `sudo` with the full path: a `uv tool` install is not on root's PATH.
+sudo "$(command -v vibe-sentinel)" hook --install --managed --mode enforce
+sudo "$(command -v vibe-sentinel)" hook --install --managed --agent cursor --mode enforce
+```
+
+- **The hook**, in Claude Code's managed settings — this tool's own file,
+  `managed-settings.d/vibe-sentinel.json`, so an organisation's shared policy is
+  never edited — or in Cursor's enterprise `hooks.json`. Claude Code runs
+  managed hooks alongside a project's, and a project's `disableAllHooks` cannot
+  turn them off.
+- **The mode and a danger set**, in the system policy:
+  `/Library/Application Support/vibe-sentinel/policy.toml` on macOS,
+  `/etc/vibe-sentinel/policy.toml` on Linux,
+  `C:\ProgramData\vibe-sentinel\policy.toml` on Windows. Its `[safety] mode` is
+  a floor a project may raise and not lower, a `no_verdict = "ask"` there holds,
+  and its `[[danger]]` tables are applied after the project's — a project may
+  add dangers, and may not override, `use`, `disable` or `use_builtins = false`
+  away the ones declared there:
+
+  ```toml
+  [safety]
+  mode = "enforce"
+
+  [[danger]]
+  id = "production-database"
+  title = "Touching the production database"
+  question = "Does this reach the production database, and is that the work?"
+  pattern = 'prod-db\.internal'
+  verdict = "unsafe"
+  ```
+
+Without an administrator's rights, `--managed` prints each file and where it
+goes, and exits 2. The files must be readable by everyone and writable only by
+an administrator, or they move nothing out of reach. `vibe-sentinel status`
+shows the level each hook came from, the floor, and a hook installed at two
+levels — which runs twice per call. What it buys is stated in the
+[threat model](THREAT_MODEL.md): the agent cannot switch the gate off by
+editing files it owns, and every attempt is recorded. It still runs as the
+user; `sudo` is asked about, not prevented.
 
 The gate is two stages, because a denylist cannot do this: `rm -rf "$DIR"` is on
 no denylist, and whether it is routine or catastrophic depends on what set `DIR`.
@@ -194,29 +294,31 @@ What this same agent ran before it, oldest first:
 |---|---|
 | `off` | triage never runs; the hook only records. **The default** |
 | `observe` | flagged commands reviewed, verdict stored, nothing blocked |
-| `enforce` | an `unsafe` verdict refuses the call; `unclear` falls through |
+| `enforce` | `unsafe` denies; `unclear` or `unreviewed` asks by default (`no_verdict = "ask"`) |
 
 These are the two stages and where each verdict lands:
 
 ```mermaid
 flowchart TB
-  TC(["an agent tool call"])
+  TC(["an agent tool call, with safety mode enforce"])
   J[("journalled — every call, ~52 ms")]
   TRI{"does a [[danger]] match?"}
   REV["one model call per matched danger,<br/>with that agent's own recent commands"]
   ALLOW(["falls through to the permission<br/>prompt you already have"])
   DENY(["denied — the command never runs"])
+  ASK(["ask for permission — default for no verdict"])
   TC --> J
   TC --> TRI
   TRI -->|no| ALLOW
   TRI -->|yes| REV
-  REV -->|"safe · unclear"| ALLOW
-  REV -->|"unsafe, and only in enforce mode"| DENY
+  REV -->|"safe"| ALLOW
+  REV -->|"unsafe"| DENY
+  REV -->|"unclear or unreviewed"| ASK
+  TRI -->|"declared unsafe verdict"| DENY
 ```
 
-**Guarantees:** Never refuses a command because the model was slow, the backend
-down, or the gate itself broke — and under `enforce` never lets one through
-silently either. A flagged command with no verdict — `unclear`, or no answer
+**Missing verdicts:** Under `enforce`, a slow or unavailable model or a review
+failure requests permission by default. A flagged command with no verdict — `unclear`, or no answer
 within `[safety] timeout` — is *asked*: Claude Code shows its own permission
 prompt with the gate's reason on it, and the row records `decision = ask`.
 Where nobody can answer, Claude Code denies the request instead, so the reason
@@ -226,6 +328,11 @@ watches that prefers that trade. `observe` records and never acts. Verdicts are
 stored apart from the commands, so the journal stays a record rather than a set
 of opinions, and `vibe-sentinel safety` counts how many commands were blocked
 and how many were asked.
+
+**Unreadable policy:** An invalid safety configuration, unloadable danger set,
+or unreadable manifest needed for triage is a different failure: enforcement
+refuses the call and names the file to fix. A valid `off` mode skips triage;
+`observe` records policy failures without refusing calls.
 
 One limit no setting closes: if the hook itself runs past the timeout Claude
 Code gives it, Claude Code cancels it and the call proceeds. That is why
@@ -289,7 +396,8 @@ an agent that names one is steered or mistaken. That includes
 the home directory and outside the project — another repository, the git
 config, a shell start-up file — is `reaching-into-home`, and asked about,
 because reading it is sometimes the work. The rest of the filesystem is not
-watched: `/usr/bin`, `/etc` and `/tmp` hold nothing personal. A command that
+watched by this check; that does not establish whether it contains sensitive
+data. A command that
 names a path without opening it — `echo "$HOME/.config"`, `cd ~` — does not
 count, and nor does the program being run, so `~/.local/bin/uv` is not a read.
 
@@ -312,8 +420,8 @@ applies_to = "tool"
 verdict = "unsafe"
 ```
 
-`control-file` is what `changing-the-gate` uses, and it is the one shipped
-danger that settles instead of asking: `verdict = "unsafe"`. A control the
+`control-file` is what `changing-the-gate` uses, and it is one of the shipped
+dangers that settle instead of asking: `verdict = "unsafe"`. A control the
 agent can switch off is not a control, and asking a model would hand the
 decision to the text the agent is writing into the file. It covers
 `.vibe-sentinel.toml`, everything under `.vibe-sentinel/` — the history
@@ -437,53 +545,27 @@ would fire on `npx tsc` and `npx prettier`, which is ordinary work.
 
 ---
 
-## Hooks worth wiring
+## Additional hooks
 
-`vibe-sentinel hook --install` writes one `PreToolUse` entry — the journal, and
-the gate that reads it. The rest of `.claude/settings.json` is yours, and none
-of the four below needs anything this package does not already ship. The hook
-contract belongs to another program, so check the event names and what each one
-does with a hook's output against your agent's own reference before pasting.
+`vibe-sentinel hook --install --mode <journal|observe|enforce>` installs the
+journal and safety gate for Claude Code, or for Cursor with `--agent cursor`,
+and sets the mode it runs in. Other hooks must be configured separately against your agent's event
+contract.
 
-**`SessionStart` → `vibe-sentinel hook --replay`.** Drains
-`.vibe-sentinel/hook-spill.jsonl`, where events go when the database was locked
-or a migration was pending. Nobody remembers to run it by hand, and a gap in
-the journal reads as *the agent ran nothing*.
+- A session-start hook can run `vibe-sentinel hook --replay` to drain events
+  spilled while the database was unavailable.
+- A session-start scan can report standing findings before work begins. It may
+  need model calls; its cost depends on the tree and policy.
+- After a dependency install, run both `vibe-sentinel packages` and
+  `vibe-sentinel licenses` in the audited environment. Guard an automatic
+  hook so it runs only after installs.
 
-**`SessionStart` → the gates.** A gate reports a state, every run, for as long
-as it is true — and an agent that never reads one starts every session not
-knowing this tree has an AGPL dependency in it and a key on disk. `vibe-sentinel
-licenses; vibe-sentinel packages; vibe-sentinel credentials` costs about 1.3 s
-on this repo and no model call. All three exit `1` when they find something,
-which a hook runner may report as a failure of the hook; end the line with
-`|| true` if yours does.
+Keep findings distinct from execution errors when wiring exit codes. Do not
+hide both with an unconditional `|| true`.
 
-**`PostToolUse` on `Bash` → `vibe-sentinel packages`.** The other half of the
-install question, and the half that cannot be asked earlier. A licence is not
-resolvable before the package is on disk: `licenses.py` reads the
-distribution's own `LICENSE` text, and an index offers only a declared
-classifier, which is the evidence it trusts least. So `undeclared-install` asks
-the one thing answerable in front of the command — *does anything declare this
-name* — and everything else is answerable a moment after it. Guard the hook on
-the command having actually been an install; one that costs 640 ms on every
-shell command is one you switch off.
-
-**Guard the guard.** An agent that can edit files can edit the file that turns
-the gate off, and the refusal it just read names that file:
-
-```toml
-[[danger]]
-id = "editing-the-guard"
-title = "Editing vibe-sentinel's own configuration or the hook wiring"
-applies_to = "target"
-pattern = '\.vibe-sentinel\.toml$|\.claude/settings\.json$'
-question = """
-Does this change what the safety gate checks, what the licence or package
-policy allows, or which pins stand? Each of those is a decision somebody
-recorded. Changing one on purpose is ordinary; changing one to get past a
-refusal that just named it is not.
-"""
-```
+The built-in `changing-the-gate` danger already protects the policy, declared
+rule files and hook settings under `enforce`; adding a second rule for those
+same paths is unnecessary. See [Command safety](#command-safety) for its scope.
 
 ---
 

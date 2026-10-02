@@ -1,4 +1,4 @@
-"""What a journalled command is, and how one is read off a hook payload.
+"""What a journalled command is: the engine's request and decision, and the records.
 
 The scan pipeline's models live in :mod:`vibe_sentinel.schemas` and are
 pydantic, because they cross a boundary with a language model: the JSON
@@ -14,7 +14,7 @@ in the package that is.** Two reasons, in this order:
    ``prompt_id: null`` — a shape the documentation all but invites, since
    the field is "absent until first input" — and refusing means the event
    is dropped, silently, exactly when something unexpected is happening.
-   :meth:`HookEvent.from_payload` coerces instead: an unreadable field
+   :mod:`vibe_sentinel.agents` coerces instead: an unreadable field
    costs one blank column, never the row. For an append-only record,
    recording something imperfect beats recording nothing.
 
@@ -53,24 +53,16 @@ MAX_FIELD_CHARS = 500
 #: The envelope carries identity, not content.
 MAX_ENVELOPE_CHARS = 4_000
 
-#: Where a tool keeps its subject, most specific first. A tool that names
-#: no target records none — this never guesses one.
-_TARGET_KEYS = (
-    "file_path",
-    "notebook_path",
-    "path",
-    "pattern",
-    "url",
-    "shell_id",
-    "subagent_type",
-)
-
-#: What survives when an oversized envelope is reduced to identity alone.
+#: What survives when an oversized envelope is reduced: the keys that say
+#: who acted and where, under any agent's spelling of them.
 _IDENTITY_KEYS = frozenset(
     {
+        "agent",
         "agent_id",
         "agent_type",
+        "conversation_id",
         "cwd",
+        "generation_id",
         "hook_event_name",
         "permission_mode",
         "prompt_id",
@@ -79,6 +71,24 @@ _IDENTITY_KEYS = frozenset(
         "tool_use_id",
     }
 )
+
+
+def bounded_envelope(data: dict[str, Any]) -> dict[str, Any]:
+    """An envelope no bigger than :data:`MAX_ENVELOPE_CHARS`.
+
+    Whole when it fits; otherwise only the identity keys, marked as cut, so
+    one oversized payload cannot grow the history without bound.
+    """
+    if _rough_size(data) <= MAX_ENVELOPE_CHARS:
+        return data
+    reduced: dict[str, Any] = {k: v for k, v in data.items() if k in _IDENTITY_KEYS}
+    reduced["envelope_truncated"] = True
+    return reduced
+
+
+def _rough_size(data: dict[str, Any]) -> int:
+    """Cheap stand-in for the serialized length of an envelope."""
+    return sum(len(str(k)) + len(str(v)) + 4 for k, v in data.items())
 
 
 def _actor_name(agent_id: str, agent_type: str) -> str:
@@ -98,14 +108,14 @@ def _actor_name(agent_id: str, agent_type: str) -> str:
     return agent_type or agent_id or "main"
 
 
-def _clip(text: str, limit: int) -> str:
+def clip(text: str, limit: int) -> str:
     """Shorten ``text`` to ``limit``, saying so rather than hiding it."""
     if len(text) <= limit:
         return text
     return f"{text[:limit]} … [truncated, {len(text) - limit} more chars]"
 
 
-def _as_text(value: object) -> str:
+def as_text(value: object) -> str:
     """Whatever arrived, as a string.
 
     ``None`` becomes empty rather than ``"None"``: absent and absent-ish
@@ -119,147 +129,71 @@ def _as_text(value: object) -> str:
     return str(value)
 
 
-def _as_mapping(value: object) -> dict[str, Any]:
+def as_mapping(value: object) -> dict[str, Any]:
     """Whatever arrived, as a dict — or an empty one."""
     return dict(value) if isinstance(value, dict) else {}
 
 
 @dataclass(slots=True)
-class HookEvent:
-    """One Claude Code hook payload, as it arrived on stdin.
+class ActionRequest:
+    """One tool call an agent is about to make, in the engine's words.
 
-    Every field defaults to empty because the payload belongs to another
-    program: a build that stops sending ``prompt_id``, or one that adds a
-    field, must cost a column's worth of detail and never an exception in
-    front of a tool call. ``extras`` is the same bet from the other side
-    — anything this build does not name is kept there and lands in the
-    envelope, rather than being silently discarded.
-
-    ``agent_id`` is the field that makes several actors legible: empty is
-    the main thread, and any other value is a subagent running under the
-    same ``session_id``.
+    The journal records it, and the gate judges it. No agent's field names
+    appear here: an adapter in :mod:`vibe_sentinel.agents` reads its agent's
+    payload into one of these, and turns a :class:`Decision` back into that
+    agent's reply. ``tool_name`` is the engine's vocabulary — ``Bash``,
+    ``Read``, ``Write``, ``mcp__<server>__<tool>`` — which is what the
+    danger set's patterns and structural checks are written against.
     """
 
-    hook_event_name: str = ""
-    session_id: str = ""
-    prompt_id: str = ""
-    """The turn — one user prompt. Absent before the first input."""
-    transcript_path: str = ""
-    cwd: str = ""
-    permission_mode: str = ""
-    agent_id: str = ""
-    """Empty for the main thread; the subagent's id inside one."""
-    agent_type: str = ""
-    """The subagent's name — ``Explore``, ``Plan``, a custom agent."""
+    agent: str
+    """Which adapter read it: ``claude-code``, ``cursor``."""
     tool_name: str = ""
+    command: str = ""
+    target: str = ""
+    description: str = ""
+    cwd: str = ""
+    session_id: str = ""
+    agent_id: str = ""
+    """Empty for the main thread; a subagent's id inside one."""
+    agent_type: str = ""
+    prompt_id: str = ""
     tool_use_id: str = ""
-    """Unique per call. The key that makes a replayed event a no-op."""
-    effort: dict[str, Any] = field(default_factory=dict)
-    """Reasoning budget, ``{"level": ...}``, when the model reports one.
+    """Unique per call, when the agent sends one: the key that makes a
+    replayed event a no-op."""
+    permission_mode: str = ""
+    transcript_path: str = ""
+    envelope: dict[str, Any] = field(default_factory=dict)
+    """Everything the payload carried but the tool's arguments and content,
+    with ``agent`` added — bounded by :func:`bounded_envelope`."""
 
-    Named but given no column: worth keeping beside a command, not worth
-    querying by. Naming it is what keeps ``commands --fields`` honest —
-    an unnamed field there means Claude Code's payload has genuinely
-    grown something, not that this build never got round to it.
-    """
-    tool_input: dict[str, Any] = field(default_factory=dict)
-    extras: dict[str, Any] = field(default_factory=dict)
-    """Everything the payload carried that this build does not name."""
+    def as_dict(self) -> dict[str, Any]:
+        """For the spill file; :meth:`from_dict` reads it back."""
+        return {f.name: getattr(self, f.name) for f in fields(self)}
 
     @classmethod
-    def from_payload(cls, payload: dict[str, Any]) -> HookEvent:
-        """Read an event off a raw payload, coercing rather than refusing.
-
-        Never raises. A field of an unexpected type costs that field and
-        nothing else — the alternative is dropping a record of something
-        the agent really did because a string arrived as a number.
-        """
-        known: dict[str, Any] = {}
-        extras: dict[str, Any] = {}
-        for key, value in payload.items():
-            if key in _TEXT_FIELDS:
-                known[key] = _as_text(value)
-            elif key in _MAPPING_FIELDS:
-                known[key] = _as_mapping(value)
-            else:
-                extras[key] = value
-        return cls(**known, extras=extras)
-
-    @property
-    def is_subagent(self) -> bool:
-        """Whether a subagent made this call, rather than the main thread."""
-        return bool(self.agent_id)
-
-    def command_text(self) -> str:
-        """The shell command, for the tools that run one."""
-        value = self.tool_input.get("command")
-        return _clip(value, MAX_COMMAND_CHARS) if isinstance(value, str) else ""
-
-    def target(self) -> str:
-        """What the tool acted on — a path, a pattern, a URL.
-
-        Deliberately not the whole of ``tool_input``: a Write's arguments
-        include the file's entire new content, and this is a record of
-        what the agent did, not a second copy of the codebase.
-        """
-        for key in _TARGET_KEYS:
-            value = self.tool_input.get(key)
-            if isinstance(value, str) and value:
-                return _clip(value, MAX_FIELD_CHARS)
-        return ""
-
-    def description(self) -> str:
-        """The agent's own one-line account of the call, when it gave one."""
-        value = self.tool_input.get("description")
-        return _clip(value, MAX_FIELD_CHARS) if isinstance(value, str) else ""
-
-    def as_payload(self) -> dict[str, Any]:
-        """The event back as a payload, for the spill file.
-
-        Round-trips through :meth:`from_payload`, so an event spilled
-        while the database was unavailable replays into exactly the row
-        it would have been.
-        """
-        data: dict[str, Any] = {name: getattr(self, name) for name in HOOK_EVENT_FIELDS}
-        data.update(self.extras)
-        return data
-
-    def envelope(self) -> dict[str, Any]:
-        """Everything but the tool's arguments, for the record.
-
-        Unnamed fields land here too, which is what lets a payload gain
-        ``agent_id`` — or anything else — without a migration, and lets a
-        stored row be checked afterwards against what was really sent.
-        """
-        data: dict[str, Any] = {
-            name: getattr(self, name)
-            for name in HOOK_EVENT_FIELDS
-            if name != "tool_input"
-        }
-        data.update(self.extras)
-        if _rough_size(data) <= MAX_ENVELOPE_CHARS:
-            return data
-        reduced: dict[str, Any] = {k: v for k, v in data.items() if k in _IDENTITY_KEYS}
-        reduced["envelope_truncated"] = True
-        return reduced
+    def from_dict(cls, data: dict[str, Any]) -> ActionRequest:
+        """Read one back off the spill file, coercing rather than refusing."""
+        known = {f.name for f in fields(cls)}
+        values: dict[str, Any] = {}
+        for key, value in data.items():
+            if key not in known:
+                continue
+            values[key] = as_mapping(value) if key == "envelope" else as_text(value)
+        return cls(**values)
 
 
-def _rough_size(data: dict[str, Any]) -> int:
-    """Cheap stand-in for the serialized length of an envelope."""
-    return sum(len(str(k)) + len(str(v)) + 4 for k, v in data.items())
+@dataclass(slots=True)
+class Decision:
+    """What the gate decided about one call, in no agent's words.
 
+    ``allow``, ``ask`` or ``deny``. An adapter turns it into its agent's
+    reply, and says so when its agent cannot express it — an ``ask`` on an
+    event that has no prompt becomes a refusal carrying the same reason.
+    """
 
-#: The fields this build names, in declaration order. Exported so callers
-#: can compare them against what a payload really carried without
-#: importing ``dataclasses`` themselves.
-HOOK_EVENT_FIELDS: tuple[str, ...] = tuple(
-    f.name for f in fields(HookEvent) if f.name != "extras"
-)
-
-_TEXT_FIELDS = frozenset(
-    name for name in HOOK_EVENT_FIELDS if name not in ("effort", "tool_input")
-)
-_MAPPING_FIELDS = frozenset({"effort", "tool_input"})
+    decision: str
+    reason: str = ""
 
 
 @dataclass(slots=True)

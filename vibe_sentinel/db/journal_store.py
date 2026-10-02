@@ -24,8 +24,8 @@ import sqlite3
 
 from vibe_sentinel.journal import (
     AgentSessionRecord,
+    ActionRequest,
     CommandRecord,
-    HookEvent,
     ReviewRecord,
 )
 
@@ -47,7 +47,7 @@ JOIN agent_sessions s ON s.id = c.agent_session_id
 
 def record_command(
     conn: sqlite3.Connection,
-    event: HookEvent,
+    event: ActionRequest,
     occurred_at: str,
 ) -> int | None:
     """Append one tool call, creating its actor row if this is the first.
@@ -107,12 +107,12 @@ def record_command(
                 event.prompt_id,
                 event.tool_use_id,
                 event.tool_name,
-                event.command_text(),
-                event.target(),
-                event.description(),
+                event.command,
+                event.target,
+                event.description,
                 event.cwd,
                 event.permission_mode,
-                json.dumps(event.envelope(), sort_keys=True, default=str),
+                json.dumps(event.envelope, sort_keys=True, default=str),
             ),
         )
         if cursor.rowcount == 0:
@@ -477,3 +477,62 @@ def journal_totals(conn: sqlite3.Connection) -> tuple[int, int, int]:
     ).fetchone()["n"]
     commands = conn.execute("SELECT COUNT(*) AS n FROM agent_commands").fetchone()["n"]
     return (int(sessions), int(actors), int(commands))
+
+
+def latest_reviewed_session(conn: sqlite3.Connection) -> str | None:
+    """The ``session_id`` of the newest agent review, or None if there is none.
+
+    A ``--check`` row is a person trying the gate rather than an agent
+    running, so it is not the last run.
+    """
+    row = conn.execute(
+        """
+        SELECT s.session_id
+        FROM command_reviews r
+        JOIN agent_commands c ON c.id = r.command_id
+        JOIN agent_sessions s ON s.id = c.agent_session_id
+        WHERE r.mode != 'check'
+        ORDER BY r.id DESC LIMIT 1
+        """
+    ).fetchone()
+    return None if row is None else str(row["session_id"])
+
+
+def review_counts(
+    conn: sqlite3.Connection, session_id: str | None = None
+) -> dict[tuple[str, str], int]:
+    """How many agent reviews ended in each ``(verdict, decision)``.
+
+    One session's when ``session_id`` is given, every session's otherwise.
+    ``--check`` rows are left out, as in :func:`latest_reviewed_session`.
+    """
+    sql = """
+        SELECT r.verdict, r.decision, COUNT(*) AS n
+        FROM command_reviews r
+        JOIN agent_commands c ON c.id = r.command_id
+        JOIN agent_sessions s ON s.id = c.agent_session_id
+        WHERE r.mode != 'check'
+    """
+    params: list[object] = []
+    if session_id is not None:
+        sql += " AND s.session_id = ?"
+        params.append(session_id)
+    sql += " GROUP BY r.verdict, r.decision"
+    return {
+        (str(row["verdict"]), str(row["decision"])): int(row["n"])
+        for row in conn.execute(sql, params)
+    }
+
+
+def commands_in_session(conn: sqlite3.Connection, session_id: str) -> int:
+    """How many tool calls the hook recorded in one session, every actor's."""
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS n
+        FROM agent_commands c
+        JOIN agent_sessions s ON s.id = c.agent_session_id
+        WHERE s.session_id = ?
+        """,
+        (session_id,),
+    ).fetchone()
+    return int(row["n"])

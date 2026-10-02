@@ -291,17 +291,18 @@ def load_dangers(root: Path | None = None) -> tuple[Danger, ...]:
 
     from vibe_sentinel.paths import CONFIG_FILENAME
 
+    system = system_dangers()
     merged: dict[str, Danger] = {d.id: d for d in builtin_dangers()}
     if root is None:
         # No root, so no tree to ask about: `requires` cannot be
         # evaluated. Everything is returned rather than nothing, because
         # the callers that pass None are describing the set rather than
         # gating on it.
-        return tuple(merged.values())
+        return tuple((merged | system).values())
 
     path = root / CONFIG_FILENAME
     if not path.is_file():
-        return _applicable(merged, root)
+        return _applicable(merged | system, root)
     try:
         with path.open("rb") as handle:
             data = tomllib.load(handle)
@@ -332,9 +333,18 @@ def load_dangers(root: Path | None = None) -> tuple[Danger, ...]:
         danger = _danger_from_toml(raw, path, index)
         merged[danger.id] = replace(danger, source=here)
 
+    lowered = [d for d in settings.get("disable", []) if d in system]
+    if lowered:
+        raise ValueError(
+            f"{path}: [safety] disable names {', '.join(lowered)}, which the "
+            f"system policy at {_system_label()} declares. A project may add "
+            f"dangers; it may not switch off the ones the organisation "
+            f"declared. Remove the entry, or ask whoever administers that file."
+        )
+
     keep = settings.get("use")
     if keep is not None:
-        unknown = [d for d in keep if d not in merged]
+        unknown = [d for d in keep if d not in merged and d not in system]
         if unknown:
             known = ", ".join(sorted(merged)) or "(none)"
             raise ValueError(
@@ -359,7 +369,48 @@ def load_dangers(root: Path | None = None) -> tuple[Danger, ...]:
     for danger_id in disable:
         del merged[danger_id]
 
-    return _applicable(merged, root)
+    # Last, so nothing above — an override by id, `use`, `disable`,
+    # `use_builtins = false` — can lower what the system policy declared.
+    return _applicable(merged | system, root)
+
+
+def system_dangers() -> dict[str, Danger]:
+    """The ``[[danger]]`` set the system policy declares, by id; empty when
+    there is no system policy.
+
+    Applied after the project's own, so a verdict declared there cannot be
+    overridden away, and ``use``, ``disable`` and ``use_builtins = false``
+    in a project cannot remove one. Raises ``ValueError`` naming the file
+    when it is there and cannot be read.
+    """
+    from vibe_sentinel import paths
+
+    import tomllib
+
+    path = paths.system_policy_path()
+    if not path.is_file():
+        return {}
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+        raise ValueError(
+            f"{path} is not readable as TOML: {e}. It is the system policy, "
+            f"which every project here reads; whoever administers it can fix it."
+        ) from e
+    label = _system_label()
+    found: dict[str, Danger] = {}
+    for index, raw in enumerate(data.get("danger", []), start=1):
+        if not isinstance(raw, dict):
+            raise ValueError(f"{path}: [[danger]] #{index} is not a table.")
+        danger = _danger_from_toml(raw, path, index)
+        found[danger.id] = replace(danger, source=label)
+    return found
+
+
+def _system_label() -> str:
+    from vibe_sentinel import paths
+
+    return f"system policy ({paths.system_policy_path()})"
 
 
 def _dangers_in_file(path: Path) -> list[Danger]:
@@ -564,6 +615,7 @@ CONTROL_FILES = (
     ".vibe-sentinel.toml",
     ".claude/settings.json",
     ".claude/settings.local.json",
+    ".cursor/hooks.json",
 )
 #: Directories that make up the gate: its record — the history database,
 #: the journal, the verdicts. Relative to the project root.
@@ -621,8 +673,23 @@ def control_paths(root: Path) -> tuple[frozenset[Path], frozenset[Path]]:
     that matches nothing adds nothing — there is no file there to change —
     and ``scan`` is where an empty glob is reported.
     """
+    import os
+
+    from vibe_sentinel import paths
+
     base = root.resolve()
     files = {base / name for name in CONTROL_FILES}
+    # Outside the tree, and on a machine set up for it not writable by the
+    # agent at all — but `sudo` is asked about, not prevented, so an attempt
+    # is settled here too. Each as written and as resolved: on macOS /etc is
+    # a symlink, and a command names whichever spelling it likes.
+    for outside in (
+        paths.system_policy_path(),
+        paths.claude_managed_hook_path(),
+        paths.cursor_enterprise_hooks_path(),
+    ):
+        files.add(Path(os.path.normpath(outside)))
+        files.add(outside.resolve())
     data = _project_config(base)
     for table in _RULE_TABLES:
         section = data.get(table)
@@ -630,6 +697,12 @@ def control_paths(root: Path) -> tuple[frozenset[Path], frozenset[Path]]:
         for pattern in patterns if isinstance(patterns, list) else []:
             files.update(path.resolve() for path in base.glob(str(pattern)))
     return frozenset(files), frozenset(base / name for name in CONTROL_DIRS)
+
+
+def _spelling(path: Path, base: Path) -> str:
+    """How a command would name a protected path: relative inside the
+    project, absolute outside it."""
+    return str(path.relative_to(base)) if path.is_relative_to(base) else str(path)
 
 
 def _as_path(word: str, root: Path) -> Path | None:
@@ -665,7 +738,7 @@ def _names_control(
     files, dirs = controls
     base = root.resolve()
     if any(ch in word for ch in "*?["):
-        names = [str(p.relative_to(base)) for p in (*files, *dirs)]
+        names = [_spelling(p, base) for p in (*files, *dirs)]
         pattern = word.removeprefix("./")
         return any(fnmatch.fnmatch(name, pattern) for name in names)
     path = _as_path(word, base)
@@ -690,6 +763,42 @@ class _Simple(NamedTuple):
     """Whether another command's output is piped into this one."""
 
 
+def _rough_words(command: str) -> list[str]:
+    """A command's text cut at whitespace, quotes and shell punctuation.
+
+    Not a parse, and never treated as one: it is read only when
+    :func:`_simple_commands` cannot split the command, and only to decide
+    whether the text *names* something a check cares about. If it does,
+    the check matches and the model reads the command. Rebuilding the
+    commands from these words would invent boundaries the shell would not
+    have drawn.
+    """
+    return [w for w in re.split(r"[\s'\"`;&|()<>]+", command) if w]
+
+
+def _shell_tokens(command: str) -> list[str]:
+    """The command's words and operators, as ``shlex`` reads a POSIX shell.
+
+    Raises ``ValueError`` for what it cannot split — an unbalanced quote, or
+    bash's ``$'...'`` quoting, which ``shlex`` does not know.
+    """
+    import shlex
+
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    return list(lexer)
+
+
+def _unsplittable(command: str) -> bool:
+    """Whether :func:`_simple_commands` would refuse this command — without
+    logging it a second time."""
+    try:
+        _shell_tokens(command)
+    except ValueError:
+        return True
+    return False
+
+
 def _simple_commands(command: str) -> list[_Simple] | None:
     """A shell line split into its simple commands, or None if it will not parse.
 
@@ -698,20 +807,16 @@ def _simple_commands(command: str) -> list[_Simple] | None:
     of the command that really runs. Shared by every check that reads paths
     out of a command, so they cannot disagree about what a command names.
     """
-    import shlex
-
     try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
-        lexer.whitespace_split = True
-        tokens = list(lexer)
+        tokens = _shell_tokens(command)
     except ValueError as e:
         # Recorded, because what follows is not neutral: a caller that gets
-        # None reads nothing structural out of this command.
+        # None cannot read the command's structure, and has to say so.
         from vibe_sentinel.log import logger
 
         logger.warning(
             "safety: could not split a command ({}); the structural checks "
-            "read nothing from it",
+            "fall back on what its text names",
             e,
         )
         return None
@@ -781,8 +886,27 @@ def _changes_control_file(
     if simples is None:
         files, dirs = controls
         base = root.resolve()
-        return any(str(p.relative_to(base)) in command for p in (*files, *dirs))
+        return any(_spelling(p, base) in command for p in (*files, *dirs))
     return any(_simple_changes(s, root, controls) for s in simples)
+
+
+#: The names this tool runs under, as a command or as ``python -m``.
+_THIS_TOOL = frozenset({"vibe-sentinel", "vibe_sentinel"})
+
+
+def _reinstalls_the_hook(verb: str, args: list[str]) -> bool:
+    """``vibe-sentinel hook --install``, however it is reached.
+
+    It writes the hook entry and ``[safety] mode`` without naming either
+    file, so no path in it is a control file — and ``--mode journal`` turns
+    the gate off. Choosing the mode is the person's.
+    """
+    words = [verb, *args]
+    return (
+        any(Path(w).name in _THIS_TOOL for w in words)
+        and "hook" in args
+        and any(a == "--install" for a in args)
+    )
 
 
 def _simple_changes(
@@ -794,6 +918,8 @@ def _simple_changes(
     if any(_names_control(w, root, controls) for w in simple.redirected):
         return True
     verb, rest = simple.verb, simple.args
+    if _reinstalls_the_hook(verb, rest):
+        return True
     if not verb or verb in _READS:
         return False
     if verb == "git":
@@ -846,9 +972,12 @@ def _reaches_home(tool_name: str, command: str, target: str, root: Path | None) 
     tool is judged by its target; a writing tool is already asked about by
     ``outside-project``. A shell command counts every path it names, minus
     the command itself and commands that name a path without opening it —
-    ``echo "$HOME/.config"`` is not an incident. A command that will not
-    parse counts as nothing here; the secret stores are caught by pattern,
-    which needs no parse.
+    ``echo "$HOME/.config"`` is not an incident.
+
+    A command that will not split — bash's ``$'...'`` quoting is enough —
+    is not read as reaching nothing. If any of its words names a path in
+    the home directory outside the project, it matches, and the model is
+    told it could not be read; see :func:`_rough_words`.
     """
     if root is None:
         return False
@@ -860,7 +989,9 @@ def _reaches_home(tool_name: str, command: str, target: str, root: Path | None) 
         return False
     simples = _simple_commands(command)
     if simples is None:
-        return False
+        return any(
+            _in_home_outside_project(w, base, home) for w in _rough_words(command)
+        )
     for simple in simples:
         words = list(simple.redirected)
         if simple.verb not in _NO_FILE_VERBS:
@@ -930,6 +1061,19 @@ def _is_remote_spec(word: str) -> bool:
     return bool(_host_of(word)) and "://" not in word and not word.startswith("-")
 
 
+def _names_a_sender(words: list[str]) -> bool:
+    """Whether these words name something :func:`_destinations` would read
+    as sending: the same sets, so the two cannot disagree."""
+    names = {Path(w).name for w in words}
+    if names & (_SOCKETS | _REMOTE_COPIES | {"ssh", "rclone"}):
+        return True
+    if any(w.startswith(_CLOUD_SCHEMES) for w in words):
+        return True
+    if "curl" in names and _sends(_CURL_SENDS, words):
+        return True
+    return "wget" in names and _sends(_WGET_SENDS, words)
+
+
 def _sends(flags: tuple[str, ...], args: list[str]) -> bool:
     for arg in args:
         for flag in flags:
@@ -985,12 +1129,18 @@ def _sends_data_out(
     and ``-F`` and ``-T`` send, as do raw sockets, a copy whose destination
     is another machine, ``ssh`` with data piped into it, and a cloud-storage
     upload. Loopback is not off the machine. ``git push`` is not counted —
-    sending code to the project's own remote is the work. A command that
-    will not parse counts as nothing here, like every asked-about check.
+    sending code to the project's own remote is the work.
+
+    A command that will not split is not read as sending nothing: if its
+    text names a sender, it matches, and the model is told it could not be
+    read. Its destination cannot be read either, so ``expected_hosts``
+    does not clear it.
     """
     if root is None or not command:
         return False
     simples = _simple_commands(command)
+    if simples is None:
+        return _names_a_sender(_rough_words(command))
     if not simples:
         return False
     expected = expected_hosts(root)
@@ -1157,6 +1307,16 @@ def build_prompt(
                 f"declares: {', '.join(undeclared) or '(none)'}"
             )
         lines.append("")
+    structural = {"home-outside-project", "egress"}
+    if command and any(d.applies_to in structural for d in asked):
+        if _unsplittable(command):
+            lines.append(
+                "This command does not split into words here, so the paths "
+                "and hosts in it were not read mechanically — it matched "
+                "because its text names them. Read the command itself to see "
+                "what it reaches and where it sends."
+            )
+            lines.append("")
     if history:
         lines.append(
             f"What this same agent ran before it, oldest first "
@@ -1383,31 +1543,58 @@ def configured_mode(root: Path) -> str:
     return configured_safety(root)[0]
 
 
+#: Strictness, for the floor the system policy sets.
+_MODE_RANK = {"off": 0, "observe": 1, "enforce": 2}
+
+
 def configured_safety(root: Path) -> tuple[str, str]:
     """``(mode, no_verdict)``, read without building the config model.
 
-    One ``tomllib.load`` rather than ``load_config``, which would build a
-    pydantic model and cost ~40 ms. This runs in front of a tool call.
+    One ``tomllib.load`` per file rather than ``load_config``, which would
+    build a pydantic model and cost ~40 ms. This runs in front of a tool
+    call.
 
-    ``off`` when nothing declares a mode: no config file, no ``[safety]``
-    table, no ``mode`` key. That is the declared default, and the gate
+    Two files, and the stricter wins. The project's ``.vibe-sentinel.toml``,
+    and the system policy at :func:`~vibe_sentinel.paths.system_policy_path`
+    — a file outside every workspace that, on a machine set up for it, only
+    an administrator can write. The system file is a floor: a project may
+    raise the mode above it and may not lower it, and a ``no_verdict =
+    "ask"`` in either holds. An agent that can edit the project's file can
+    therefore not switch off what the organisation switched on.
+
+    ``off`` and ``ask`` when nothing declares them — no file, no
+    ``[safety]`` table, no key. That is the declared default, and the gate
     really is off.
 
-    Raises ``ValueError`` when a mode *was* declared and cannot be read —
-    a file that will not open, TOML that will not parse, a ``[safety]``
-    that is not a table, or a value that is not one of
-    :data:`SAFETY_MODES`. Returning ``off`` for those is what this used to
-    do, and it is the worst kind of fallback: a stray comma or ``mode =
-    "enfroce"`` silently disabled the gate, the setting still said enforce,
-    and nothing anywhere said otherwise.
+    Raises ``ValueError`` when either file *declared* something that cannot
+    be read: a file that will not open, TOML that will not parse, a
+    ``[safety]`` that is not a table, a value outside :data:`SAFETY_MODES`.
+    Returning ``off`` for those is what this used to do, and it is the worst
+    kind of fallback: a stray comma or ``mode = "enfroce"`` silently
+    disabled the gate, the setting still said enforce, and nothing anywhere
+    said otherwise.
     """
+    from vibe_sentinel import paths
+
+    mode, no_verdict = declared_safety(root / paths.CONFIG_FILENAME)
+    mode, no_verdict = mode or "off", no_verdict or "ask"
+    system = paths.system_policy_path()
+    if system.is_file():
+        floor, system_no_verdict = declared_safety(system)
+        if floor is not None and _MODE_RANK[floor] > _MODE_RANK[mode]:
+            mode = floor
+        if system_no_verdict == "ask":
+            no_verdict = "ask"
+    return mode, no_verdict
+
+
+def declared_safety(path: Path) -> tuple[str | None, str | None]:
+    """``(mode, no_verdict)`` as one file declares them; None for a key it
+    does not set, or for a file that is not there."""
     import tomllib
 
-    from vibe_sentinel.paths import CONFIG_FILENAME
-
-    path = root / CONFIG_FILENAME
     if not path.is_file():
-        return "off", "ask"
+        return None, None
     try:
         with path.open("rb") as handle:
             data = tomllib.load(handle)
@@ -1419,7 +1606,7 @@ def configured_safety(root: Path) -> tuple[str, str]:
         ) from e
 
     if "safety" not in data:
-        return "off", "ask"
+        return None, None
     section = data["safety"]
     if not isinstance(section, dict):
         raise ValueError(
@@ -1427,8 +1614,8 @@ def configured_safety(root: Path) -> tuple[str, str]:
             f"table, so the safety mode is unknown. Fix the file, then check "
             f"it with `vibe-sentinel safety --print-dangers`."
         )
-    no_verdict = section.get("no_verdict", "ask")
-    if no_verdict not in NO_VERDICT:
+    no_verdict = section.get("no_verdict")
+    if no_verdict is not None and no_verdict not in NO_VERDICT:
         # Read even with no mode declared, so a typo is found by the scan
         # that validates this rather than on the day enforce is turned on.
         raise ValueError(
@@ -1436,14 +1623,15 @@ def configured_safety(root: Path) -> tuple[str, str]:
             f"'ask' or 'allow'. A setting this cannot read is not 'allow' — "
             f"fix it, then check it with `vibe-sentinel safety --print-dangers`."
         )
-    if "mode" not in section:
-        return "off", str(no_verdict)
-    mode = section["mode"]
-    if mode not in SAFETY_MODES:
+    mode = section.get("mode")
+    if mode is not None and mode not in SAFETY_MODES:
         raise ValueError(
             f"{path}: [safety] mode is {mode!r}, which is not one of "
             f"{', '.join(repr(m) for m in SAFETY_MODES)}. A mode this cannot "
             f"read is not 'off' — fix it, then check it with `vibe-sentinel "
             f"safety --print-dangers`."
         )
-    return str(mode), str(no_verdict)
+    return (
+        None if mode is None else str(mode),
+        None if no_verdict is None else str(no_verdict),
+    )

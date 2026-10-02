@@ -21,8 +21,9 @@ ones — use the latest.
 
 The boundaries the tool states and does not keep:
 
-- a secret, or an excerpt of one, sent anywhere but a loopback model
-  endpoint, or written to stdout, the log or the history database;
+- a credential excerpt sent to a non-loopback model endpoint without the
+  explicit `allow_remote_model` override, or an unredacted credential value
+  written to stdout, the log or the history database;
 - the dependency inventory sent to a third party without `--online`;
 - a command the documentation says the safety gate flags passing it
   unflagged, or a way to make the gate record a verdict it did not reach;
@@ -32,8 +33,8 @@ The boundaries the tool states and does not keep:
 ## What does not
 
 The gaps in [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) are known and
-listed there — reads outside the project, secrets leaving the machine, the
-agent editing the tool's own policy, and others. A report that one of them
+listed there — reads outside the watched home-directory paths, uploads to
+expected hosts, policy writes hidden inside interpreter code, and others. A report that one of them
 is exploitable is welcome, but it is a known gap rather than a new finding.
 So is:
 
@@ -42,7 +43,8 @@ So is:
   as an eval case;
 - anything that needs an attacker already running code as the user. The
   safety gate is a guardrail inside the agent's trust domain, not a
-  sandbox.
+  sandbox. `hook --install --managed` and the system policy move its
+  configuration out of the agent's reach; the agent still runs as the user.
 
 ## Assumptions
 

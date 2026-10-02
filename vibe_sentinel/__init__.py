@@ -59,7 +59,7 @@ from __future__ import annotations
 import importlib
 from typing import TYPE_CHECKING, Any
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 if TYPE_CHECKING:
     from vibe_sentinel.analyze import analyze_drift
@@ -71,10 +71,12 @@ if TYPE_CHECKING:
     from vibe_sentinel.engine import run_gates, scan, scan_and_compare
     from vibe_sentinel.inventory import compare
     from vibe_sentinel.report import render_agent, render_json, render_terminal
+    from vibe_sentinel.agents.claude_code import HookEvent
     from vibe_sentinel.journal import (
+        ActionRequest,
         AgentSessionRecord,
         CommandRecord,
-        HookEvent,
+        Decision,
     )
     from vibe_sentinel.schemas import (
         Change,
@@ -101,7 +103,9 @@ _LAZY: dict[str, tuple[str, str]] = {
     "GateFinding": ("vibe_sentinel.schemas", "GateFinding"),
     "GateReport": ("vibe_sentinel.schemas", "GateReport"),
     "GateState": ("vibe_sentinel.schemas", "GateState"),
-    "HookEvent": ("vibe_sentinel.journal", "HookEvent"),
+    "HookEvent": ("vibe_sentinel.agents.claude_code", "HookEvent"),
+    "ActionRequest": ("vibe_sentinel.journal", "ActionRequest"),
+    "Decision": ("vibe_sentinel.journal", "Decision"),
     "HorizonDrift": ("vibe_sentinel.schemas", "HorizonDrift"),
     "LLMConnectionError": ("vibe_sentinel.exceptions", "LLMConnectionError"),
     "Observation": ("vibe_sentinel.schemas", "Observation"),
@@ -164,6 +168,8 @@ __all__ = [
     "GateReport",
     "GateState",
     "HookEvent",
+    "ActionRequest",
+    "Decision",
     "HorizonDrift",
     "LLMConnectionError",
     "Observation",

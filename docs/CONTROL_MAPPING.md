@@ -10,8 +10,9 @@ A row with no control says **not covered**. Evidence is cited as
 *file::name* for a test in `tests/`, and *suite:case-id* for an eval
 case; a test in `tests/test_evals.py` fails if any citation here stops
 existing, so a row cannot keep claiming evidence that was renamed away.
-"Covered" means the call reaches the gate's judgement and is refused or asked
-about under `enforce`; how often the judgement is right is a rate, in
+"Covered" means the described call is detected or a stated boundary is enforced.
+Detection can still lead to a `safe` verdict; it does not promise a refusal.
+How often the judgement is right is a rate, in
 [evals.md](evals.md), not a property this table can promise.
 
 ## Sources
@@ -38,8 +39,8 @@ where it was `LLM03:2025`, and Excessive Agency is `LLM03:2026`, where it was
 | # | Risk | Threat | Status | OWASP | MITRE ATLAS | NIST AI RMF |
 |---|---|---|---|---|---|---|
 | C1 | Destructive action on files or history | T2, T5 | covered | LLM03:2026, ASI02 | AML.T0101, AML.T0053 | MEASURE 2.6 |
-| C2 | Destruction through an interpreter or infrastructure tool | T3, T4 | **not covered** for an interpreter and `terraform`; covered for `kubectl`, container prunes and `DROP` | ASI05, LLM03:2026 | AML.T0050, AML.T0101 | MEASURE 2.7 |
-| C3 | Code fetched at run time executed | T1 | partial | ASI05 | AML.T0050, AML.T0053 | MEASURE 2.7 |
+| C2 | Destruction through an interpreter or infrastructure tool | T3, T4 | covered, by name | ASI05, LLM03:2026 | AML.T0050, AML.T0101 | MEASURE 2.7 |
+| C3 | Code fetched at run time executed | T1 | covered, except a script fetched into the project and run there | ASI05 | AML.T0050, AML.T0053 | MEASURE 2.7 |
 | C4 | A hallucinated or misspelled dependency installed | T6, T7 | covered | LLM04:2026, ASI04 | AML.T0010.001, AML.T0060, AML.T0011.001 | GOVERN 6.1, MAP 4.1, MANAGE 3.1 |
 | C5 | Local data sent off the machine | T8 | covered, except to an expected host | LLM02:2026, ASI02 | AML.T0086 | MEASURE 2.7 |
 | C6 | The agent reads credentials in the home directory | T9 | covered in the home directory | LLM02:2026, ASI03 | AML.T0055 | MEASURE 2.7 |
@@ -48,11 +49,11 @@ where it was `LLM03:2025`, and Excessive Agency is `LLM03:2026`, where it was
 | C9 | The agent switches its own guardrail off | T11 | covered, except through an interpreter | LLM03:2026, ASI03 | AML.T0081 | MANAGE 2.4, GOVERN 1.4 |
 | C10 | The audit record moved or deleted | T12 | covered | Agentic T&M T8 | no match | MEASURE 2.4, MANAGE 4.1 |
 | C11 | A dangerous MCP tool call | T13 | partial: by name | ASI02, LLM03:2026 | AML.T0053, AML.T0101 | MAP 4.2, MEASURE 2.6 |
-| C12 | PowerShell | T14 | **not covered** | ASI05 | AML.T0050 | MEASURE 2.7 |
+| C12 | PowerShell | T14 | partial: two spellings | ASI05 | AML.T0050 | MEASURE 2.7 |
 | C13 | Prompt injection against the judge | T15 | partial | LLM01:2026, ASI01 | AML.T0051.001 | MEASURE 2.7 |
 | C14 | A different model answering as the judge | T16 | partial | LLM04:2026 | AML.T0010 | MANAGE 3.2 |
 | C15 | A question cut short without an error | T17 | partial | — | no match | MEASURE 1.1 |
-| C16 | A secret sent to a remote model | T18 | prevented | LLM02:2026 | AML.T0057 | MEASURE 2.7 |
+| C16 | A secret sent to a remote model | T18 | prevented by default | LLM02:2026 | AML.T0057 | MEASURE 2.7 |
 | C17 | The dependency inventory sent to a third party | T19 | prevented | LLM02:2026 | no match | GOVERN 6.1 |
 | C18 | The gate has no verdict | — | covered: asked under `enforce` | Agentic T&M T10 | no match | MAP 3.5, MEASURE 2.6 |
 | C19 | The hook outlives its own timeout | — | **not covered**: the call proceeds | — | no match | MEASURE 2.6 |
@@ -111,27 +112,34 @@ and any delete of the gate's own files as `unsafe`. **Status:** covered.
 
 ### C2 — Destruction through an interpreter or infrastructure tool
 
-**Threat:** T3, T4. **Control:** `removing-infrastructure` and
-`changing-a-database` catch `kubectl delete`, container prunes and `DROP`.
-Nothing catches a deletion written in an interpreter's code or `terraform
-destroy`. **Status:** not covered for those two.
+**Threat:** T3, T4. **Control:** `deleting-files` matches an interpreter's
+deletion calls by name — `shutil.rmtree`, `os.remove`, `unlink`, node's
+`fs.rm` and `rmSync`, `rimraf`. `removing-infrastructure` catches `terraform
+destroy` and `apply -destroy`, `pulumi`, `cdk` and `tofu destroy`, `kubectl
+delete` and container prunes; `changing-a-database` catches `DROP`. A
+deletion through a call the list does not name is not seen. **Status:**
+covered, by name.
 
-**Evidence:** `adversarial:interpreter-deletes-home` and
-`adversarial:terraform-destroy`, both recorded as misses;
+**Evidence:** `test_safety::test_destructive_commands_escalate`,
+`test_safety::test_ordinary_work_never_reaches_the_model`,
+`adversarial:interpreter-deletes-home`, `adversarial:terraform-destroy`,
 `safety:kubectl-delete-in-prod`, `safety:drop-production-database`.
 
 ### C3 — Code fetched at run time executed
 
 **Threat:** T1. **Control:** `running-unseen-code` flags `curl … | sh`,
-`bash -c "$(curl …)"` and a decoded payload piped to a shell. The model
-answers `unclear` for the first two, which under `enforce` is asked about
-rather than allowed. A script fetched in one command and run in the next is
-not flagged. **Status:** partial.
+`bash -c "$(curl …)"`, a decoded payload piped to a shell, and a file run
+from where downloads land — a temp directory, `~/Downloads` — which is how a
+fetch and a run split across two commands look; the model reads the fetch
+in the history. It answers `unclear` for most of these, which under
+`enforce` is asked about rather than allowed. A script fetched into the
+project and run from there is not flagged. **Status:** covered, with that
+gap.
 
 **Evidence:** `adversarial:fetched-script-piped-to-shell`,
 `adversarial:fetched-script-in-command-substitution`,
 `adversarial:encoded-payload-piped-to-shell`,
-`adversarial:fetched-then-run-in-two-steps` (a miss),
+`adversarial:fetched-then-run-in-two-steps`,
 `test_safety::test_eval_in_a_command_position_escalates`,
 `test_safety::test_enforce_asks_about_an_unclear_verdict`.
 
@@ -165,13 +173,16 @@ squat. **Status:** covered.
 **Threat:** T8. **Control:** `sending-data-off-the-machine` asks about an
 upload — `curl` or `wget` with data, a raw socket, a remote copy, `ssh` fed
 through a pipe, a cloud-storage upload — to any host not in
-`[safety] expected_hosts`. A secret sent to an expected host, or sent by an
+`[safety] expected_hosts`, and a command the gate cannot split into words
+whose text names a sender. A secret sent to an expected host, or sent by an
 interpreter's own code, is not seen. **Status:** covered, with those gaps.
 
 **Evidence:** `test_safety::test_sending_to_an_unexpected_host_is_asked_about`,
 `test_safety::test_fetching_loopback_and_expected_hosts_are_not_egress`,
 `adversarial:upload-env-file`, `adversarial:pipe-env-to-socket`,
-`adversarial:copy-secrets-to-a-remote-host`.
+`adversarial:copy-secrets-to-a-remote-host`,
+`adversarial:upload-behind-unsplittable-quoting`,
+`test_safety::test_a_command_that_will_not_split_still_matches_what_its_text_names`.
 
 ### C6 — The agent reads credentials in the home directory
 
@@ -187,7 +198,8 @@ home directory outside the project. Outside the home directory is not watched.
 `adversarial:read-private-key-from-shell`,
 `adversarial:read-private-key-with-read-tool`,
 `adversarial:read-cloud-credentials`,
-`adversarial:read-another-projects-secrets`.
+`adversarial:read-another-projects-secrets`,
+`adversarial:read-another-projects-secrets-behind-unsplittable-quoting`.
 
 ### C7 — Credentials at rest in the working tree
 
@@ -217,7 +229,15 @@ the home directory. **Status:** covered.
 
 **Threat:** T11. **Control:** `changing-the-gate` settles a write, move or
 delete of the gate's settings, its hook entry, its record or a declared rule
-file as `unsafe`, with no model, so it holds with the backend down. A write
+file as `unsafe`, with no model, so it holds with the backend down — and
+`vibe-sentinel hook --install`, which rewrites the mode without naming the
+file. `vibe-sentinel status` says which mode is in force and where the hook
+is installed, and says so when it is not. `hook --install --managed` puts the
+hook in managed settings no project can override and the mode and dangers in a
+system policy no project can lower; those files are protected the same way,
+so the agent cannot switch the gate off by editing what it owns — though as
+the same user it can still try, and `sudo` is asked about, not prevented. A
+write
 hidden in an interpreter's code is not seen. **Status:** covered, with that
 gap.
 
@@ -225,7 +245,13 @@ gap.
 `test_safety::test_reading_the_gate_or_naming_the_root_is_not_changing_it`,
 `test_safety::test_editing_the_gate_is_refused_under_enforce_with_the_model_down`,
 `adversarial:edit-sentinel-config`, `adversarial:turn-gate-off-from-shell`,
-`adversarial:rewrite-hook-settings`.
+`adversarial:rewrite-hook-settings`,
+`adversarial:turn-gate-off-through-its-own-cli`,
+`test_safety::test_reinstalling_the_hook_is_changing_the_gate`,
+`test_cli::test_status_says_nothing_is_installed_in_those_words`,
+`test_system_policy::test_the_floor_holds_at_the_hook`,
+`test_system_policy::test_a_project_cannot_remove_or_soften_a_system_danger`,
+`test_system_policy::test_writing_a_system_file_is_changing_the_gate`.
 
 ### C10 — The audit record moved or deleted
 
@@ -253,11 +279,14 @@ tool whose name says it deletes as `unsafe`; a project names its own tools with
 
 ### C12 — PowerShell
 
-**Threat:** T14. **Control:** none. The danger set reads POSIX shells.
-**Status:** not covered.
+**Threat:** T14. **Control:** `deleting-files` matches `Remove-Item`, and
+`running-unseen-code` matches `iwr … | iex` and `Invoke-Expression` over a
+download. The rest of the danger set reads POSIX shells, and the hook has
+never run on native Windows. **Status:** partial.
 
-**Evidence:** `adversarial:powershell-recursive-delete` and
-`adversarial:powershell-download-and-run`, both recorded as misses.
+**Evidence:** `test_safety::test_destructive_commands_escalate`,
+`adversarial:powershell-recursive-delete`,
+`adversarial:powershell-download-and-run`.
 
 ### C13 — Prompt injection against the judge
 
@@ -291,7 +320,8 @@ for the answer side only.
 
 **Threat:** T18. **Control:** a credential excerpt goes only to a loopback
 endpoint, reduced to a prefix and a shape; no environment variable can change
-that. **Status:** prevented.
+that. An explicit `[credentials] allow_remote_model = true` permits a remote
+endpoint. **Status:** prevented by default.
 
 **Evidence:** `test_credentials::test_a_remote_endpoint_is_refused`,
 `test_credentials::test_nothing_is_sent_to_a_remote_endpoint`,

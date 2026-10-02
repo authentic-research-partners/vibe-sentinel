@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import time
 from datetime import UTC, datetime
@@ -79,7 +80,7 @@ from vibe_sentinel.db.connection import (
     db_path,
     get_db,
 )
-from vibe_sentinel.journal import HookEvent
+from vibe_sentinel.journal import ActionRequest, Decision
 
 #: Events that could not reach the database land here, one JSON object
 #: per line. ``vibe-sentinel hook --replay`` drains it.
@@ -142,54 +143,12 @@ def find_project_root(start: Path) -> Path | None:
         current = parent
 
 
-def parse_event(raw: str) -> HookEvent | None:
-    """Parse one hook payload, or None when it is not usable.
-
-    Three things are unusable: text that is not JSON, JSON that is not an
-    object, and an object with no ``tool_name``. Everything past that is
-    coerced by :meth:`~vibe_sentinel.journal.HookEvent.from_payload` — a
-    field of an unexpected type costs that field, not the event. Refusing
-    the whole payload over one surprising value would drop a record of
-    something the agent really did, at exactly the moment something
-    unexpected was happening.
-
-    ``tool_name`` is the exception because it is not a surprising field,
-    it is the whole event: a ``PreToolUse`` payload always carries one,
-    so an object without it came from a different program's schema. That
-    distinction matters here more than most places. Coercion would happily
-    accept it and append a row naming no tool and no command — a record
-    asserting that an agent did something unidentifiable, which is worse
-    than no row at all, and indistinguishable in the journal from a real
-    call this build failed to read.
-    """
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as e:
-        logger.debug("hook: payload is not JSON ({}) — ignoring", e)
-        return None
-    if not isinstance(payload, dict):
-        logger.debug("hook: payload is {}, not an object — ignoring", type(payload))
-        return None
-    if not str(payload.get("tool_name") or "").strip():
-        # Loud, not debug: every payload reaching here is one somebody
-        # wired up, so this is a misconfiguration rather than noise, and
-        # the fields it did carry are the only clue to whose schema it is.
-        logger.warning(
-            "hook: payload carries no 'tool_name', so nothing was recorded. "
-            "This build reads Claude Code's PreToolUse schema; the payload "
-            "had: {}",
-            ", ".join(sorted(payload)[:10]) or "(no fields)",
-        )
-        return None
-    return HookEvent.from_payload(payload)
-
-
 def spill_path(root: Path) -> Path:
     """Where events go when the database is unavailable."""
     return db_path(root).parent / SPILL_NAME
 
 
-def spill(root: Path, event: HookEvent, occurred_at: str, reason: str) -> bool:
+def spill(root: Path, request: ActionRequest, occurred_at: str, reason: str) -> bool:
     """Append one unrecordable event to the spill file.
 
     Returns whether it landed. Failing here is the end of the line: the
@@ -210,7 +169,7 @@ def spill(root: Path, event: HookEvent, occurred_at: str, reason: str) -> bool:
             {
                 "occurred_at": occurred_at,
                 "reason": reason,
-                "payload": event.as_payload(),
+                "request": request.as_dict(),
             },
             sort_keys=True,
         )
@@ -224,7 +183,7 @@ def spill(root: Path, event: HookEvent, occurred_at: str, reason: str) -> bool:
 
 
 def record_event(
-    root: Path, event: HookEvent, occurred_at: str
+    root: Path, request: ActionRequest, occurred_at: str
 ) -> tuple[str, int | None]:
     """Record one event, spilling it if the database cannot take it.
 
@@ -236,41 +195,28 @@ def record_event(
     """
     try:
         with get_db(root, JOURNAL_DURABILITY) as conn:
-            command_id = journal_store.record_command(conn, event, occurred_at)
+            command_id = journal_store.record_command(conn, request, occurred_at)
     except (SchemaMismatchError, sqlite3.Error, OSError) as e:
-        spill(root, event, occurred_at, str(e))
+        spill(root, request, occurred_at, str(e))
         return ("spilled", None)
     if command_id is None:
         return ("duplicate", None)
     return ("recorded", command_id)
 
 
-def _deny(reason: str) -> dict[str, Any]:
-    """The JSON that tells Claude Code to refuse this tool call."""
-    return {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": reason,
-        }
-    }
+def _deny(reason: str) -> Decision:
+    """Refuse this tool call."""
+    return Decision("deny", reason)
 
 
-def _ask(reason: str) -> dict[str, Any]:
-    """The JSON that hands this tool call to the person to approve or refuse.
+def _ask(reason: str) -> Decision:
+    """Hand this tool call to the person to approve or refuse.
 
-    Claude Code shows its own permission prompt, with ``reason`` on it.
-    Where nobody can answer — a ``claude -p`` run with no permission host —
-    Claude Code denies the request instead, so ``reason`` has to carry the
-    fix as well as the doubt.
+    Where nobody can answer — a ``claude -p`` run with no permission host,
+    or an agent event with no prompt — the call ends refused instead, so
+    ``reason`` has to carry the fix as well as the doubt.
     """
-    return {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "ask",
-            "permissionDecisionReason": reason,
-        }
-    }
+    return Decision("ask", reason)
 
 
 def _no_verdict_reason(
@@ -295,7 +241,7 @@ def _no_verdict_reason(
     )
 
 
-def _unreadable_config(error: str) -> dict[str, Any]:
+def _unreadable_config(error: str) -> Decision:
     """What to do when the safety mode itself cannot be read.
 
     Refuse. The gate cannot establish whether it is switched on, so it
@@ -356,7 +302,7 @@ def _untriageable(
     mode: str,
     reason: str,
     fix: str,
-) -> dict[str, Any] | None:
+) -> Decision | None:
     """What to do when something triage reads will not load.
 
     Two things can: the project's ``[[danger]]`` set, and its
@@ -394,8 +340,8 @@ def _untriageable(
 
 
 def gate(
-    root: Path, event: HookEvent, command_id: int, occurred_at: str
-) -> dict[str, Any] | None:
+    root: Path, request: ActionRequest, command_id: int, occurred_at: str
+) -> Decision | None:
     """Judge one recorded command, and decide whether to stop it.
 
     Returns the decision JSON for Claude Code, or None to say nothing —
@@ -443,7 +389,7 @@ def gate(
 
         try:
             signals = triage(
-                event.tool_name, event.command_text(), event.target(), root, dangers
+                request.tool_name, request.command, request.target, root, dangers
             )
         except ManifestUnreadable as e:
             return _untriageable(
@@ -465,8 +411,8 @@ def gate(
         with get_db(root, JOURNAL_DURABILITY) as conn:
             history = journal_store.recent_commands_for_actor(
                 conn,
-                event.session_id,
-                event.agent_id,
+                request.session_id,
+                request.agent_id,
                 limit=config.safety_history,
                 before_id=command_id,
             )
@@ -489,10 +435,10 @@ def gate(
 
             opinion = asyncio.run(
                 review(
-                    event.tool_name,
-                    event.command_text(),
-                    event.target(),
-                    event.cwd,
+                    request.tool_name,
+                    request.command,
+                    request.target,
+                    request.cwd,
                     root,
                     signals,
                     list(history),
@@ -584,29 +530,36 @@ def handle(raw: str, *, default_cwd: Path | None = None) -> str:
 
 
 def guard(
-    raw: str, *, default_cwd: Path | None = None
+    raw: str, *, agent: str = "claude-code", default_cwd: Path | None = None
 ) -> tuple[str, dict[str, Any] | None]:
-    """Record one payload, then decide whether to let the command run.
+    """Record one payload, then decide whether to let the call run.
 
-    Returns the outcome and, when the safety gate is set to ``enforce``
-    and the command was judged unsafe, the JSON Claude Code should act
-    on. The caller writes that to stdout; nothing else ever goes there.
+    ``agent`` names the adapter that reads the payload and writes the reply.
+    Returns the outcome and the JSON that agent should act on — None to
+    print nothing. The caller writes it to stdout; nothing else ever goes
+    there.
     """
-    event = parse_event(raw)
-    if event is None:
-        return ("unparsed", None)
+    from vibe_sentinel.agents import adapter
 
-    start = Path(event.cwd) if event.cwd else (default_cwd or Path.cwd())
+    reader = adapter(agent)
+    request = reader.read(raw)
+    if request is None:
+        return ("unparsed", reader.reply(None, None))
+
+    start = Path(request.cwd) if request.cwd else (default_cwd or Path.cwd())
     root = find_project_root(start)
     if root is None:
         logger.debug("hook: {} is not inside a watched project — ignoring", start)
-        return ("unwatched", None)
+        return ("unwatched", reader.reply(None, request))
 
     occurred_at = now_iso()
-    outcome, command_id = record_event(root, event, occurred_at)
+    outcome, command_id = record_event(root, request, occurred_at)
     if command_id is None:
-        return (outcome, None)
-    return (outcome, gate(root, event, command_id, occurred_at))
+        return (outcome, reader.reply(None, request))
+    return (
+        outcome,
+        reader.reply(gate(root, request, command_id, occurred_at), request),
+    )
 
 
 def replay_spill(root: Path) -> tuple[int, int]:
@@ -654,18 +607,29 @@ def replay_spill(root: Path) -> tuple[int, int]:
     return (recorded, len(unrecoverable))
 
 
-def _from_spill_line(line: str) -> tuple[HookEvent | None, str]:
-    """One spill line back into an event and the time it happened."""
+def _from_spill_line(line: str) -> tuple[ActionRequest | None, str]:
+    """One spill line back into a request and the time it happened.
+
+    A line carries ``request``, the engine's form. A line written before
+    agents had adapters carries ``payload``, which was always Claude Code's,
+    and is read through that adapter: a queue somebody was promised would be
+    replayed is replayed, whichever build wrote it.
+    """
     try:
         record = json.loads(line)
-        payload = record["payload"]
         occurred_at = str(record["occurred_at"])
     except (json.JSONDecodeError, KeyError, TypeError) as e:
         logger.debug("hook: unreadable spill line ({})", e)
         return (None, "")
-    if not isinstance(payload, dict):
+    if not isinstance(record, dict):
         return (None, "")
-    return (HookEvent.from_payload(payload), occurred_at)
+    if isinstance(record.get("request"), dict):
+        return (ActionRequest.from_dict(record["request"]), occurred_at)
+    if isinstance(record.get("payload"), dict):
+        from vibe_sentinel.agents.claude_code import HookEvent
+
+        return (HookEvent.from_payload(record["payload"]).request(), occurred_at)
+    return (None, "")
 
 
 # ---------------------------------------------------------------------------
@@ -696,21 +660,86 @@ def settings_path(root: Path) -> Path:
     return root / ".claude" / "settings.json"
 
 
-def is_installed(settings: dict[str, object], command: str = HOOK_COMMAND) -> bool:
-    """Whether ``command`` is already wired to PreToolUse in ``settings``."""
+def is_this_hook(command: object) -> bool:
+    """Whether a settings entry's ``command`` runs this tool's hook.
+
+    ``vibe-sentinel hook``, however it is reached — a full path, ``uv run``,
+    ``uvx`` — and with nothing after it: ``vibe-sentinel hook --install`` in
+    a settings file would not be a hook that records anything.
+    """
+    if not isinstance(command, str):
+        return False
+    words = command.split()
+    return (
+        len(words) >= 2
+        and words[-1] == "hook"
+        and Path(words[-2]).name == HOOK_COMMAND.split()[0]
+    )
+
+
+def hook_matchers(
+    settings: dict[str, object], command: str = HOOK_COMMAND
+) -> list[str]:
+    """The matcher of every PreToolUse entry in ``settings`` that runs this
+    hook, or ``command`` exactly — empty when none does."""
     hooks = settings.get("hooks")
     if not isinstance(hooks, dict):
-        return False
+        return []
     entries = hooks.get("PreToolUse")
     if not isinstance(entries, list):
-        return False
+        return []
+    found: list[str] = []
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        for spec in entry.get("hooks", []):
-            if isinstance(spec, dict) and spec.get("command") == command:
-                return True
-    return False
+        specs = entry.get("hooks", [])
+        for spec in specs if isinstance(specs, list) else []:
+            if isinstance(spec, dict) and (
+                spec.get("command") == command or is_this_hook(spec.get("command"))
+            ):
+                found.append(str(entry.get("matcher", "")))
+    return found
+
+
+def is_installed(settings: dict[str, object], command: str = HOOK_COMMAND) -> bool:
+    """Whether this hook is already wired to PreToolUse in ``settings``."""
+    return bool(hook_matchers(settings, command))
+
+
+def claude_settings_files(root: Path) -> list[tuple[str, Path]]:
+    """``(scope, path)`` for each Claude Code settings file that can carry a
+    hook for this project, broadest first.
+
+    The managed file is this tool's own in ``managed-settings.d``, written
+    by ``hook --install --managed``; a hook an organisation put in its own
+    ``managed-settings.json`` is not read here.
+    """
+    from vibe_sentinel import paths
+
+    return [
+        ("managed", paths.claude_managed_hook_path()),
+        ("user", Path.home() / ".claude" / "settings.json"),
+        ("project", settings_path(root)),
+        ("local", root / ".claude" / "settings.local.json"),
+    ]
+
+
+def read_settings(path: Path) -> dict[str, object] | None:
+    """A settings file as an object; None when there is no file.
+
+    Raises ``ValueError`` naming the file when it is there and is not a JSON
+    object: a file that will not parse is not a file with no hook in it.
+    """
+    if not path.is_file():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8")
+        loaded = json.loads(text) if text.strip() else {}
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise ValueError(f"{path} could not be read as JSON ({e})") from e
+    if not isinstance(loaded, dict):
+        raise ValueError(f"{path} holds a {type(loaded).__name__}, not a JSON object")
+    return loaded
 
 
 def install(
@@ -733,12 +762,12 @@ def install(
         except json.JSONDecodeError as e:
             raise ValueError(
                 f"{path} is not valid JSON ({e}). Fix or move it, then re-run "
-                f"`vibe-sentinel hook --install`."
+                f"`vibe-sentinel hook --install --mode <choice>`."
             ) from e
         if not isinstance(loaded, dict):
             raise ValueError(
                 f"{path} holds a {type(loaded).__name__}, not a JSON object. "
-                f"Fix or move it, then re-run `vibe-sentinel hook --install`."
+                f"Fix or move it, then re-run `vibe-sentinel hook --install --mode <choice>`."
             )
         settings = loaded
 
@@ -749,13 +778,13 @@ def install(
     if not isinstance(hooks, dict):
         raise ValueError(
             f"{path} has a 'hooks' key that is not an object. Fix it, then "
-            f"re-run `vibe-sentinel hook --install`."
+            f"re-run `vibe-sentinel hook --install --mode <choice>`."
         )
     entries = hooks.setdefault("PreToolUse", [])
     if not isinstance(entries, list):
         raise ValueError(
             f"{path} has a 'hooks.PreToolUse' key that is not a list. Fix it, "
-            f"then re-run `vibe-sentinel hook --install`."
+            f"then re-run `vibe-sentinel hook --install --mode <choice>`."
         )
     entries.append(settings_entry(command, matcher))
 
@@ -767,3 +796,124 @@ def install(
         logger.info("backed up {} to {}", path, backup)
     path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
     return (path, True)
+
+
+# ---------------------------------------------------------------------------
+# Choosing the mode at install
+# ---------------------------------------------------------------------------
+
+#: What ``hook --install --mode`` offers, and the ``[safety] mode`` each
+#: writes. ``journal`` is the hook with the gate off: every call recorded,
+#: none judged.
+INSTALL_MODES: dict[str, str] = {
+    "journal": "off",
+    "observe": "observe",
+    "enforce": "enforce",
+}
+
+#: What each ``[safety] mode`` does, in the words ``status`` and
+#: ``hook --install`` print.
+MODE_MEANING: dict[str, str] = {
+    "off": "records every tool call; judges none and blocks none",
+    "observe": "judges each flagged call and records the verdict; blocks none",
+    "enforce": "refuses an unsafe call, and asks you about one with no verdict",
+}
+
+_TABLE_RE = re.compile(r"^\s*\[")
+_SAFETY_RE = re.compile(r"^\s*\[\s*safety\s*\]\s*(?:#.*)?$")
+_MODE_RE = re.compile(r"^\s*mode\s*=")
+_DOTTED_RE = re.compile(r"^\s*safety\s*[.=]")
+
+
+def set_mode(root: Path, mode: str) -> Path:
+    """Write ``[safety] mode`` into the project's config; see :func:`set_mode_at`."""
+    return set_mode_at(root / CONFIG_FILENAME, mode)
+
+
+def set_mode_at(path: Path, mode: str) -> Path:
+    """Write ``[safety] mode`` into one file, and prove it took.
+
+    A line edit rather than a rewrite, so every comment in the file stays
+    where it is: the ``mode`` line inside ``[safety]`` is replaced, or added
+    under the header, or a ``[safety]`` table is appended. The file is then
+    read back with :func:`~vibe_sentinel.safety.declared_safety`, the reader
+    the hook uses, and if it does not declare ``mode`` the original bytes
+    are put back and this raises — a file this could not edit must not be
+    left reading as some other mode. What it declares, not what is in
+    force: a system policy may hold the mode higher, and that is not this
+    file failing to say what it was told.
+
+    ``OSError`` — no permission, most often, for the system policy — is
+    raised before anything is written.
+    """
+    from vibe_sentinel.safety import declared_safety
+
+    if mode not in INSTALL_MODES.values():
+        raise ValueError(
+            f"mode {mode!r} is not one of {sorted(INSTALL_MODES.values())}"
+        )
+    original = path.read_text(encoding="utf-8") if path.is_file() else None
+    lines = (original or "").splitlines()
+    line = f'mode = "{mode}"'
+
+    header = next((i for i, text in enumerate(lines) if _SAFETY_RE.match(text)), None)
+    if header is None:
+        if any(_DOTTED_RE.match(text) for text in lines):
+            raise ValueError(
+                f"{path} declares safety as a dotted key or an inline table, "
+                f'which this does not edit. Set `mode = "{mode}"` under '
+                f"[safety] yourself, then check it with `vibe-sentinel status`."
+            )
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines += ["[safety]", line]
+    else:
+        end = next(
+            (i for i in range(header + 1, len(lines)) if _TABLE_RE.match(lines[i])),
+            len(lines),
+        )
+        existing = next(
+            (i for i in range(header + 1, end) if _MODE_RE.match(lines[i])), None
+        )
+        if existing is None:
+            lines.insert(header + 1, line)
+        else:
+            lines[existing] = line
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    try:
+        written, _ = declared_safety(path)
+    except ValueError as e:
+        written, problem = None, str(e)
+    else:
+        problem = f"it reads back as {written!r}"
+    if written != mode:
+        if original is None:
+            path.unlink()
+        else:
+            path.write_text(original, encoding="utf-8")
+        raise ValueError(
+            f"Could not set [safety] mode in {path}: {problem}. The file is "
+            f'unchanged. Set `mode = "{mode}"` under [safety] yourself.'
+        )
+    return path
+
+
+def install_managed(matcher: str = DEFAULT_MATCHER) -> tuple[Path, str]:
+    """The Claude Code hook in this tool's own managed-settings file.
+
+    Returns ``(path, content)`` once written. ``OSError`` — no permission,
+    as a rule, because only an administrator should be able to write there
+    — is raised with nothing written, and the caller prints both for
+    whoever has the rights.
+    """
+    from vibe_sentinel import paths
+
+    path = paths.claude_managed_hook_path()
+    content = json.dumps(
+        {"hooks": {"PreToolUse": [settings_entry(matcher=matcher)]}}, indent=2
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content + "\n", encoding="utf-8")
+    return path, content

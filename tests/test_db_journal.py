@@ -8,7 +8,7 @@ import pytest
 
 from vibe_sentinel.db import journal_store, store
 from vibe_sentinel.db.connection import db_path, get_db, init_db
-from vibe_sentinel.journal import HOOK_EVENT_FIELDS, HookEvent
+from vibe_sentinel.agents.claude_code import HOOK_EVENT_FIELDS, HookEvent
 from vibe_sentinel.schemas import DriftReport, Snapshot
 
 
@@ -44,7 +44,7 @@ def event(
 
 def record(project: Path, ev: HookEvent, at: str) -> int | None:
     with get_db(project) as conn:
-        return journal_store.record_command(conn, ev, at)
+        return journal_store.record_command(conn, ev.request(), at)
 
 
 # --- actors ----------------------------------------------------------------

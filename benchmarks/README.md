@@ -27,7 +27,7 @@ backend that serialises and it will report a different answer. That is the
 measurement working, and it is exactly why `concurrency` is a setting
 rather than a constant.
 
-## The three suites
+## The four suites
 
 ### `concurrency` — what the fan-out width buys
 

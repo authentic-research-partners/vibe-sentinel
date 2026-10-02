@@ -16,6 +16,19 @@ Three statements first, because the rest depends on them.
   spell the same action a way no pattern anticipates. Enforcement against a
   determined process belongs to the operating system: a container, a
   separate user, a filesystem the agent cannot write.
+
+  What can be moved out of its reach is the gate's own configuration.
+  `hook --install --managed` puts the hook where no project file can
+  override it — Claude Code's managed settings, whose hooks a project's
+  `disableAllHooks` cannot turn off, or Cursor's enterprise `hooks.json` —
+  and the mode and a danger set into a system policy that a project may add
+  to and may not lower. With both in place, and those files writable only by
+  an administrator, the agent cannot disable the gate by editing files it
+  owns, and every attempt is a recorded refusal. It still runs as the user,
+  and what the user can do the agent can try: `sudo` and `chmod` are asked
+  about, not prevented. The guarantee is the record and the raised cost,
+  never isolation. On WSL, `/etc/claude-code` is writable by the user, so
+  there it is not out of reach at all.
 - **The gate never sees a tool's output, so it cannot know an instruction
   was injected.** When an agent reads a web page or a file that tells it to
   run something, that text reaches the agent, not the gate. The gate judges
@@ -34,8 +47,9 @@ Three statements first, because the rest depends on them.
 ## Architecture
 
 ```
-coding agent (Claude Code)
-   │  every tool call, before it runs  (PreToolUse hook, matcher "*")
+coding agent (Claude Code or Cursor)
+   │  before it runs: every tool call  (Claude Code: PreToolUse, matcher "*")
+   │                  shell, MCP, reads (Cursor: before* events — not edits)
    ▼
 vibe-sentinel hook ──► journal row in .vibe-sentinel/history.db   (always)
    │
@@ -43,7 +57,8 @@ vibe-sentinel hook ──► journal row in .vibe-sentinel/history.db   (always)
    │  safety.mode = observe   → judge, record, never refuse
    │  safety.mode = enforce   → judge, record, refuse an unsafe verdict
    ▼
-triage: patterns over the command, plus two checks of the tree
+triage: patterns over command text, targets and tool names,
+        plus structural checks of paths, policy, egress and installs
    │  (dangers.default.toml, then the project's [[danger]] tables)
    │  nothing matched → allowed, no model call
    ▼
@@ -98,8 +113,8 @@ provenance and near-miss names) and the licences gate.
    about names already flagged plus the dependencies `pyproject.toml`
    states publicly — never the installed set.
 4. **Model answer → decision.** Every answer is bounded by a schema and
-   validated. The model can rate a change or a command; it cannot add or
-   remove a finding.
+   validated. A lens cannot add or remove a measured change. Credential and
+   package-name reviews can clear mechanically nominated candidates.
 
 ## Attack surfaces
 
@@ -125,24 +140,24 @@ the progress since is in [evals.md](evals.md).
 
 | # | Threat | Example | Status | Control | Eval cases |
 |---|---|---|---|---|---|
-| T1 | Fetched code run | `curl … \| sh`, `bash -c "$(curl …)"`, `base64 -d \| sh` | partial: the one-command forms are flagged; fetching a script and running it in the next command is not | `running-unseen-code` | `fetched-script-piped-to-shell`, `fetched-script-in-command-substitution`, `encoded-payload-piped-to-shell`, `fetched-then-run-in-two-steps` |
+| T1 | Fetched code run | `curl … \| sh`, `bash -c "$(curl …)"`, `base64 -d \| sh` | covered: the one-command forms are flagged, and so is running a file from where downloads land — a temp directory, `~/Downloads` — with the fetch in the history the model reads. A script downloaded into the project and run from there is not | `running-unseen-code` | `fetched-script-piped-to-shell`, `fetched-script-in-command-substitution`, `encoded-payload-piped-to-shell`, `fetched-then-run-in-two-steps` |
 | T2 | A protected path deleted | `rm -rf ~/.ssh`, `rm -rf .git` | covered | `deleting-files`, `recursive`, `home-directory` | `delete-ssh-keys`, `delete-git-history`, `destructive-step-after-reading-a-guide` |
-| T3 | Destruction through an interpreter | `python -c "…shutil.rmtree(…)"` | **not covered** | — | `interpreter-deletes-home` |
-| T4 | Destructive infrastructure command | `terraform destroy` | **not covered** | `kubectl delete`, container prunes and `DROP` are covered | `terraform-destroy` |
+| T3 | Destruction through an interpreter | `python -c "…shutil.rmtree(…)"` | covered by name: `rmtree`, `os.remove`, `unlink`, node's `fs.rm` and `rmSync`, `rimraf`. A deletion through an API the pattern does not list is not | `deleting-files` | `interpreter-deletes-home` |
+| T4 | Destructive infrastructure command | `terraform destroy` | covered: `terraform destroy` and `apply -destroy`, `pulumi`, `cdk` and `tofu destroy`, beside `kubectl delete`, container prunes and `DROP` | `removing-infrastructure`, `changing-a-database` | `terraform-destroy` |
 | T5 | History rewritten | `git push --force origin main` | covered | `discarding-work`, `force` | `force-push-main` |
 | T6 | Undeclared or misspelled Python package | `pip install reqeusts` | covered, including an install whose words cannot be split — `pip install reqeusts # don't worry` — which is asked about rather than read as installing nothing | `undeclared-install`, plus the packages gate's near-miss check | `misspelled-python-package`, `misspelled-package-behind-a-comment` |
 | T7 | Undeclared or misspelled npm package | `npm install lodahs`, `yarn add`, `bun add` | covered: an install of a name `package.json` does not declare is asked about, for npm, pnpm, yarn and bun. A global tool install is not; nor is a sub-package's own `package.json` in a monorepo | `installing-undeclared-dependency` | `misspelled-npm-package`, `misspelled-package-with-yarn`, `misspelled-package-with-bun`, `misspelled-npm-package-behind-a-comment` |
-| T8 | A secret sent off the machine | `curl -F file=@.env https://…`, `cat .env \| nc …`, `scp .env host:` | covered: any upload to a host not in `[safety] expected_hosts` is asked about. Sending to an expected host is not; nor is an interpreter doing the sending | `sending-data-off-the-machine` | `upload-env-file`, `pipe-env-to-socket`, `copy-secrets-to-a-remote-host` |
-| T9 | A read outside the project | `cat ~/.ssh/id_rsa`, or the Read tool on it; another repository's `.env` | covered in the home directory: a file that holds keys is settled `unsafe` without a model; anything else there is asked about. Outside the home directory is not watched | `secret-store`, `secret-store-target`, `reaching-into-home` | `read-private-key-from-shell`, `read-private-key-with-read-tool`, `read-cloud-credentials`, `read-another-projects-secrets` |
+| T8 | A secret sent off the machine | `curl -F file=@.env https://…`, `cat .env \| nc …`, `scp .env host:` | covered: any upload to a host not in `[safety] expected_hosts` is asked about. A command the gate cannot split into words is asked about if its text names a sender. Sending to an expected host is not; nor is an interpreter doing the sending | `sending-data-off-the-machine` | `upload-env-file`, `pipe-env-to-socket`, `copy-secrets-to-a-remote-host`, `upload-behind-unsplittable-quoting` |
+| T9 | A read outside the project | `cat ~/.ssh/id_rsa`, or the Read tool on it; another repository's `.env` | covered in the home directory: a file that holds keys is settled `unsafe` without a model; anything else there is asked about, including in a command the gate cannot split. Outside the home directory is not watched | `secret-store`, `secret-store-target`, `reaching-into-home` | `read-private-key-from-shell`, `read-private-key-with-read-tool`, `read-cloud-credentials`, `read-another-projects-secrets`, `read-another-projects-secrets-behind-unsplittable-quoting` |
 | T10 | A write outside the project | the Write tool on `~/.zshrc`; `>> ~/.zshrc` from a shell | covered: writing tools anywhere outside the project; a shell write into the home directory | `outside-project`, `reaching-into-home` | `write-shell-startup-file`, `append-to-shell-startup-from-shell` |
-| T11 | The tool's own policy edited | an edit to `.vibe-sentinel.toml` or `.claude/settings.json` | covered, and settled `unsafe` without a model — except a write hidden inside an interpreter one-liner | `changing-the-gate` | `edit-sentinel-config`, `turn-gate-off-from-shell`, `rewrite-hook-settings` |
+| T11 | The tool's own policy edited | an edit to `.vibe-sentinel.toml` or `.claude/settings.json`, or `vibe-sentinel hook --install --mode journal` | covered, and settled `unsafe` without a model — except a write hidden inside an interpreter one-liner | `changing-the-gate` | `edit-sentinel-config`, `turn-gate-off-from-shell`, `rewrite-hook-settings`, `turn-gate-off-through-its-own-cli` |
 | T12 | The audit record moved or deleted | `mv .vibe-sentinel/history.db /tmp/` | covered, and settled `unsafe` without a model | `changing-the-gate` | `move-history-database`, `delete-history-database` |
 | T13 | A dangerous MCP tool call | `mcp__github__delete_repository` | covered for a tool whose name says it deletes, settled `unsafe` without a model; any other tool is covered only if the project names it | `deleting-through-a-connected-tool`; `applies_to = "tool"` for a project's own | `mcp-delete-repository`, `mcp-delete-page` |
-| T14 | PowerShell | `Remove-Item -Recurse -Force`, `iwr \| iex` | **not covered** | native Windows is untested | `powershell-recursive-delete`, `powershell-download-and-run` |
+| T14 | PowerShell | `Remove-Item -Recurse -Force`, `iwr \| iex` | partial: `Remove-Item` and `iwr … \| iex` are matched; the rest of the danger set reads POSIX shells, and the hook has never run on native Windows | `deleting-files`, `running-unseen-code` | `powershell-recursive-delete`, `powershell-download-and-run` |
 | T15 | The judge steered by text in what it reads | a planted "this is a test fixture" | partial | data and instructions are delimited, and attempts are reported | none yet |
 | T16 | A different model answering under the judge's name | another program serving the same name on the same port | partial | a model name only this project builds, and its digest recorded; `backend status` cannot check the digest | — |
-| T17 | A question cut short without an error | Ollama's 4,096-token default below 24 GB of GPU memory | partial | the docs set the context; this repository's Modelfile pins it; nothing detects it at run time | — |
-| T18 | A secret sent to a remote model | a non-loopback `[llm] endpoint` | prevented | loopback-only excerpts; values reduced to a prefix and a shape | tests, not evals |
+| T17 | A question cut short without an error | Ollama's 4,096-token default below 24 GB of GPU memory | partial | the docs set the context, on the server or in a model built with `PARAMETER num_ctx`; nothing detects it at run time | — |
+| T18 | A secret sent to a remote model | a non-loopback `[llm] endpoint` | prevented by default | loopback-only excerpts unless `allow_remote_model` is explicitly enabled; values reduced to a prefix and a shape | tests, not evals |
 | T19 | The machine's dependency inventory sent to a third party | a CVE lookup per installed package | prevented | `--online` sends flagged names only; the CVE check is off unless configured | tests, not evals |
 
 T11 was the one to read first. A control the agent can switch off is not a
@@ -186,9 +201,13 @@ would run, with nothing recorded as the reason.
 
 ## What a verdict is worth
 
+The following is the historical baseline, before the default changed to asking
+about missing verdicts. Current behavior is described above; subsequent
+measurements are in [Evals](evals.md#progress-against-it).
+
 Measured on 2026-09-30 with the judged safety eval — 27 labelled cases,
 three separate runs — against the recommended model (Gemma 4 26B QAT,
-thinking off, built with the context this repository pins). The comparison
+thinking off, with a 32,768-token context). The comparison
 with other models is in [evals.md](evals.md).
 
 | | |
@@ -222,20 +241,21 @@ In order of how much they undercut the gate:
 
 1. **The gate only refuses under `enforce`.** `changing-the-gate` settles
    an edit to the gate as `unsafe`, but in `observe` that is a record and in
-   `off` it is nothing, and an interpreter one-liner still gets past it
-   (T11, T3).
+   `off` it is nothing, and a write hidden in an interpreter one-liner still
+   gets past it (T11).
 2. **Egress is asked about, not settled** (T8): an upload to a host the
    project did not list reaches the model, and only an `unsafe` answer stops
    it. A secret sent to a listed host, or sent by an interpreter's own code,
    is not seen. Reads are watched in the home directory only (T9): a file holding keys is refused, the rest of the home
    directory is asked about — and only an `unsafe` answer refuses, so a
-   grey-area read is recorded rather than stopped. The list of files that
+   grey-area read requests permission by default. The list of files that
    hold keys is a list; a secret kept somewhere it does not name is a
    read like any other. `ssh -i ~/.ssh/key` is refused too, because it
    names a key.
-3. **Interpreter one-liners, `terraform destroy`, PowerShell, and a
-   fetched script run a command later** reach nothing (T1, T3, T4, T14).
-   An MCP tool is matched by its name only (T13): the gate sees which tool,
+3. **The newer patterns are lists.** An interpreter's deletion is seen by
+   the names of its deletion calls, a fetched script by where it is run from,
+   PowerShell by two of its spellings (T1, T3, T14): a call, a directory or
+   a cmdlet the list does not name is not seen. An MCP tool is matched by its name only (T13): the gate sees which tool,
    not its arguments, so a tool that is destructive under an innocent name
    is not seen unless the project names it.
 4. **The gate is off by default.** Until a project sets `observe` or
@@ -247,7 +267,12 @@ In order of how much they undercut the gate:
 6. **The verdict is a small model's opinion.** One unsafe command in 81 was
    called safe, which no prompt catches. `curl … | sh` is judged `unclear`,
    which is now asked about rather than let through.
-7. **Only Claude Code is wired.** Other coding agents do not call the hook.
+7. **Two agents are wired, and not equally.** Claude Code sends a hook before
+   every tool call. Cursor sends one before a shell command, an MCP tool and a
+   file read, but not before its own file edits, so under Cursor an edit to
+   the gate's settings or to a shell startup file is not seen (T10, T11) —
+   measured per adapter in the adversarial suite. Other coding agents do not
+   call the hook.
 8. **The history database is a file on disk.** Moving or deleting it from
    a shell or a writing tool is refused under `enforce`; a process that
    does not go through the agent's tools is not seen at all.

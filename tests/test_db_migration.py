@@ -20,7 +20,7 @@ from vibe_sentinel.db.connection import (
     init_db,
     read_schema_version,
 )
-from vibe_sentinel.journal import HookEvent
+from vibe_sentinel.agents.claude_code import HookEvent
 from vibe_sentinel.db.migration import (
     BACKUP_DIR_NAME,
     MigrationError,
@@ -347,7 +347,9 @@ def test_v2_adds_the_journal_and_keeps_recorded_runs(tmp_path: Path) -> None:
 
         journal_store.record_command(
             conn,
-            HookEvent(session_id="s", tool_name="Bash", tool_input={"command": "ls"}),
+            HookEvent(
+                session_id="s", tool_name="Bash", tool_input={"command": "ls"}
+            ).request(),
             "2026-01-02T00:00:00.000+00:00",
         )
         assert [c.command for c in journal_store.list_commands(conn)] == ["ls"]
@@ -372,7 +374,7 @@ def test_v4_adds_the_verdict_table_beside_the_commands(tmp_path: Path) -> None:
             conn,
             HookEvent(
                 session_id="s", tool_name="Bash", tool_input={"command": "rm -rf /"}
-            ),
+            ).request(),
             "2026-01-02T00:00:00.000+00:00",
         )
         (command,) = journal_store.list_commands(conn)
@@ -586,7 +588,7 @@ def test_v8_records_what_the_gate_did_and_keeps_every_verdict(tmp_path: Path) ->
                     tool_name="Bash",
                     tool_use_id=f"t{n}",
                     tool_input={"command": command},
-                ),
+                ).request(),
                 f"2026-01-02T00:00:0{n}.000+00:00",
             )
         for command_id, verdict, enforced in ((1, "unsafe", 1), (2, "safe", 0)):

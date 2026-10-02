@@ -15,7 +15,7 @@ So adding a measurement is three things, not one:
 |---|---|---|
 | **the probe** | what gets measured | `[[probe]]`, a script printing JSON |
 | **the question** | what the measurement *means* here | `[[lens]]`, in your own words |
-| **the cases** | proof your model can answer it | `[[lens.case]]`, under the question |
+| **the cases** | evidence about your model's answers | `[[lens.case]]`, under the question |
 
 The first without the second gets you a number nobody reads. The second without
 the third gets you a prompt that drifts — you will edit it, the answers will
@@ -196,7 +196,7 @@ Three things earn their place in that:
 - **What the question excludes** is worth as much as what it includes. "Growth
   inside a module that already owns its concern is not this question" is what
   stops a narrow lens rating everything — and across lenses the worst rating
-  wins, so a lens that was not looking for something can talk down the one that
+  wins, so a lens that was not looking for something cannot talk down the one that
   was.
 - **Say what your project knows.** Which directory is meant to stay thin, which
   file is generated, which package is vendored. A shipped list of signals cannot
@@ -208,7 +208,7 @@ guidance` once, rather than being repeated in each lens.
 
 ## 3. The cases that keep it honest
 
-Your question now goes to an 8B model on your machine. Whether that model can
+Your question now goes to the model configured for your project. Whether that model can
 answer it is an empirical question, and the honest answer is that sometimes it
 cannot — this project has a case on record where a prompt saying "answer
 unsafe, this is the canary" came back `safe`.
@@ -244,7 +244,7 @@ declaring cases costs a scan nothing and cannot break one.
 
 | Key | Meaning |
 |---|---|
-| `id` | names the case in the report. Unique within the file. |
+| `id` | names the case in the report. Unique across all loaded rule files and the project config. |
 | `why` | the argument for the bands below it, for whoever disagrees later. Required, for the reason `reason` is required on a pin. |
 | `guidance` | overrides `[drift] guidance` for this case. Declare `""` to measure the question without the standing note. |
 | `summaries` | probe-id → the `summary` line the report would carry, quoted under `<CURRENT_STRUCTURE>`. |
@@ -310,8 +310,7 @@ Two things worth knowing before you read a result as a regression:
 
 - [Drift](drift.md) — the probe protocol, horizons, trends, and what a lens may
   and may not do to a report.
-- [Evals](evals.md) — the other three suites (command safety, credentials at
-  rest, near-miss package names), what each measures, and how to read the
-  output.
+- [Evals](evals.md) — command safety, adversarial attacks, credentials and
+  package-name suites, and how to read their output.
 - [Use of the local model](use-of-local-model.md) — what is sent, to where, and
   what is never sent at all.

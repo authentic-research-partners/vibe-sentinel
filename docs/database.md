@@ -39,8 +39,11 @@ vibe-sentinel backups                      # every copy, however it was made
 
 This uses SQLite's online backup API, not a file copy. A copy taken mid-write draws pages from two transactions and needs a WAL sidecar that will not match.
 Backups are also taken automatically before a migration, an applied prune, and a
-vacuum. **To restore, copy the file back over the database** — that is the whole
-procedure.
+vacuum. To restore, first stop all processes using this history file, including
+scans and agent hooks. Preserve the current database and any `-wal`/`-shm`
+sidecars together, then put the backup at the configured history path. Do not
+replace a live database or leave old sidecars beside the restored file.
+Run `vibe-sentinel db check` before resuming use.
 
 ## Trimming old records
 

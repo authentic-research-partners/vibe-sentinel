@@ -395,7 +395,48 @@ def _add_hook(sub: Subparsers) -> None:
         "record shell commands only and spend one process per shell "
         "command instead of one per tool call",
     )
+    p_hook.add_argument(
+        "--agent",
+        choices=("claude-code", "cursor"),
+        default="claude-code",
+        help="Whose hook this is: 'claude-code' (default) reads Claude Code's "
+        "PreToolUse payload and --install writes .claude/settings.json; "
+        "'cursor' reads Cursor's beforeShellExecution, beforeMCPExecution and "
+        "beforeReadFile payloads and --install writes .cursor/hooks.json",
+    )
+    p_hook.add_argument(
+        "--managed",
+        action="store_true",
+        help="With --install: write the hook where no project file can "
+        "override it — this tool's own file in Claude Code's "
+        "managed-settings.d, or Cursor's enterprise hooks.json — and --mode "
+        "into the system policy, which a project may raise and not lower. "
+        "Needs an administrator's rights; without them it prints what to "
+        "write and where",
+    )
+    p_hook.add_argument(
+        "--mode",
+        choices=("journal", "observe", "enforce"),
+        default=None,
+        help="What --install sets [safety] mode to, and required with it: "
+        "'journal' records every call and judges none, 'observe' judges "
+        "flagged calls and blocks nothing, 'enforce' refuses unsafe calls and "
+        "asks about unclear ones. Run --install without it to see the numbers "
+        "recorded so far",
+    )
     p_hook.add_argument("--config", help="Path to .vibe-sentinel.toml")
+
+
+def _add_status(sub: Subparsers) -> None:
+    p_status = _command(
+        sub,
+        "status",
+        help="Say what is protecting this repository: where the hook is "
+        "installed, the safety mode, whether the judge answers, and the last "
+        "session's verdicts",
+    )
+    p_status.add_argument("root", nargs="?", default=None, help="Project root")
+    p_status.add_argument("--config", help="Path to .vibe-sentinel.toml")
 
 
 def _add_commands(sub: Subparsers) -> None:
@@ -633,6 +674,7 @@ def _add_backend(sub: Subparsers) -> None:
 #: that is not here does not exist: there is one list, and adding to it
 #: is how a command is registered.
 COMMANDS: tuple[Callable[[Subparsers], None], ...] = (
+    _add_status,
     _add_scan,
     _add_history,
     _add_trend,
@@ -685,15 +727,24 @@ def main(argv: list[str] | None = None) -> int:
     # the hook actually does, and none of it is needed to read one
     # payload from stdin. Any other argv falls through to the parser
     # below, so this can only ever be faster — never different.
-    if arguments == ["hook"]:
+    if arguments == ["hook"] or (
+        len(arguments) == 3 and arguments[:2] == ["hook", "--agent"]
+    ):
         import json
 
         from vibe_sentinel.hook import guard
 
-        _, decision = guard(sys.stdin.read())
+        agent = arguments[2] if len(arguments) == 3 else "claude-code"
+        try:
+            _, decision = guard(sys.stdin.read(), agent=agent)
+        except KeyError as e:
+            # An --agent nobody wrote an adapter for: say so, record nothing,
+            # and leave the call to the agent — this runs in front of it.
+            logger.error(e.args[0])
+            return 0
         if decision is not None:
-            # The only thing this ever writes to stdout, and only when
-            # the safety gate is set to enforce and said no.
+            # The only thing this ever writes to stdout: the reply the agent
+            # acts on.
             print(json.dumps(decision))
         return 0
 
@@ -760,8 +811,12 @@ def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         run_parameters,
         run_safety,
         run_scan,
+        run_status,
         run_trend,
     )
+
+    if args.command == "status":
+        return run_status(args)
 
     if args.command == "scan":
         return run_scan(args)

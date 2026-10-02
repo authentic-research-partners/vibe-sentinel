@@ -20,7 +20,9 @@ from vibe_sentinel import hook
 from vibe_sentinel.__main__ import main
 from vibe_sentinel.db import journal_store
 from vibe_sentinel.db.connection import db_path, get_db, init_db
-from vibe_sentinel.journal import HOOK_EVENT_FIELDS, HookEvent
+from vibe_sentinel.agents import claude_code
+from vibe_sentinel.agents.claude_code import HOOK_EVENT_FIELDS, HookEvent
+from vibe_sentinel.journal import ActionRequest
 
 
 @pytest.fixture
@@ -304,9 +306,25 @@ def test_an_unwritable_database_spills_instead_of_dropping(
 
     lines = hook.spill_path(project).read_text(encoding="utf-8").splitlines()
     assert len(lines) == 1
-    assert (
-        json.loads(lines[0])["payload"]["tool_input"]["command"] == "pytest tests/ -q"
+    assert json.loads(lines[0])["request"]["command"] == "pytest tests/ -q"
+
+
+def test_a_spill_line_written_before_adapters_still_replays(project: Path) -> None:
+    """0.5.0 spilled Claude Code's raw payload under `payload`. A queue the
+    hook promised to replay is replayed, whichever build wrote it."""
+    line = json.dumps(
+        {
+            "occurred_at": "2026-09-30T12:00:00.000+00:00",
+            "reason": "database is locked",
+            "payload": json.loads(payload(project, "make build")),
+        }
     )
+    hook.spill_path(project).parent.mkdir(parents=True, exist_ok=True)
+    hook.spill_path(project).write_text(line + "\n", encoding="utf-8")
+    assert hook.replay_spill(project) == (1, 0)
+    with get_db(project) as conn:
+        (row,) = journal_store.list_commands(conn)
+    assert row.command == "make build"
 
 
 def test_replay_drains_the_spill_keeping_the_original_time(
@@ -623,13 +641,18 @@ def test_recording_a_command_imports_no_logger_and_no_model_stack(
 def test_a_spilled_event_round_trips_through_its_payload(project: Path) -> None:
     """The spill file holds a payload, not a dump of our own model, so a
     replay produces the row the hook would have written."""
-    original = hook.parse_event(payload(project, "make build", effort={"level": "max"}))
+    original = claude_code.parse(
+        payload(project, "make build", effort={"level": "max"})
+    )
     assert original is not None
 
     restored = HookEvent.from_payload(original.as_payload())
     assert restored == original
     assert restored.extras == {}
     assert restored.effort == {"level": "max"}
+
+    request = original.request()
+    assert ActionRequest.from_dict(request.as_dict()) == request
 
 
 def test_the_hook_does_not_fsync_on_every_tool_call(project: Path) -> None:
@@ -668,3 +691,84 @@ def test_durability_is_per_connection_not_stored_in_the_file(project: Path) -> N
         assert conn.execute("PRAGMA synchronous").fetchone()[0] == 1
     with get_db(project) as conn:
         assert conn.execute("PRAGMA synchronous").fetchone()[0] == 2
+
+
+# --- choosing the mode at install ------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("before", "after_contains"),
+    [
+        (None, '[safety]\nmode = "observe"\n'),
+        ('[llm]\nmodel = "x"\n', '[llm]\nmodel = "x"\n\n[safety]\nmode = "observe"\n'),
+        (
+            "[safety]\n# kept\ntimeout = 8.0\n",
+            '[safety]\nmode = "observe"\n# kept\ntimeout = 8.0\n',
+        ),
+        (
+            '[safety]\nmode = "enforce"  # was\n\n[[danger]]\nid = "d"\n',
+            '[safety]\nmode = "observe"\n\n[[danger]]\nid = "d"\n',
+        ),
+    ],
+)
+def test_set_mode_edits_the_line_and_keeps_the_rest(
+    tmp_path: Path, before: str | None, after_contains: str
+) -> None:
+    config = tmp_path / ".vibe-sentinel.toml"
+    if before is not None:
+        config.write_text(before, encoding="utf-8")
+    hook.set_mode(tmp_path, "observe")
+    assert after_contains in config.read_text(encoding="utf-8")
+
+
+def test_set_mode_does_not_touch_a_mode_in_another_table(tmp_path: Path) -> None:
+    config = tmp_path / ".vibe-sentinel.toml"
+    config.write_text(
+        '[safety]\ntimeout = 8.0\n\n[other]\nmode = "x"\n', encoding="utf-8"
+    )
+    hook.set_mode(tmp_path, "enforce")
+    text = config.read_text(encoding="utf-8")
+    assert '[safety]\nmode = "enforce"\n' in text
+    assert '[other]\nmode = "x"\n' in text
+
+
+def test_set_mode_refuses_a_form_it_cannot_edit_and_leaves_the_file(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / ".vibe-sentinel.toml"
+    original = 'safety.mode = "off"\n'
+    config.write_text(original, encoding="utf-8")
+    with pytest.raises(ValueError, match="dotted key"):
+        hook.set_mode(tmp_path, "enforce")
+    assert config.read_text(encoding="utf-8") == original
+
+
+def test_set_mode_puts_the_file_back_when_it_does_not_read_back(
+    tmp_path: Path,
+) -> None:
+    """A [safety] header inside a multi-line string is not a table. The edit
+    lands in the string, the reader disagrees, and the original returns."""
+    config = tmp_path / ".vibe-sentinel.toml"
+    original = 'note = """\n[safety]\n"""\n'
+    config.write_text(original, encoding="utf-8")
+    with pytest.raises(ValueError, match="file is unchanged"):
+        hook.set_mode(tmp_path, "enforce")
+    assert config.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.parametrize(
+    ("command", "ours"),
+    [
+        ("vibe-sentinel hook", True),
+        ("/opt/venv/bin/vibe-sentinel hook", True),
+        ("uv run vibe-sentinel hook", True),
+        ("vibe-sentinel hook --install", False),
+        ("vibe-sentinel scan", False),
+        ("other-tool hook", False),
+        (None, False),
+    ],
+)
+def test_this_hook_is_recognised_however_it_is_reached(
+    command: object, ours: bool
+) -> None:
+    assert hook.is_this_hook(command) is ours

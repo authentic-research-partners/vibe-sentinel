@@ -103,7 +103,7 @@ PINNED: dict[str, str] = {
     "schemas.BREVITY": "1aeeb15ea99979c9",
     "schemas.every_field(resolves_to)": "b9f9fd68c90e2c77",
     "schemas.every_field(suspect)": "6bb7470deeb6803d",
-    "dangers.default.toml": "083feabf487ac6ac",
+    "dangers.default.toml": "74efc256a281c35e",
     "secrets.default.toml": "324d0735ed994d09",
 }
 

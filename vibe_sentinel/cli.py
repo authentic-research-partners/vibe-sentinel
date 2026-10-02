@@ -1427,16 +1427,47 @@ def run_hook(args: argparse.Namespace) -> int:
 
     if getattr(args, "install", False):
         _, root = _load(args)
+        choice = getattr(args, "mode", None)
+        if choice is None:
+            _explain_modes(root)
+            return 2
+        mode = hook.INSTALL_MODES[choice]
+        agent = getattr(args, "agent", None) or "claude-code"
+        if getattr(args, "managed", False):
+            return _install_managed(agent, matcher, mode)
         try:
-            path, changed = hook.install(root, matcher=matcher)
+            if agent == "cursor":
+                from vibe_sentinel.agents import cursor
+
+                path, changed = cursor.install(root, hook.HOOK_TIMEOUT)
+            else:
+                path, changed = hook.install(root, matcher=matcher)
+            config_path = hook.set_mode(root, mode)
         except (OSError, ValueError) as e:
             logger.error(str(e))
             return 2
+        who = "Cursor" if agent == "cursor" else "Claude Code"
         if changed:
-            print(f"PreToolUse hook installed in {path}")
-            print("It takes effect in Claude Code sessions started from now on.")
+            print(f"{who} hook installed in {path}")
+            print(f"It takes effect in {who} sessions started from now on.")
         else:
-            print(f"PreToolUse hook already installed in {path}")
+            print(f"{who} hook already installed in {path}")
+        print(f"[safety] mode = {mode!r} in {config_path}: {hook.MODE_MEANING[mode]}")
+        from vibe_sentinel.safety import configured_safety
+
+        try:
+            effective, _ = configured_safety(root)
+        except ValueError as e:
+            logger.error(str(e))
+            return 2
+        if effective != mode:
+            from vibe_sentinel import paths
+
+            print(
+                f"The system policy at {paths.system_policy_path()} holds the "
+                f"mode at {effective!r}, so that is what runs here."
+            )
+        print("Check it with: vibe-sentinel status")
         return 0
 
     if getattr(args, "replay", False):
@@ -1458,11 +1489,148 @@ def run_hook(args: argparse.Namespace) -> int:
             print(f"{kept} unreadable event(s) left in {hook.spill_path(root)}")
         return 0
 
-    outcome, decision = hook.guard(sys.stdin.read())
+    outcome, decision = hook.guard(
+        sys.stdin.read(), agent=getattr(args, "agent", None) or "claude-code"
+    )
     if decision is not None:
         print(json.dumps(decision))
     logger.debug("hook: {}", outcome)
     return 0
+
+
+def _install_managed(agent: str, matcher: str, mode: str) -> int:
+    """``hook --install --managed``: the hook and the mode, outside the tree.
+
+    Each file is written if this process may, and otherwise printed with
+    its path for whoever administers the machine. Exit 2 when anything was
+    left unwritten, so a provisioning script cannot mistake a printed
+    instruction for an installed gate.
+    """
+    from vibe_sentinel import hook, paths
+
+    pending: list[tuple[Path, str]] = []
+    if agent == "cursor":
+        from vibe_sentinel.agents import cursor
+
+        target = paths.cursor_enterprise_hooks_path()
+        try:
+            written, _ = cursor.install_at(target, hook.HOOK_TIMEOUT)
+            print(f"Cursor hook installed in {written} (enterprise)")
+        except OSError:
+            entries = {
+                event: [{"command": cursor.HOOK_COMMAND, "timeout": hook.HOOK_TIMEOUT}]
+                for event in cursor.EVENTS
+            }
+            pending.append(
+                (target, json.dumps({"version": 1, "hooks": entries}, indent=2))
+            )
+    else:
+        try:
+            written, _ = hook.install_managed(matcher)
+            print(f"Claude Code hook installed in {written} (managed)")
+        except OSError:
+            entry = hook.settings_entry(matcher=matcher)
+            pending.append(
+                (
+                    paths.claude_managed_hook_path(),
+                    json.dumps({"hooks": {"PreToolUse": [entry]}}, indent=2),
+                )
+            )
+
+    policy = paths.system_policy_path()
+    try:
+        hook.set_mode_at(policy, mode)
+        print(f"[safety] mode = {mode!r} in {policy}: a floor no project can lower")
+    except OSError:
+        pending.append((policy, f'[safety]\nmode = "{mode}"'))
+    except ValueError as e:
+        logger.error(str(e))
+        return 2
+
+    if not pending:
+        print("Check it with: vibe-sentinel status")
+        return 0
+    print(
+        "\nNot written: this needs an administrator's rights. Whoever has them "
+        "writes each file below — merging into an existing hooks.json rather "
+        "than replacing it — and makes it readable by everyone and writable by "
+        "no one else:"
+    )
+    for path, content in pending:
+        print(f"\n{path}\n{content}")
+    return 2
+
+
+def _explain_modes(root: Path) -> None:
+    """What ``hook --install`` without ``--mode`` prints instead of guessing.
+
+    The state is chosen, never inherited: so the three choices, what each
+    does, and what the verdicts recorded here so far say about moving from
+    one to the next.
+    """
+    from vibe_sentinel import hook
+    from vibe_sentinel.protection import enforce_preview
+    from vibe_sentinel.safety import configured_safety
+
+    print("Choose what the hook does, with --mode:\n")
+    for choice, mode in hook.INSTALL_MODES.items():
+        print(f"  --mode {choice:<8} {hook.MODE_MEANING[mode]}")
+    print(
+        "\nStart with observe: it measures how often the gate would stop work "
+        "on this project's own traffic before anything is stopped."
+    )
+
+    counts: dict[tuple[str, str], int] = {}
+    if db_path(root).is_file():
+        try:
+            with get_db(root) as conn:
+                counts = journal_store.review_counts(conn)
+        except SchemaMismatchError as e:
+            logger.error(str(e))
+            return
+    if not counts:
+        print("\nNo verdicts recorded here yet, so there is nothing to measure from.")
+        return
+    no_verdict: str | None = None
+    try:
+        _, no_verdict = configured_safety(root)
+    except ValueError as e:
+        logger.error(str(e))
+    if no_verdict is None:
+        # No preview rather than one computed from a setting nobody declared:
+        # numbers shaped like this project's would not be this project's.
+        print(
+            f"\n{sum(counts.values())} reviewed call(s) are recorded, but the "
+            f"safety settings could not be read, so what enforce would have "
+            f"done with them is unknown."
+        )
+        return
+    preview = enforce_preview(counts, no_verdict)
+    total = sum(counts.values())
+    print(
+        f"\nRecorded so far ({total} reviewed call(s), `vibe-sentinel safety` "
+        f"lists them): under enforce, {preview['refused']} would have been "
+        f"refused, {preview['asked']} asked about, {preview['allowed']} allowed."
+    )
+
+
+def run_status(args: argparse.Namespace) -> int:
+    """Say what is protecting this repository.
+
+    Exits 1 when something is not as it should be — no hook anywhere, a
+    settings file or a mode that will not read, or a judge that does not
+    answer while the gate is on — so a script can check it too.
+    """
+    import asyncio
+
+    from vibe_sentinel import hook
+    from vibe_sentinel.protection import gather
+    from vibe_sentinel.report import render_protection
+
+    config, root = _load(args)
+    report = asyncio.run(gather(config, root))
+    render_protection(report, hook.MODE_MEANING)
+    return 0 if report.ok else 1
 
 
 def run_commands(args: argparse.Namespace) -> int:
@@ -1514,7 +1682,7 @@ def run_commands(args: argparse.Namespace) -> int:
             if not commands and journal_store.journal_totals(conn)[2] == 0:
                 logger.error(
                     "No commands recorded in {}. Install the hook with: "
-                    "vibe-sentinel hook --install",
+                    "vibe-sentinel hook --install --mode observe",
                     db_path(root),
                 )
                 return 2
@@ -1721,20 +1889,21 @@ def _record_finding(
     ``main`` in every listing.
     """
     from vibe_sentinel.hook import now_iso
-    from vibe_sentinel.journal import HookEvent
+    from vibe_sentinel.journal import ActionRequest
 
     occurred_at = now_iso()
     try:
         with get_db(root) as conn:
             command_id = journal_store.record_command(
                 conn,
-                HookEvent(
-                    hook_event_name="Check",
+                ActionRequest(
+                    agent="check",
+                    tool_name="Bash",
+                    command=command,
+                    cwd=str(root),
                     session_id="vibe-sentinel-check",
                     agent_type="check",
-                    cwd=str(root),
-                    tool_name="Bash",
-                    tool_input={"command": command},
+                    envelope={"agent": "check", "hook_event_name": "Check"},
                 ),
                 occurred_at,
             )

@@ -18,7 +18,8 @@ ever a baseline. What it can tell you grows with the record:
 The last two are **readings, not verdicts**. None of them move the baseline, none are stored, and none change the exit code — a horizon reaches back to a fixed
 point and a slope persists for as long as the window, so a finding in either
 would fail every scan until it aged out, with nothing anyone could do to clear
-it. Only the baseline comparison sets the exit code.
+it. Only the baseline comparison contributes drift to the exit code; state-gate
+findings and execution errors can also fail a scan.
 
 Every key, with commentary: `vibe-sentinel scan --print-example`.
 
@@ -242,6 +243,11 @@ name = "SOURCE_ROOT"
 description = "The directory containing this project's source code."
 default = "."
 pattern = '^[a-zA-Z0-9_\-./]+$'
+
+[[probe.placeholders]]
+name = "FILE_GLOB"
+description = "Source files to measure."
+default = "*.py"
 ```
 
 Write regex patterns as TOML literal strings with single quotes. Every
@@ -321,6 +327,7 @@ description = "The directory whose contents are served."
 name = "CATEGORIES"
 default = "images=*.png,*.jpg,*.webp,*.avif; video=*.mp4; fonts=*.woff2"
 description = "What to weigh and what to call it."
+pattern = '^[\w./*,;= -]{1,400}$'
 
 [[probe.placeholders]]
 name = "UNIT"
@@ -358,9 +365,13 @@ thin: route, validate, one call into a service.
 """
 ```
 
-Each lens is its own request, and the report is the shared prefix, so a batching server prefills it once — measured, at a 99% prefix-cache hit rate against 5% when every request is given a prefix of its own. Three questions do cost nearly the same as one, but the reason is the batching rather than the cache: generation dominates this workload, so reusing the prefill saved less than the spread between repeat runs, while widening the fan-out from one request at a time to eight took a sixteen-question pass from 208s to 31s. `benchmarks/` carries both numbers.
+Each lens is its own request, with the report as a shared prefix. The benefit
+of caching and concurrency depends on the backend: the recorded Ollama run
+benefited from a shared prefix but not wider concurrency; earlier batching-server
+runs behaved differently. See [Benchmarks](../benchmarks/README.md) and its dated
+results. Concurrency defaults to 1.
 `watch` names the probes a lens is about and is what keeps that true: a lens whose probes did not move, did not move over a horizon, and have no fitted trend gets skipped entirely, and is reported as not asked rather than as having found
-nothing. Set `[drift] concurrency = 1` on a backend that serialises.
+nothing. Raise `[drift] concurrency` only for a backend measured to benefit.
 
 A lens can only rate changes the comparison already found, using the same boundary as the built-in analysis. `[drift] guidance` is a standing note placed in front of
 every question; `use`, `disable` and `use_builtins` select from the set the same

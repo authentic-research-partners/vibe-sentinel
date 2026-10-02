@@ -27,7 +27,10 @@ question = """\
     What exactly will this delete, once variables and globs are resolved \
     from the history? Is every path it touches inside the work, and \
     recoverable if this turns out to be a mistake?"""
-pattern = '\b(?:rm|rmdir|unlink|shred|srm)\b'
+# Interpreters spell it differently, and a one-liner carries no `rm`:
+# `shutil.rmtree`, `os.remove`, node's `fs.rm`, `rimraf`, PowerShell's
+# `Remove-Item`. `unlink` already covers `os.unlink` and `Path.unlink`.
+pattern = '\b(?:rm|rmdir|unlink|shred|srm|rmtree|removedirs|rimraf|remove-item)\b|\bos\.remove\b|\bfs(?:\.promises)?\.rm(?:dir)?\b|\.rm(?:dir)?sync\b|\bfileutils\.rm'
 
 [[danger]]
 id = 'overwriting-data'
@@ -60,7 +63,11 @@ question = """\
     Where does the code being executed come from, and is any of it visible \
     here? Code fetched at run time can do anything, so what it will act on \
     is in neither the command nor the history."""
-pattern = '''\|\s*(?:sudo\s+)?(?:ba|z|k|da)?sh\b|(?:^|[;&|(]\s*)eval\b|-[a-z]*c\s*["'`]\s*eval\b|[$<]\(\s*(?:sudo\s+)?(?:curl|wget)\b'''
+# Also: a file run from where downloads land — a temp directory, the
+# Downloads folder — which is fetch-then-run split across two commands so
+# neither looks like it, and the history the model reads shows the fetch.
+# And PowerShell's spelling of `curl | sh`: `iwr … | iex`.
+pattern = '''\|\s*(?:sudo\s+)?(?:ba|z|k|da)?sh\b|(?:^|[;&|(]\s*)eval\b|-[a-z]*c\s*["'`]\s*eval\b|[$<]\(\s*(?:sudo\s+)?(?:curl|wget)\b|(?:^|[;&|(]\s*)(?:sudo\s+)?(?:(?:(?:ba|z|k|da)?sh|source|\.|python[\d.]*|node|deno|bun|ruby|perl|pwsh|powershell)\s+(?:-\S+\s+)*)?["']?(?:/tmp/|/var/tmp/|/private/tmp/|/dev/shm/|/var/folders/|~/downloads/|\$\{?tmpdir\}?/)|\|\s*(?:iex|invoke-expression)\b|\b(?:iex|invoke-expression)\b[^|;&]*\b(?:iwr|irm|invoke-webrequest|invoke-restmethod|downloadstring)\b'''
 
 [[danger]]
 id = 'discarding-work'
@@ -102,11 +109,12 @@ pattern = '\bfind\b[^|;&]*\s-(?:delete|exec)\b'
 
 [[danger]]
 id = 'removing-infrastructure'
-title = 'Removing containers, images or cluster resources'
+title = 'Removing containers, images, cluster resources or provisioned infrastructure'
 question = """\
     What does this remove or stop, and could anyone else be relying on it? \
-    A prune with --all reaches past this project."""
-pattern = '\b(?:docker|podman|kubectl)\b[^|;&]*\b(?:rm|rmi|prune|delete|down)\b'
+    A prune with --all reaches past this project, and a destroy removes \
+    everything the configuration manages."""
+pattern = '\b(?:docker|podman|kubectl)\b[^|;&]*\b(?:rm|rmi|prune|delete|down)\b|\bterraform\b[^|;&]*\b(?:destroy\b|apply\b[^|;&]*\s-destroy\b)|\b(?:pulumi|cdk|cdktf|tofu)\s+destroy\b'
 
 [[danger]]
 id = 'changing-a-database'
