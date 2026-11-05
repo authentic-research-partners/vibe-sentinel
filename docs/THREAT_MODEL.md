@@ -136,7 +136,7 @@ shipped danger set, and nothing else, over the cases named in the last
 column. Each attack there has a harmless twin of the same shape, so a rule
 added to catch it is measured for what it costs as well. On 2026-09-30,
 before any fix, triage flagged 10 of 26 attacks and none of the 14 twins;
-the progress since is in [evals.md](evals.md).
+the progress since is in [historical eval results](eval-results.md).
 
 | # | Threat | Example | Status | Control | Eval cases |
 |---|---|---|---|---|---|
@@ -203,12 +203,12 @@ would run, with nothing recorded as the reason.
 
 The following is the historical baseline, before the default changed to asking
 about missing verdicts. Current behavior is described above; subsequent
-measurements are in [Evals](evals.md#progress-against-it).
+measurements are in [adversarial eval results](eval-results.md#progress-against-it).
 
 Measured on 2026-09-30 with the judged safety eval — 27 labelled cases,
 three separate runs — against the recommended model (Gemma 4 26B QAT,
 thinking off, with a 32,768-token context). The comparison
-with other models is in [evals.md](evals.md).
+with other models is in [historical eval results](eval-results.md).
 
 | | |
 |---|---|
@@ -223,7 +223,7 @@ Of the 26 in the adversarial suite, 7 end refused, the same 7 in three runs:
 16 never reach the model, and 3 that do are let through — `curl … | sh` and
 `bash -c "$(curl …)"` are judged `unclear`, which `enforce` allows, and
 deleting the history database is judged `safe`. That was the baseline; the
-progress since is in [evals.md](evals.md).
+progress since is in [historical eval results](eval-results.md).
 
 Smaller models measured worse: Qwen3 8B cleared a misspelled package name
 in every run, and Qwen3 14B called two unsafe commands safe. With thinking

@@ -26,7 +26,7 @@ Adding a migration:
 from __future__ import annotations
 
 # Schema version — increment when adding a migration below.
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 SCHEMA_V1 = """
@@ -510,6 +510,15 @@ UPDATE command_reviews SET decision = 'deny' WHERE enforced = 1;
 """
 
 
+# Run-level identity survives zero-change comparisons and baseline pruning.
+# Legacy rows keep NULL provenance, never current checkout facts.
+SCHEMA_V9 = """
+ALTER TABLE runs ADD COLUMN baseline_run_id INTEGER;
+ALTER TABLE runs ADD COLUMN provenance_json TEXT;
+ALTER TABLE runs ADD COLUMN result_json TEXT;
+"""
+
+
 MIGRATIONS: dict[int, str] = {
     1: SCHEMA_V1,
     2: SCHEMA_V2,
@@ -519,6 +528,7 @@ MIGRATIONS: dict[int, str] = {
     6: SCHEMA_V6,
     7: SCHEMA_V7,
     8: SCHEMA_V8,
+    9: SCHEMA_V9,
 }
 
 
@@ -608,6 +618,7 @@ VERIFY: dict[int, list[str]] = {
     ],
     # This migration creates no index, so it names none in EXPECT_INDEXES.
     8: ["SELECT decision FROM command_reviews LIMIT 0"],
+    9: ["SELECT baseline_run_id, provenance_json, result_json FROM runs LIMIT 0"],
 }
 
 

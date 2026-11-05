@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sentinel full-stack example</title>
+<style>
+  body { max-width: 42rem; margin: 4rem auto; padding: 1rem; font: 1rem/1.5 system-ui; }
+  output { display: block; padding: 1rem; background: #f1f4f6; }
+</style>
+<h1>One request, three components</h1>
+<p>The browser calls the Node API, which asks the Python service for a greeting.</p>
+<output id="greeting" aria-live="polite">Loading the local services…</output>
+<script type="module" src="/src/main.js"></script>
+</html>

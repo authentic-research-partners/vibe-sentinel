@@ -66,6 +66,33 @@ def test_unparseable_text_is_none() -> None:
     assert _extract_json("") is None
 
 
+@pytest.mark.parametrize("status", [200, 400, 503])
+def test_failed_model_output_is_never_logged(
+    status: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret = "PRIVATE_MODEL_DIAGNOSTIC_DO_NOT_FORWARD"
+    monkeypatch.setattr(llm_mod, "_RETRY_BACKOFF_S", 0)
+    messages: list[str] = []
+    sink = llm_mod.logger.add(lambda message: messages.append(str(message)))
+    try:
+
+        def respond(_: httpx.Request) -> httpx.Response:
+            if status == 200:
+                return httpx.Response(status, json=_completion(secret))
+            return httpx.Response(status, text=secret)
+
+        if status == 503:
+            with pytest.raises(LLMConnectionError) as exc:
+                _ask(respond)
+            assert secret not in str(exc.value)
+        else:
+            assert _ask(respond) is None
+    finally:
+        llm_mod.logger.remove(sink)
+    assert messages
+    assert secret not in "".join(messages)
+
+
 # --- structured output modes ----------------------------------------------
 
 
@@ -364,6 +391,39 @@ def _patch_async_client(monkeypatch: pytest.MonkeyPatch, handler) -> None:
         return real(transport=httpx.MockTransport(handler), **kwargs)
 
     monkeypatch.setattr(llm_mod.httpx, "AsyncClient", factory)
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "trust_env"),
+    [
+        ("http://127.0.0.1:11434/v1", False),
+        ("http://[::1]:11434/v1", False),
+        ("http://localhost:11434/v1", False),
+        ("https://remote.example/v1", True),
+    ],
+)
+def test_local_judge_bypasses_environment_proxies(
+    monkeypatch: pytest.MonkeyPatch, endpoint: str, trust_env: bool
+) -> None:
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.example:8080")
+    monkeypatch.setenv("NO_PROXY", "")
+    seen = []
+    real = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": "test"}]})
+        return httpx.Response(200, json=_completion('{"ok": true}'))
+
+    def factory(**kwargs: Any) -> httpx.AsyncClient:
+        seen.append(kwargs.get("trust_env"))
+        return real(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(llm_mod.httpx, "AsyncClient", factory)
+    config = SentinelConfig(llm_endpoint=endpoint)
+    assert asyncio.run(check_endpoint(config))[0]
+    assert asyncio.run(llm_query("sys", "user", SCHEMA, "test", config)) == {"ok": True}
+    assert seen == [trust_env, trust_env]
 
 
 def test_check_endpoint_lists_served_models(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -25,9 +25,9 @@ finding. "Code started appearing somewhere new" needs no threshold.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from vibe_sentinel.json_schema import unbounded_schema
 
@@ -106,6 +106,541 @@ class ProbeResult(BaseModel):
         return {o.key: o for o in self.observations}
 
 
+class ResultModel(BaseModel):
+    """Versioned boundary objects reject unknown fields."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class RunProvenanceV1(ResultModel):
+    """Frozen version 1 provenance; never enriched from current declarations."""
+
+    captured_at: str = ""
+    availability: Literal["captured", "unavailable"] = "unavailable"
+    source_kind: Literal["git", "non_git", "unavailable"] = "unavailable"
+    source_identity_policy: Literal[
+        "git_head_and_path", "canonical_path_only", "unavailable"
+    ] = "unavailable"
+    source_identity_sha256: str = ""
+    source_revision: str = ""
+    source_dirty: bool | None = None
+    consistency: Literal["not_atomic"] = "not_atomic"
+    config_sha256: str = ""
+    rules_sha256: str = ""
+    scope_sha256: str = ""
+    fingerprint_status: Literal["captured", "unavailable"] = "unavailable"
+    fingerprint_scope: Literal["behavior_excluding_auth_and_opaque_request_fields"] = (
+        "behavior_excluding_auth_and_opaque_request_fields"
+    )
+    tool_version: str = ""
+    tool_build_identity: Literal["unverified"] = "unverified"
+    packs: Literal["not_implemented"] = "not_implemented"
+    scanner_executable: str = ""
+    scanner_python: str = ""
+    judge_configured_name: str = ""
+    judge_endpoint: str = ""
+    judge_identity_sha256: str = ""
+    judge_weights_identity: Literal["unverified"] = "unverified"
+    build_freshness: Literal["not_assessed"] = "not_assessed"
+
+
+class PackExecutableProvenance(ResultModel):
+    id: str
+    command: str
+    path: str
+    identity: Literal["path_only_contents_unverified"] = "path_only_contents_unverified"
+
+
+class PackProvenance(ResultModel):
+    """A declared local pack and the capabilities selected for this scan."""
+
+    id: str
+    version: str
+    protocol: Literal[1]
+    manifest_sha256: str
+    executables: tuple[PackExecutableProvenance, ...] = ()
+    ecosystems: tuple[str, ...] = ()
+    supported_inputs: tuple[str, ...] = ()
+    selected_probes: tuple[str, ...] = ()
+    inventory_readers: tuple[str, ...] = ()
+    inventory_status: Literal["not_declared", "declared_not_assessed"] = "not_declared"
+    history_coverage: Literal["baseline_only"] = "baseline_only"
+
+
+class RunProvenance(ResultModel):
+    """Captured facts, never reconstructed from the current checkout."""
+
+    captured_at: str = ""
+    availability: Literal["captured", "unavailable"] = "unavailable"
+    source_kind: Literal["git", "non_git", "unavailable"] = "unavailable"
+    source_identity_policy: Literal[
+        "git_head_and_path", "canonical_path_only", "unavailable"
+    ] = "unavailable"
+    source_identity_sha256: str = ""
+    source_revision: str = ""
+    source_dirty: bool | None = None
+    consistency: Literal["not_atomic"] = "not_atomic"
+    config_sha256: str = ""
+    rules_sha256: str = ""
+    scope_sha256: str = ""
+    fingerprint_status: Literal["captured", "unavailable"] = "unavailable"
+    fingerprint_scope: Literal["behavior_excluding_auth_and_opaque_request_fields"] = (
+        "behavior_excluding_auth_and_opaque_request_fields"
+    )
+    tool_version: str = ""
+    tool_build_identity: Literal["unverified"] = "unverified"
+    packs: tuple[PackProvenance, ...] = ()
+    scanner_executable: str = ""
+    scanner_python: str = ""
+    judge_configured_name: str = ""
+    judge_endpoint: str = ""
+    judge_identity_sha256: str = ""
+    judge_weights_identity: Literal["unverified"] = "unverified"
+    build_freshness: Literal["not_assessed"] = "not_assessed"
+
+
+ResultPhase = Literal["configuration", "measurement", "judgement", "gates", "storage"]
+
+
+class ScanContext(ResultModel):
+    provenance: RunProvenance | RunProvenanceV1 = Field(default_factory=RunProvenance)
+    run_id: int | None = None
+    baseline_run_id: int | None = None
+    baseline_unmeasured: tuple[str, ...] = ()
+    stage_error: str = ""
+    stage_errors: tuple[ResultPhase, ...] = ()
+
+
+class ResultStage(ResultModel):
+    id: str
+    status: Literal[
+        "complete",
+        "findings",
+        "error",
+        "incomplete",
+        "unconfigured",
+        "not_run",
+        "not_asked",
+        "answered",
+    ]
+
+
+class ResultCounts(ResultModel):
+    probes: int = Field(default=0, ge=0)
+    observations: int = Field(default=0, ge=0)
+    changes: int = Field(default=0, ge=0)
+    findings: int = Field(default=0, ge=0)
+    failing_findings: int = Field(default=0, ge=0)
+    baseline_unmeasured: int = Field(default=0, ge=0)
+
+
+class ScanResultV1(ResultModel):
+    """Common scan envelope. The version is required even on the wire."""
+
+    schema_version: Literal[1]
+    profile: Literal["local", "mcp", "shareable"] = "local"
+    run_id: int | None = None
+    baseline_run_id: int | None = None
+    generated_at: str = ""
+    outcome: Literal["complete", "findings", "incomplete", "error"] = "incomplete"
+    exit_code: Literal[0, 1, 2] = 2
+    comparison: Literal["compared", "no_baseline", "incomplete", "not_run"] = "not_run"
+    provenance: RunProvenanceV1 = Field(default_factory=RunProvenanceV1)
+    measured_environment: dict[str, str] | None = None
+    measured_environment_sha256: str = ""
+    failed_stages: tuple[
+        Literal["configuration", "measurement", "judgement", "gates", "storage"], ...
+    ] = ()
+    probes: tuple[ResultStage, ...] = ()
+    gates: tuple[ResultStage, ...] = ()
+    judges: tuple[ResultStage, ...] = ()
+    horizons: tuple[ResultStage, ...] = ()
+    gates_status: Literal["complete", "error", "not_run"] = "not_run"
+    counts: ResultCounts = Field(default_factory=ResultCounts)
+
+
+class ScanResultV2(ResultModel):
+    """Common scan envelope. The version is required even on the wire."""
+
+    schema_version: Literal[2]
+    profile: Literal["local", "mcp", "shareable"] = "local"
+    run_id: int | None = None
+    baseline_run_id: int | None = None
+    generated_at: str = ""
+    outcome: Literal["complete", "findings", "incomplete", "error"] = "incomplete"
+    exit_code: Literal[0, 1, 2] = 2
+    comparison: Literal["compared", "no_baseline", "incomplete", "not_run"] = "not_run"
+    provenance: RunProvenance = Field(default_factory=RunProvenance)
+    measured_environment: dict[str, str] | None = None
+    measured_environment_sha256: str = ""
+    failed_stages: tuple[
+        Literal["configuration", "measurement", "judgement", "gates", "storage"], ...
+    ] = ()
+    probes: tuple[ResultStage, ...] = ()
+    gates: tuple[ResultStage, ...] = ()
+    judges: tuple[ResultStage, ...] = ()
+    horizons: tuple[ResultStage, ...] = ()
+    gates_status: Literal["complete", "error", "not_run"] = "not_run"
+    counts: ResultCounts = Field(default_factory=ResultCounts)
+
+
+#: One sentence about one change.
+NOTE_CHARS = 240
+#: Two or three sentences about the report as a whole.
+ASSESSMENT_CHARS = 700
+#: Ratings one lens may return. A report with more changes than this is
+#: not one where rating every change helps, and the ones past the cap keep
+#: the mechanical severity — the same degradation as a lens that did not
+#: mention them.
+MAX_RATED = 40
+#: A reason a person acts on: the command that made this one dangerous, or
+#: why a string is a live key.
+REASON_CHARS = 400
+
+# Evidence is local and bounded; exceeding a limit makes capture unavailable.
+# Identity and configured question strings are never shortened to fit.
+EVIDENCE_MAX_ITEMS = 10000
+EVIDENCE_MAX_LENSES = 256
+EVIDENCE_MAX_BYTES = 8 * 1024 * 1024
+EvidenceIdentity = Annotated[str, Field(max_length=8192)]
+EvidenceQuestion = Annotated[str, Field(max_length=32768)]
+
+
+class RatingEvidence(ResultModel):
+    """A validated rating resolved to an existing measured change."""
+
+    probe_id: EvidenceIdentity
+    key: EvidenceIdentity
+    severity: Severity
+    note: str = Field(max_length=NOTE_CHARS)
+    applied: bool
+
+
+class LensEvidence(ResultModel):
+    id: EvidenceIdentity
+    title: EvidenceIdentity
+    source: EvidenceIdentity
+    question: EvidenceQuestion
+    watch: tuple[EvidenceIdentity, ...] = Field(max_length=EVIDENCE_MAX_ITEMS)
+    status: Literal["not_asked", "answered", "failed"]
+    assessment: str = Field(default="", max_length=ASSESSMENT_CHARS)
+    ratings: tuple[RatingEvidence, ...] = Field(default=(), max_length=MAX_RATED)
+    dropped_ratings: int = Field(default=0, ge=0)
+
+
+DecisionOrigin = Literal["mechanical", "model", "declared_verdict", "pin", "unknown"]
+
+
+class GateDecisionEvidence(ResultModel):
+    """Only configured questions and validated decisions, never excerpts."""
+
+    origin: DecisionOrigin = "unknown"
+    status: Literal["not_asked", "answered", "failed", "unavailable"] = "unavailable"
+    question: EvidenceQuestion = ""
+    source: EvidenceIdentity = ""
+
+
+class StructuralEvidence(ResultModel):
+    """Named structural identities; never an arbitrary observation attribute map."""
+
+    identity: EvidenceIdentity = ""
+    pointer: EvidenceIdentity = ""
+    file: EvidenceIdentity = ""
+    edge_schema: EvidenceIdentity = ""
+    ecosystem: EvidenceIdentity = ""
+    source: EvidenceIdentity = ""
+    target: EvidenceIdentity = ""
+    kind: EvidenceIdentity = ""
+    phase: EvidenceIdentity = ""
+    resolution: EvidenceIdentity = ""
+    metric: EvidenceIdentity = ""
+    unit: EvidenceIdentity = ""
+
+
+class ChangeEvidence(ResultModel):
+    label: EvidenceIdentity = ""
+    structural: StructuralEvidence | None = None
+    probe_id: EvidenceIdentity
+    key: EvidenceIdentity
+    kind: ChangeKind
+    before: float | None
+    after: float | None
+    before_state: EvidenceIdentity
+    after_state: EvidenceIdentity
+    severity: Severity
+    note: EvidenceIdentity
+    lens_id: EvidenceIdentity = ""
+
+
+class GateEvidence(ResultModel):
+    gate: EvidenceIdentity
+    key: EvidenceIdentity
+    kind: EvidenceIdentity
+    subject: EvidenceIdentity
+    risk: EvidenceIdentity
+    verdict: EvidenceIdentity
+    failing: bool | None
+    reason: EvidenceIdentity
+    decision: GateDecisionEvidence
+    # A closed set of measured facts is populated by the gate producers.
+    # No generic attrs, details, candidate values or excerpts cross here.
+    matches: int | None = None
+    spdx: EvidenceIdentity = ""
+    suspect: EvidenceIdentity = ""
+
+
+class ScanEvidence(ResultModel):
+    availability: Literal["captured", "unavailable", "withheld"] = "unavailable"
+    failure: Literal["", "limit_exceeded"] = ""
+    lenses: tuple[LensEvidence, ...] = Field(default=(), max_length=EVIDENCE_MAX_LENSES)
+    changes: tuple[ChangeEvidence, ...] = Field(
+        default=(), max_length=EVIDENCE_MAX_ITEMS
+    )
+    gates: tuple[GateEvidence, ...] = Field(default=(), max_length=EVIDENCE_MAX_ITEMS)
+    withheld_dependency_changes: int = Field(default=0, ge=0)
+
+
+class ScanResult(ResultModel):
+    """Common scan envelope. The version is required even on the wire."""
+
+    schema_version: Literal[3]
+    profile: Literal["local", "local-detail", "mcp", "shareable"] = "local"
+    run_id: int | None = None
+    baseline_run_id: int | None = None
+    generated_at: str = ""
+    outcome: Literal["complete", "findings", "incomplete", "error"] = "incomplete"
+    exit_code: Literal[0, 1, 2] = 2
+    comparison: Literal["compared", "no_baseline", "incomplete", "not_run"] = "not_run"
+    provenance: RunProvenance = Field(default_factory=RunProvenance)
+    measured_environment: dict[str, str] | None = None
+    measured_environment_sha256: str = ""
+    failed_stages: tuple[
+        Literal["configuration", "measurement", "judgement", "gates", "storage"], ...
+    ] = ()
+    probes: tuple[ResultStage, ...] = ()
+    gates: tuple[ResultStage, ...] = ()
+    judges: tuple[ResultStage, ...] = ()
+    horizons: tuple[ResultStage, ...] = ()
+    gates_status: Literal["complete", "error", "not_run"] = "not_run"
+    counts: ResultCounts = Field(default_factory=ResultCounts)
+
+    evidence: ScanEvidence = Field(default_factory=ScanEvidence)
+
+
+VersionedScanResult = ScanResult | ScanResultV2 | ScanResultV1
+
+
+def decode_result(payload: object) -> VersionedScanResult:
+    """Dispatch stored/wire shapes without upgrading historical evidence."""
+    if not isinstance(payload, dict) or type(payload.get("schema_version")) is not int:
+        raise ValueError("Incompatible versioned scan result")
+    version = payload["schema_version"]
+    if version == 1:
+        model: type[ScanResult] | type[ScanResultV2] | type[ScanResultV1] = ScanResultV1
+        provenance_model: type[RunProvenance] | type[RunProvenanceV1] = RunProvenanceV1
+    elif version in (2, 3):
+        model = ScanResultV2 if version == 2 else ScanResult
+        provenance_model = RunProvenance
+    else:
+        raise ValueError("Incompatible versioned scan result")
+    if not set(model.model_fields).issubset(payload):
+        raise ValueError("Incomplete versioned scan result")
+    for key, nested_model in (
+        ("provenance", provenance_model),
+        ("counts", ResultCounts),
+    ):
+        nested = payload.get(key)
+        if not isinstance(nested, dict) or not set(nested_model.model_fields).issubset(
+            nested
+        ):
+            raise ValueError("Incomplete versioned scan result")
+    if version in (2, 3):
+        packs = payload["provenance"].get("packs")
+        if not isinstance(packs, list):
+            raise ValueError("Incomplete pack provenance")
+        for pack in packs:
+            if (
+                not isinstance(pack, dict)
+                or not set(PackProvenance.model_fields).issubset(pack)
+                or type(pack.get("protocol")) is not int
+            ):
+                raise ValueError("Incomplete pack provenance")
+    result = model.model_validate(payload)
+    if isinstance(result, ScanResult):
+        _validate_evidence_shape(payload["evidence"])
+        _validate_evidence(result)
+    return result
+
+
+def _validate_evidence_shape(payload: object) -> None:
+    def require(value: object, shape: type[ResultModel]) -> dict:
+        if not isinstance(value, dict) or set(value) != set(shape.model_fields):
+            raise ValueError("Incomplete scan evidence")
+        return value
+
+    evidence = require(payload, ScanEvidence)
+    for name, shape in (
+        ("lenses", LensEvidence),
+        ("changes", ChangeEvidence),
+        ("gates", GateEvidence),
+    ):
+        rows = evidence[name]
+        if not isinstance(rows, list):
+            raise ValueError("Incomplete scan evidence")
+        for row in rows:
+            require(row, shape)
+            if name == "lenses":
+                if not isinstance(row["ratings"], list):
+                    raise ValueError("Incomplete scan evidence")
+                for rating in row["ratings"]:
+                    require(rating, RatingEvidence)
+            elif name == "gates":
+                require(row["decision"], GateDecisionEvidence)
+            elif row["structural"] is not None:
+                require(row["structural"], StructuralEvidence)
+
+
+def _validate_evidence(result: ScanResult) -> None:
+    evidence = result.evidence
+    if result.profile == "local-detail" and evidence.availability != "captured":
+        raise ValueError("Local detail requires captured evidence")
+    if evidence.failure:
+        if (
+            evidence.availability not in {"unavailable", "withheld"}
+            or result.outcome not in {"incomplete", "error"}
+            or evidence.lenses
+            or evidence.changes
+            or evidence.gates
+        ):
+            raise ValueError(
+                "Evidence capture failure must remain explicit and incomplete"
+            )
+        return
+    if len(evidence.model_dump_json().encode()) > EVIDENCE_MAX_BYTES:
+        raise ValueError("Evidence exceeds the captured size limit")
+    if result.profile in {"mcp", "shareable"} and evidence.availability != "withheld":
+        raise ValueError("Evidence must be withheld from this profile")
+    if evidence.availability == "withheld":
+        if (
+            evidence.lenses
+            or evidence.changes
+            or evidence.gates
+            or evidence.withheld_dependency_changes
+        ):
+            raise ValueError("Withheld evidence carries detail")
+        return
+    if result.profile == "local-detail" and evidence.availability != "captured":
+        raise ValueError("Local detail requires captured evidence")
+    if (
+        len(evidence.changes) + evidence.withheld_dependency_changes
+        != result.counts.changes
+    ):
+        raise ValueError("Evidence change count differs from the recorded result")
+    probe_ids = {stage.id for stage in result.probes}
+    changes = {(change.probe_id, change.key): change for change in evidence.changes}
+    if len(changes) != len(evidence.changes) or any(
+        change.probe_id == "dependency-versions"
+        or (
+            change.probe_id not in probe_ids
+            and not (
+                change.kind == "disappeared"
+                and change.key == change.probe_id
+                and change.before is None
+                and change.after is None
+                and not change.before_state
+                and not change.after_state
+                and change.structural is None
+            )
+        )
+        for change in evidence.changes
+    ):
+        raise ValueError("Evidence measurement identity mismatch")
+    gate_judges = sum(stage.id in {"packages", "credentials"} for stage in result.gates)
+    if (
+        evidence.availability == "captured"
+        and len(evidence.lenses) != len(result.judges) - gate_judges
+    ):
+        raise ValueError("Captured questions differ from recorded judge stages")
+    lens_ids: set[str] = set()
+    selected: dict[tuple[str, str], tuple[str, RatingEvidence]] = {}
+    for index, lens in enumerate(evidence.lenses):
+        stage = result.judges[index] if index < len(result.judges) else None
+        if (
+            lens.id in lens_ids
+            or stage is None
+            or stage.id != lens.id
+            or stage.status
+            != {
+                "answered": "answered",
+                "not_asked": "not_asked",
+                "failed": "incomplete",
+            }[lens.status]
+        ):
+            raise ValueError("Evidence judge identity or status mismatch")
+        lens_ids.add(lens.id)
+        if lens.status != "answered" and (
+            lens.assessment or lens.ratings or lens.dropped_ratings
+        ):
+            raise ValueError("Unanswered question carries an answer")
+        for rating in lens.ratings:
+            pair = rating.probe_id, rating.key
+            if pair not in changes:
+                raise ValueError("Rating does not refer to a recorded measurement")
+            previous = selected.get(pair)
+            order = ("info", "low", "medium", "high")
+            applied = previous is None or order.index(rating.severity) > order.index(
+                previous[1].severity
+            )
+            if rating.applied != applied:
+                raise ValueError("Recorded rating application is inconsistent")
+            if rating.applied:
+                selected[pair] = lens.id, rating
+    for pair, change in changes.items():
+        if change.lens_id:
+            winning = selected.get(pair)
+            if winning is None or (
+                winning[0],
+                winning[1].severity,
+                winning[1].note,
+            ) != (change.lens_id, change.severity, change.note):
+                raise ValueError("Recorded winning answer differs from the change")
+        elif pair in selected:
+            raise ValueError("Applied rating has no recorded attribution")
+    if (
+        sum(finding.failing is not None for finding in evidence.gates)
+        != result.counts.findings
+        or sum(finding.failing is True for finding in evidence.gates)
+        != result.counts.failing_findings
+    ):
+        raise ValueError("Evidence gate counts differ from recorded findings")
+    gate_ids = {stage.id for stage in result.gates}
+    identities: set[tuple[str, str]] = set()
+    for finding in evidence.gates:
+        pair = finding.gate, finding.key
+        if finding.gate not in gate_ids or pair in identities:
+            raise ValueError("Evidence gate identity mismatch")
+        identities.add(pair)
+        decision = finding.decision
+        if (
+            decision.origin in {"mechanical", "declared_verdict", "pin"}
+            and decision.status != "not_asked"
+        ):
+            raise ValueError("A non-model decision cannot claim a model answer")
+        if decision.origin == "model" and decision.status not in {"answered", "failed"}:
+            raise ValueError("Invalid model decision status")
+        if decision.origin == "unknown" and decision.status == "answered":
+            raise ValueError("An unknown decision cannot claim a model answer")
+        if decision.status == "failed" and (finding.verdict or finding.reason):
+            raise ValueError("A failed decision cannot carry an answer")
+
+
+def decode_provenance(payload: object) -> RunProvenance | RunProvenanceV1:
+    """Stored provenance predates envelope versions; its pack shape identifies it."""
+    if isinstance(payload, dict) and payload.get("packs") == "not_implemented":
+        return RunProvenanceV1.model_validate(payload)
+    return RunProvenance.model_validate(payload)
+
+
 class Snapshot(BaseModel):
     """The recorded structure of the codebase at one point in time.
 
@@ -120,6 +655,7 @@ class Snapshot(BaseModel):
     root: str = ""
     model: str = ""
     probes: dict[str, ProbeResult] = Field(default_factory=dict)
+    context: ScanContext | None = Field(default=None, exclude=True)
 
     def probe_keys(self, probe_id: str) -> set[str]:
         result = self.probes.get(probe_id)
@@ -162,6 +698,7 @@ class Change(BaseModel):
     run being reported — the ``after`` side, or ``before`` for something
     that disappeared. Not stored either: the observations already hold
     them, and a change is recomputed from those."""
+    rating_lens: str = Field(default="", exclude=True)
     severity: Severity = "info"
     note: str = ""
     """Filled by the analysis pass — why this change matters, or doesn't."""
@@ -231,6 +768,7 @@ class LensResult(BaseModel):
     none of them is "found nothing".
     """
 
+    evidence: LensEvidence | None = Field(default=None, exclude=True)
     id: str
     title: str = ""
     asked: bool = False
@@ -417,19 +955,6 @@ class TrendFit(BaseModel):
 # of the four overran the 2048-token default and came back as half an
 # answer. An unbounded answer is not only expensive; it is the one that
 # does not arrive.
-
-#: One sentence about one change.
-NOTE_CHARS = 240
-#: Two or three sentences about the report as a whole.
-ASSESSMENT_CHARS = 700
-#: Ratings one lens may return. A report with more changes than this is
-#: not one where rating every change helps, and the ones past the cap keep
-#: the mechanical severity — the same degradation as a lens that did not
-#: mention them.
-MAX_RATED = 40
-#: A reason a person acts on: the command that made this one dangerous, or
-#: why a string is a live key.
-REASON_CHARS = 400
 
 #: Characters per English word, with its space and punctuation. Used only
 #: to turn a character cap into something a model can actually count.
@@ -657,6 +1182,7 @@ class GateFinding(BaseModel):
     review.
     """
 
+    evidence: GateDecisionEvidence | None = Field(default=None, exclude=True)
     gate: str
     key: str
     kind: str = ""
@@ -676,6 +1202,9 @@ class GateFinding(BaseModel):
     attrs: dict[str, str] = Field(default_factory=dict)
 
 
+NODE_GATE_UNAVAILABLE = "npm dependency and license coverage is unavailable."
+
+
 class GateReport(BaseModel):
     """One gate's answer about the tree, and whether it got to finish.
 
@@ -686,6 +1215,7 @@ class GateReport(BaseModel):
     next run as a tree that had been cleaned up.
     """
 
+    evidence: tuple[GateEvidence, ...] = Field(default=(), exclude=True)
     gate: str
     ok: bool = True
     configured: bool = True

@@ -157,8 +157,10 @@ def init_db(path: Path) -> None:
 
 
 @contextmanager
-def get_db(root: Path, synchronous: str = DURABILITY) -> Iterator[sqlite3.Connection]:
-    """Open the history database for ``root``, creating it if absent.
+def get_db(
+    root: Path, synchronous: str = DURABILITY, *, readonly: bool = False
+) -> Iterator[sqlite3.Connection]:
+    """Open history, creating it if absent unless ``readonly`` is requested.
 
     Raises :class:`SchemaMismatchError` when the file exists at an older
     version — the caller is expected to surface the message, not migrate.
@@ -169,6 +171,24 @@ def get_db(root: Path, synchronous: str = DURABILITY) -> Iterator[sqlite3.Connec
     why they differ.
     """
     path = db_path(root)
+    if readonly:
+        if not path.is_file():
+            raise FileNotFoundError(
+                "No history database; run 'vibe-sentinel scan' to record a scan first"
+            )
+        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+            conn.execute("PRAGMA query_only=ON")
+            row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+            current = int(row[0]) if row and row[0] is not None else 0
+            if current != SCHEMA_VERSION:
+                raise SchemaMismatchError(current, SCHEMA_VERSION, path)
+            yield conn
+        finally:
+            conn.close()
+        return
     current = read_schema_version(path)
 
     if current == 0 and not path.is_file():

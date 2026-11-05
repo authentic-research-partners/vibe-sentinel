@@ -9,6 +9,7 @@ the boundary — what must be flagged, and what must never be.
 from __future__ import annotations
 
 import asyncio
+import secrets
 from pathlib import Path
 from typing import Any
 
@@ -322,7 +323,298 @@ def test_extras_only_requirements_stay_out_of_the_closure() -> None:
     class _Dist:
         metadata = _Meta()
 
-    assert pk._requires(_Dist()) == ("anyio",)  # type: ignore[arg-type]
+    installed = {
+        "thing": pk.Installed(
+            name="thing",
+            version="1",
+            requires=pk._requires(_Dist()),  # type: ignore[arg-type]
+        )
+    }
+    assert pk.requirement_closure({"thing"}, installed) == {"thing", "anyio"}
+
+
+def test_transitive_requested_extra_explains_cryptography_but_not_other_extras() -> (
+    None
+):
+    installed = {
+        "mcp": pk.Installed(name="mcp", version="1", requires=("pyjwt[crypto]>=2",)),
+        "pyjwt": pk.Installed(
+            name="pyjwt",
+            version="2",
+            requires=(
+                'cryptography>=3; extra == "crypto"',
+                'pytest; extra == "dev"',
+            ),
+        ),
+    }
+    assert pk.requirement_closure({"mcp"}, installed) == {
+        "mcp",
+        "pyjwt",
+        "cryptography",
+    }
+    assert pk.requirement_closure({"pyjwt"}, installed) == {"pyjwt"}
+
+
+def test_extras_reached_late_revisit_dependencies_and_cycles_terminate() -> None:
+    installed = {
+        "root": pk.Installed(name="root", version="1", requires=("branch", "shared")),
+        "branch": pk.Installed(
+            name="branch", version="1", requires=("shared[Feature_A]",)
+        ),
+        "shared": pk.Installed(
+            name="shared",
+            version="1",
+            requires=(
+                'leaf; extra == "feature-a"',
+                'root[second]; extra == "feature-a"',
+            ),
+        ),
+    }
+    # The stack visits shared without extras first, then branch adds its extra.
+    assert pk.requirement_closure({"root"}, installed) == {
+        "root",
+        "branch",
+        "shared",
+        "leaf",
+    }
+
+
+def test_markers_evaluate_whole_expressions_in_the_measured_interpreter() -> None:
+    installed = {
+        "root": pk.Installed(
+            name="root",
+            version="1",
+            requires=(
+                'never; python_version < "2"',
+                'base; python_version >= "3" or extra == "other"',
+                'chosen; python_version >= "3" and extra == "feature"',
+                'wrong-platform; sys_platform == "not-an-operating-system"',
+            ),
+        )
+    }
+    assert pk.requirement_closure({"root[feature]"}, installed) == {
+        "root",
+        "base",
+        "chosen",
+    }
+    assert pk.requirement_closure({"root"}, installed) == {"root", "base"}
+
+
+def test_selected_extras_and_groups_define_active_roots_and_missing_requirements(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write_project(
+        tmp_path,
+        pyproject="""
+[project]
+name = "myapp"
+dependencies = ["base>=1", "missing>=1; python_version >= '3'", "inactive>=1; python_version < '2'"]
+[project.optional-dependencies]
+plugin = ["mcp>=1"]
+unused = ["unused>=1"]
+[dependency-groups]
+dev = [{include-group = "Test_Tools"}, "absent-tool>=1"]
+test-tools = ["pytest>=1"]
+unselected = ["other-tool>=1"]
+""",
+    )
+    installed = {
+        name: pk.Installed(name=name, version="1")
+        for name in ("base", "mcp", "pytest", "unused", "other-tool", "stray")
+    }
+    monkeypatch.setattr(pk, "installed_distributions", lambda: installed)
+    policy = pk.policy_from_data(
+        {"extras": ["plugin"], "groups": ["group:dev"]}, "test"
+    )
+    inventory = pk.take_inventory(tmp_path, policy)
+    assert {r.name for r in inventory.active} == {
+        "base",
+        "missing",
+        "mcp",
+        "pytest",
+        "absent-tool",
+    }
+    assert inventory.closure == {"base", "missing", "mcp", "pytest", "absent-tool"}
+    assert inventory.selected_extras == {"plugin"}
+    assert inventory.selected_groups == {"group:dev"}
+    assert {"inactive", "unused", "other-tool"} <= inventory.direct
+    assert pk.outside_closure(inventory) == {"unused", "other-tool", "stray"}
+    assert {f.name for f in pk.audit(inventory, policy) if f.kind == "uninstalled"} == {
+        "missing",
+        "absent-tool",
+    }
+
+
+def test_orphan_accounting_uses_active_edges_and_ignores_project_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write_project(
+        tmp_path, pyproject='[project]\nname="myapp"\ndependencies=["wanted>=1"]\n'
+    )
+    installed = {
+        "myapp": pk.Installed(name="myapp", version="1", requires=("stray",)),
+        "wanted": pk.Installed(
+            name="wanted", version="1", requires=('inactive; python_version < "2"',)
+        ),
+        "stray": pk.Installed(name="stray", version="1", requires=("child[feature]",)),
+        "child": pk.Installed(
+            name="child", version="1", requires=('leaf; extra == "feature"',)
+        ),
+        "leaf": pk.Installed(name="leaf", version="1"),
+        "inactive": pk.Installed(name="inactive", version="1"),
+    }
+    monkeypatch.setattr(pk, "installed_distributions", lambda: installed)
+    inventory = pk.take_inventory(tmp_path)
+    assert inventory.closure == {"wanted"}
+    assert pk.outside_closure(inventory) == {"stray", "inactive"}
+    assert pk.dragged_in(inventory, "stray") == {"child", "leaf"}
+
+
+@pytest.mark.parametrize("raw", ['dep; not_a_marker == "yes"', "!!!"])
+def test_unreadable_installed_requirement_fails_instead_of_hiding_an_edge(
+    raw: str,
+) -> None:
+    installed = {"root": pk.Installed(name="root", version="1", requires=(raw,))}
+    with pytest.raises(ValueError):
+        pk.requirement_closure({"root"}, installed)
+
+
+@pytest.mark.parametrize(
+    "data", [{"extras": "dev"}, {"groups": ["dev"]}, {"groups": [3]}]
+)
+def test_invalid_selection_policy_fails(data: dict[str, Any]) -> None:
+    with pytest.raises(ValueError):
+        pk.policy_from_data(data, "test policy")
+
+
+def test_selected_poetry_extras_markers_and_groups(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_project(
+        tmp_path,
+        pyproject="""
+[tool.poetry]
+name = "myapp"
+[tool.poetry.dependencies]
+python = "^3.13"
+root = {version = "^1", extras = ["feature"], markers = "python_version >= '3'"}
+optional = {version = "^1", optional = true}
+[tool.poetry.extras]
+plugin = ["optional"]
+[tool.poetry.group.dev.dependencies]
+test-tool = "^1"
+""",
+    )
+    monkeypatch.setattr(pk, "installed_distributions", lambda: {})
+    base = pk.take_inventory(tmp_path)
+    assert {r.name for r in base.active} == {"root"}
+    assert base.active[0].extras == ("feature",)
+    selected = pk.take_inventory(
+        tmp_path,
+        pk.Policy(extras=frozenset({"plugin"}), groups=frozenset({"poetry:dev"})),
+    )
+    assert {r.name for r in selected.active} == {"root", "optional", "test-tool"}
+
+
+def test_project_self_extras_expand_from_current_manifest_to_a_fixed_point(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write_project(
+        tmp_path,
+        pyproject="""
+[project]
+name = "myapp"
+dependencies = []
+[project.optional-dependencies]
+all = ["myapp[crypto]"]
+crypto = ["myapp[all]", "cryptography>=1", "myapp[unused]; python_version < '2'"]
+unused = ["unwanted>=1"]
+""",
+    )
+    installed = {
+        name: pk.Installed(name=name, version="1")
+        for name in ("cryptography", "unwanted")
+    }
+    monkeypatch.setattr(pk, "installed_distributions", lambda: installed)
+    inventory = pk.take_inventory(tmp_path, pk.Policy(extras=frozenset({"all"})))
+    assert inventory.closure == {"cryptography"}
+    assert pk.outside_closure(inventory) == {"unwanted"}
+
+
+def test_installed_dependency_urls_are_not_exported_or_quoted_in_errors() -> None:
+    credential = secrets.token_hex(16)
+    dependency_url = f"https://user:{credential}@example.invalid/dependency.whl"
+
+    class Meta:
+        def get_all(self, key: str) -> list[str]:
+            return [f'child[crypto] @ {dependency_url} ; python_version >= "3"']
+
+    class Dist:
+        metadata = Meta()
+
+    requires = pk._requires(Dist())  # type: ignore[arg-type]
+    exported = pk.Installed(
+        name="root", version="1", requires=requires
+    ).model_dump_json()
+    assert credential not in exported and "example.invalid" not in exported
+    assert dependency_url not in exported
+    assert "child[crypto]" in exported and "python_version" in exported
+    with pytest.raises(ValueError) as failure:
+        pk._metadata_requirement(f"!!! {dependency_url}")
+    assert credential not in str(failure.value)
+    assert dependency_url not in str(failure.value)
+    assert failure.value.__suppress_context__
+
+
+def test_near_miss_context_uses_selected_extras_for_required_by(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write_project(
+        tmp_path,
+        pyproject='[project]\nname="myapp"\ndependencies=["root[crypto]>=1"]\n',
+    )
+    installed = {
+        "root": pk.Installed(
+            name="root", version="1", requires=('child; extra == "crypto"',)
+        ),
+        "child": pk.Installed(name="child", version="1"),
+    }
+    monkeypatch.setattr(pk, "installed_distributions", lambda: installed)
+    inventory = pk.take_inventory(tmp_path)
+    finding = pk.Finding(
+        kind="near-miss",
+        name="child / chlid",
+        detail="",
+        remediation="",
+        evidence=("child", "chlid"),
+    )
+    context = pk.build_near_miss_context(inventory, [finding])
+    assert "required by root" in context
+
+
+def test_orphan_marker_evaluation_failure_is_a_failed_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vibe_sentinel.gates import collect_packages
+
+    write_project(
+        tmp_path, pyproject='[project]\nname="myapp"\ndependencies=["wanted>=1"]\n'
+    )
+    installed = {
+        "wanted": pk.Installed(name="wanted", version="1"),
+        "orphan": pk.Installed(
+            name="orphan", version="1", requires=('child; dependency_groups == "dev"',)
+        ),
+    }
+    monkeypatch.setattr(pk, "installed_distributions", lambda: installed)
+    report = asyncio.run(collect_packages(tmp_path))
+    assert not report.ok
+    assert "Cannot evaluate dependency marker" in report.error
 
 
 # --- policy and pins -------------------------------------------------------

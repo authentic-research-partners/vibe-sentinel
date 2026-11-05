@@ -1,0 +1,35 @@
+[
+  {
+    "tuple": [
+      "npm",
+      "file:src/écran.tsx",
+      "file:lib/数据.ts",
+      "import",
+      "type",
+      "workspace"
+    ],
+    "key": "edge:1:967d83625860ade4583b45fbb69d0020f95b64059aa537d2443ce0693995b936"
+  },
+  {
+    "tuple": [
+      "pypi",
+      "file:src/café.py",
+      "namespace:src/数据",
+      "import",
+      "runtime",
+      "local"
+    ],
+    "key": "edge:1:41366929c1f581f2ddf3dc73343594e4be967d27fba926636b233bb822ba87ab"
+  },
+  {
+    "tuple": [
+      "pypi",
+      "file:a.py",
+      "package:external.name",
+      "import",
+      "runtime",
+      "external"
+    ],
+    "key": "edge:1:344a9487402a74dbd972784e86b113ab3da07b36eb4624228d692135ad25d864"
+  }
+]

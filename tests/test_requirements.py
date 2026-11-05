@@ -47,6 +47,60 @@ def test_an_unreadable_requirement_yields_nothing_rather_than_a_guess() -> None:
     assert rq.requirement_name("!!!") == ""
 
 
+def test_requested_extras_are_preserved_and_normalized() -> None:
+    entry = rq.parse("PyJWT[Crypto,Feature_A,crypto]>=2", "project")
+    assert entry is not None
+    assert entry.extras == ("crypto", "feature-a")
+
+
+@pytest.mark.parametrize(
+    "groups",
+    [
+        {"dev": [{"include-group": "missing"}]},
+        {"dev": [{"include-group": "other"}], "other": [{"include-group": "dev"}]},
+        {"dev": [{"unknown": "other"}]},
+        {"dev": ["tool"], "Dev": []},
+    ],
+)
+def test_selected_invalid_dependency_groups_fail(groups: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        list(
+            rq.selected_requirements(
+                {"dependency-groups": groups}, groups=frozenset({"group:dev"})
+            )
+        )
+
+
+def test_unknown_extra_and_poetry_group_fail() -> None:
+    with pytest.raises(ValueError, match="Unknown project extras"):
+        list(rq.selected_requirements({}, extras=frozenset({"missing"})))
+    with pytest.raises(ValueError, match="Unknown dependency group"):
+        list(rq.selected_requirements({}, groups=frozenset({"poetry:missing"})))
+
+
+@pytest.mark.parametrize("condition", ["python", "platform"])
+def test_unsupported_selected_poetry_activation_fails(condition: str) -> None:
+    manifest = {
+        "tool": {
+            "poetry": {
+                "dependencies": {"thing": {"version": "1", condition: "condition"}}
+            }
+        }
+    }
+    with pytest.raises(ValueError, match="python/platform"):
+        list(rq.selected_requirements(manifest))
+
+
+def test_selected_poetry_multi_constraint_array_fails() -> None:
+    manifest = {
+        "tool": {
+            "poetry": {"dependencies": {"thing": [{"version": "1", "python": "<3"}]}}
+        }
+    }
+    with pytest.raises(ValueError, match="multi-constraint array"):
+        list(rq.selected_requirements(manifest))
+
+
 # --- what the manifests declare --------------------------------------------
 
 
@@ -244,8 +298,6 @@ _PACKAGE_JSON = (
         ("pnpm add reacct", ("reacct",)),
         ("yarn add expresss@4", ("expresss",)),
         ("bun add zodd", ("zodd",)),
-        ("npm i -w packages/web reacct", ("reacct",)),
-        ("cd web && npm install lodahs", ("lodahs",)),
     ],
 )
 def test_an_npm_family_install_of_an_undeclared_name_is_found(

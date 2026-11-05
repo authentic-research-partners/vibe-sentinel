@@ -134,6 +134,18 @@ def test_ordinary_source_is_not_flagged(project: Path) -> None:
     assert rules_fired(project) == set()
 
 
+def test_generated_output_directories_are_skipped(project: Path) -> None:
+    source = project / "src"
+    source.mkdir()
+    (source / ".env").touch()
+    for directory in ("out", "dist", "build"):
+        output = source / directory
+        output.mkdir()
+        (output / ".env").touch()
+
+    assert {c.path for c in scan(project).candidates} == {"src/.env"}
+
+
 def test_one_candidate_per_rule_not_per_match(project: Path) -> None:
     (project / "app.py").write_text(
         'a = "AKIAIOSFODNN7EXAMPLE"\nb = "AKIAJONESJONESJONES1"\n', encoding="utf-8"

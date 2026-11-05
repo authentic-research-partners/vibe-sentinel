@@ -91,6 +91,7 @@ EXCLUDED_DIRS: frozenset[str] = frozenset(
         # build output
         "build",
         "dist",
+        "out",
         ".eggs",
         ".next",
         ".nuxt",

@@ -12,6 +12,7 @@ Surfaces:
 - ``hook``       — record one agent tool call; install the hook.
 - ``commands``   — what the coding agent ran, and which actor ran it.
 - ``credentials``— passwords and keys sitting at rest in the tree.
+- ``security``    — opt-in JS/TS application security checks.
 - ``safety``     — verdicts on those commands, or try the gate on one.
 - ``licenses``   — check dependency licences against the policy.
 - ``packages``   — check dependency provenance: does it exist, who added it.
@@ -25,6 +26,7 @@ the surface itself: one ``_add_*`` builder per command, listed once in
 from __future__ import annotations
 
 import argparse
+import signal
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -128,6 +130,11 @@ def _add_scan(sub: Subparsers) -> None:
         "exit code and moves no baseline.",
     )
     p_scan.add_argument(
+        "--list-packs",
+        action="store_true",
+        help="List explicitly configured local pack identities, protocol, sources and drift/inventory declarations without executing readers or scanning.",
+    )
+    p_scan.add_argument(
         "--list-probes",
         action="store_true",
         help="Print the active probe set — the built-ins, whatever this "
@@ -162,7 +169,47 @@ def _add_scan(sub: Subparsers) -> None:
         help="Output format (default: terminal). 'agent' renders drift as a "
         "constraint block to feed back to the coding agent.",
     )
+    p_scan.add_argument(
+        "--shareable",
+        action="store_true",
+        help="With JSON output, export only versioned statuses, counts and "
+        "fingerprints. Omit source text, findings detail, inventories and diagnostics.",
+    )
     p_scan.add_argument("--config", help="Path to .vibe-sentinel.toml")
+
+
+def _add_summarize(sub: Subparsers) -> None:
+    parser = _command(
+        sub,
+        "summarize",
+        help="Render aggregate Markdown from a recorded JSON export, without scanning",
+    )
+    parser.add_argument(
+        "result_file", help="Existing versioned result JSON file to summarize"
+    )
+
+
+def _add_export(sub: Subparsers) -> None:
+    parser = _command(
+        sub,
+        "export",
+        help="Export a recorded result without scanning or changing history",
+    )
+    parser.add_argument(
+        "root",
+        nargs="?",
+        default=None,
+        help="Project root (default: current directory)",
+    )
+    parser.add_argument(
+        "--run", type=int, required=True, help="Recorded run ID to export"
+    )
+    parser.add_argument(
+        "--profile",
+        choices=["shareable", "local-detail"],
+        default="shareable",
+        help="Export profile (default: shareable counts and fingerprints). local-detail includes sensitive questions, answers and finding identities for local review",
+    )
 
 
 def _add_history(sub: Subparsers) -> None:
@@ -363,8 +410,7 @@ def _add_hook(sub: Subparsers) -> None:
     p_hook = _command(
         sub,
         "hook",
-        help="Record one Claude Code tool call read from stdin, or install "
-        "the PreToolUse hook that sends them",
+        help="Record an agent tool call from stdin, install a hook, or configure its mode",
     )
     p_hook.add_argument("root", nargs="?", default=None, help="Project root")
     hook_mode = p_hook.add_mutually_exclusive_group()
@@ -373,6 +419,12 @@ def _add_hook(sub: Subparsers) -> None:
         action="store_true",
         help="Add the PreToolUse hook to this project's .claude/settings.json "
         "(existing settings are backed up and preserved)",
+    )
+    hook_mode.add_argument(
+        "--configure",
+        action="store_true",
+        help="Set the project's safety mode without installing a hook; use "
+        "with --mode after enabling and trusting the Codex plugin",
     )
     hook_mode.add_argument(
         "--print-config",
@@ -397,12 +449,13 @@ def _add_hook(sub: Subparsers) -> None:
     )
     p_hook.add_argument(
         "--agent",
-        choices=("claude-code", "cursor"),
+        choices=("claude-code", "cursor", "codex"),
         default="claude-code",
         help="Whose hook this is: 'claude-code' (default) reads Claude Code's "
         "PreToolUse payload and --install writes .claude/settings.json; "
         "'cursor' reads Cursor's beforeShellExecution, beforeMCPExecution and "
-        "beforeReadFile payloads and --install writes .cursor/hooks.json",
+        "beforeReadFile payloads and --install writes .cursor/hooks.json; "
+        "'codex' reads Codex PreToolUse payloads from the manually installed plugin",
     )
     p_hook.add_argument(
         "--managed",
@@ -418,10 +471,11 @@ def _add_hook(sub: Subparsers) -> None:
         "--mode",
         choices=("journal", "observe", "enforce"),
         default=None,
-        help="What --install sets [safety] mode to, and required with it: "
+        help="What --install or --configure sets [safety] mode to, required with either: "
         "'journal' records every call and judges none, 'observe' judges "
         "flagged calls and blocks nothing, 'enforce' refuses unsafe calls and "
-        "asks about unclear ones. Run --install without it to see the numbers "
+        "asks about unclear ones (Codex refuses because its hook cannot ask). "
+        "Run --install without it to see the numbers "
         "recorded so far",
     )
     p_hook.add_argument("--config", help="Path to .vibe-sentinel.toml")
@@ -673,10 +727,58 @@ def _add_backend(sub: Subparsers) -> None:
 #: Every subcommand, in the order ``--help`` prints them. A command
 #: that is not here does not exist: there is one list, and adding to it
 #: is how a command is registered.
+def _add_security(sub: Subparsers) -> None:
+    command = _command(
+        sub, "security", help="Run selected JavaScript application security checks"
+    )
+    actions = command.add_subparsers(dest="security_action", required=True)
+    scan = _command(
+        actions, "scan", help="Check selected source, lockfiles and browser artifacts"
+    )
+    scan.add_argument("root", nargs="?", help="Project root (default: cwd)")
+    scan.add_argument("--config", help="Project configuration for the local judge")
+    scan.add_argument("--lockfile", help="Project-relative npm package-lock.json")
+    scan.add_argument(
+        "--advisory-db", help="Prepared local OSV advisory cache directory"
+    )
+    scan.add_argument("--source", help="Project-relative JS/TS source directory")
+    scan.add_argument(
+        "--browser-artifacts",
+        help="Project-relative directory of an existing Next.js export",
+    )
+    setup = _command(
+        actions,
+        "setup",
+        help="Install pinned isolated security tools and prepare local advisories",
+    )
+    setup.add_argument(
+        "root", nargs="?", help="Project context (security tools are shared)"
+    )
+    setup.add_argument(
+        "--refresh", action="store_true", help="Download a fresh advisory snapshot"
+    )
+    status = _command(
+        actions, "status", help="Inspect security tools and advisory readiness"
+    )
+    status.add_argument(
+        "root", nargs="?", help="Project context (security tools are shared)"
+    )
+    for action in (scan, setup, status):
+        action.add_argument("--tools-directory", help="Managed security tool directory")
+        action.add_argument(
+            "--format",
+            choices=("text", "json"),
+            default="text",
+            help="Report output format",
+        )
+
+
 COMMANDS: tuple[Callable[[Subparsers], None], ...] = (
     _add_status,
     _add_scan,
     _add_history,
+    _add_export,
+    _add_summarize,
     _add_trend,
     _add_parameters,
     _add_migrate,
@@ -687,6 +789,7 @@ COMMANDS: tuple[Callable[[Subparsers], None], ...] = (
     _add_licenses,
     _add_packages,
     _add_credentials,
+    _add_security,
     _add_safety,
     _add_backend,
 )
@@ -718,8 +821,21 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _interrupt_security(_signum: int, _frame: object) -> None:
+    raise KeyboardInterrupt
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
+    if (
+        arguments
+        and arguments[0] == "security"
+        and (
+            len(arguments) == 1
+            or arguments[1] not in {"scan", "setup", "status", "-h", "--help"}
+        )
+    ):
+        arguments = [arguments[0], "scan", *arguments[1:]]
 
     # Fast path for the installed hook, which Claude Code invokes as
     # exactly `vibe-sentinel hook`, once per tool call. Building the
@@ -762,6 +878,33 @@ def main(argv: list[str] | None = None) -> int:
     # which Claude Code already routes to its own debug log.
     if args.command == "hook":
         return run_hook(args)
+    if args.command == "summarize":
+        from vibe_sentinel.cli import run_summarize
+
+        return run_summarize(args)
+    if args.command == "export":
+        # No current config, file logging or maintenance may alter historical evidence.
+        from vibe_sentinel.cli import run_export
+
+        return run_export(args)
+    if args.command == "security":
+        from vibe_sentinel.cli import run_security, run_security_environment
+        from vibe_sentinel.security_checks import selection_error
+
+        previous = signal.signal(signal.SIGTERM, _interrupt_security)
+        try:
+            if args.security_action != "scan":
+                return run_security_environment(args)
+            invalid = selection_error(
+                args.lockfile, args.advisory_db, args.source, args.browser_artifacts
+            )
+            if invalid:
+                parser.error(invalid)
+            return run_security(args)
+        except KeyboardInterrupt:
+            return 130
+        finally:
+            signal.signal(signal.SIGTERM, previous)
 
     # Imported here, not at module scope: `load_config` builds a pydantic
     # model, and the hook path above returns before ever needing one. That
@@ -778,6 +921,10 @@ def main(argv: list[str] | None = None) -> int:
         # Still the logger rather than `print`: stdout is the result channel,
         # and an error is not a result.
         logger.error(str(e))
+        if args.command == "scan":
+            from vibe_sentinel.cli import render_scan_failure
+
+            return render_scan_failure(args)
         return 2
 
     # Every command that is not itself about the database gets a health
@@ -793,6 +940,10 @@ def main(argv: list[str] | None = None) -> int:
         return _dispatch(args, parser)
     except ConfigError as e:
         logger.error(str(e))
+        if args.command == "scan":
+            from vibe_sentinel.cli import render_scan_failure
+
+            return render_scan_failure(args)
         return 2
 
 

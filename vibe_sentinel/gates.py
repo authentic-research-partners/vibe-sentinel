@@ -73,7 +73,14 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from vibe_sentinel.schemas import GateFinding, GateReport, GateState
+from vibe_sentinel.schemas import (
+    NODE_GATE_UNAVAILABLE,
+    GateFinding,
+    GateReport,
+    GateState,
+    GateDecisionEvidence,
+    GateEvidence,
+)
 from vibe_sentinel.exceptions import LLMConnectionError
 
 if TYPE_CHECKING:
@@ -81,6 +88,20 @@ if TYPE_CHECKING:
 
 #: The gates that run as part of a scan, in the order they are reported.
 GATES: tuple[str, ...] = ("licenses", "packages", "credentials")
+
+
+def node_dependency_coverage_unavailable(
+    root: Path, config: SentinelConfig | None
+) -> bool:
+    """Keep Node-only projects out of the scanner's Python environment."""
+    if not (root / "package.json").is_file() or (root / "pyproject.toml").is_file():
+        return False
+    if config is None:
+        from vibe_sentinel.config import find_config, load_config
+
+        path = find_config(root)
+        config = load_config(path) if path else None
+    return not (config and config.environment_python)
 
 
 def _failed(gate: str, error: str, started: float) -> GateReport:
@@ -103,6 +124,7 @@ def shape_licenses(
     policy: Any,
     project_spdx: str = "",
     duration_ms: int = 0,
+    environment: str = "",
 ) -> GateReport:
     """Turn one licence check into findings, without re-running it.
 
@@ -123,6 +145,11 @@ def shape_licenses(
         findings.append(
             GateFinding(
                 gate="licenses",
+                evidence=GateDecisionEvidence.model_construct(
+                    origin="mechanical",
+                    status="not_asked",
+                    source=", ".join(policy.sources),
+                ),
                 key=resolved.name,
                 kind="dependency",
                 subject=f"{resolved.name}:{resolved.version}",
@@ -144,6 +171,11 @@ def shape_licenses(
         findings.append(
             GateFinding(
                 gate="licenses",
+                evidence=GateDecisionEvidence.model_construct(
+                    origin="mechanical",
+                    status="not_asked",
+                    source=", ".join(policy.sources),
+                ),
                 key=f"source:{found.path}",
                 kind="vendored",
                 subject=found.path,
@@ -166,6 +198,7 @@ def shape_licenses(
         summary=(
             f"{ok_count} package(s) accepted, {failing} finding(s)"
             + (f"; project licence {project_spdx}" if project_spdx else "")
+            + (f"; environment {environment}" if environment else "")
         ),
         duration_ms=duration_ms,
     )
@@ -186,15 +219,23 @@ def _unconfigured(gate: str, hint: str, started: float) -> GateReport:
         ok=False,
         configured=False,
         error=hint,
-        summary=f"{gate}: no policy declared",
+        summary=hint
+        if hint == NODE_GATE_UNAVAILABLE
+        else f"{gate}: no policy declared",
         duration_ms=int((time.monotonic() - started) * 1000),
     )
 
 
-def collect_licenses(root: Path, policy_path: Path | None = None) -> GateReport:
+def collect_licenses(
+    root: Path,
+    policy_path: Path | None = None,
+    config: SentinelConfig | None = None,
+) -> GateReport:
     """Run the licence gate's collect stage over ``root``."""
     started = time.monotonic()
-    import importlib.metadata as md
+    if node_dependency_coverage_unavailable(root, config):
+        return _unconfigured("licenses", NODE_GATE_UNAVAILABLE, started)
+    from vibe_sentinel.python_environment import collect_environment
 
     from vibe_sentinel.licenses import (
         audit,
@@ -211,7 +252,19 @@ def collect_licenses(root: Path, policy_path: Path | None = None) -> GateReport:
     except (KeyError, ValueError) as e:
         return _failed("licenses", str(e), started)
 
-    ok, bad = audit(list(md.distributions()), policy)
+    try:
+        snapshot = collect_environment(root, config)
+    except (OSError, ValueError) as e:
+        return _failed("licenses", str(e), started)
+    if snapshot.limitations:
+        return _failed(
+            "licenses",
+            "Selected environment inventory is incomplete: "
+            + "; ".join(snapshot.limitations),
+            started,
+        )
+    ok, bad = audit(snapshot.license_distributions(), policy)
+    env = snapshot.environment
     own = project_license(root, policy.all_markers())
     return shape_licenses(
         ok_count=len(ok),
@@ -223,6 +276,7 @@ def collect_licenses(root: Path, policy_path: Path | None = None) -> GateReport:
         policy=policy,
         project_spdx=own.spdx if own else "",
         duration_ms=int((time.monotonic() - started) * 1000),
+        environment=f"{env.executable} (Python {env.python}; {env.selection})",
     )
 
 
@@ -246,6 +300,8 @@ def shape_packages(
     ``distinct`` is a thing that was found and then decided, which is a
     different record from a pair that was never there.
     """
+    from vibe_sentinel.packages import near_miss_question
+
     judged = (
         {j.finding.name: j for j in adjudication.judgements}
         if adjudication is not None
@@ -260,6 +316,22 @@ def shape_packages(
         shaped.append(
             GateFinding(
                 gate="packages",
+                evidence=(
+                    judgement.evidence
+                    if judgement is not None and judgement.evidence is not None
+                    else GateDecisionEvidence.model_construct(
+                        origin="model",
+                        status="failed",
+                        question=near_miss_question(finding),
+                        source="built-in",
+                    )
+                    if judgement is not None and judgement.verdict == "standing"
+                    else GateDecisionEvidence.model_construct(
+                        origin="mechanical", status="not_asked"
+                    )
+                    if finding.kind != "near-miss"
+                    else GateDecisionEvidence.model_construct()
+                ),
                 key=f"{finding.kind}:{finding.name}",
                 kind=finding.kind,
                 subject=finding.name,
@@ -288,7 +360,8 @@ def shape_packages(
         findings=tuple(shaped),
         summary=(
             f"{len(inventory.installed)} installed, {len(inventory.direct)} declared "
-            f"in {env.label}; {len(shaped)} finding(s), {failing} failing, "
+            f"in {env.label} ({env.executable}; Python {env.python}; {env.selection}); "
+            f"{len(shaped)} finding(s), {failing} failing, "
             + ("index queried" if online else "index not queried")
         ),
         duration_ms=duration_ms,
@@ -311,6 +384,8 @@ async def collect_packages(
     stands, exactly as it did before this step existed.
     """
     started = time.monotonic()
+    if node_dependency_coverage_unavailable(root, config):
+        return _unconfigured("packages", NODE_GATE_UNAVAILABLE, started)
     from vibe_sentinel.packages import (
         adjudicate,
         audit,
@@ -325,7 +400,7 @@ async def collect_packages(
         return _failed("packages", str(e), started)
 
     try:
-        inventory = take_inventory(root)
+        inventory = take_inventory(root, policy, config=config)
     except (OSError, ValueError) as e:
         return _failed("packages", str(e), started)
 
@@ -345,8 +420,19 @@ async def collect_packages(
             started,
         )
 
-    findings = by_severity(audit(inventory, policy))
-    adjudged = await adjudicate(inventory, findings, policy, config)
+    try:
+        findings = by_severity(audit(inventory, policy))
+    except (OSError, ValueError) as e:
+        return _failed("packages", str(e), started)
+    evidence: dict[str, GateEvidence] = {}
+    try:
+        adjudged = await adjudicate(
+            inventory, findings, policy, config, evidence=evidence
+        )
+    except LLMConnectionError as exc:
+        failed = _failed("packages", str(exc), started)
+        failed.evidence = tuple(evidence.values())
+        return failed
     return shape_packages(
         inventory,
         findings,
@@ -373,6 +459,7 @@ def shape_credentials(
     findings = [
         GateFinding(
             gate="credentials",
+            evidence=j.evidence,
             key=f"{j.candidate.rule}:{j.candidate.path}",
             kind=j.candidate.rule,
             subject=j.candidate.path,
@@ -433,14 +520,17 @@ async def collect_credentials(
             started,
         )
 
+    evidence: dict[tuple[str, str], GateEvidence] = {}
     try:
-        found = await creds.adjudicate(scan, secrets, policy, config)
+        found = await creds.adjudicate(scan, secrets, policy, config, evidence=evidence)
     except LLMConnectionError as e:
         # Deciding which pattern hits are real is half of this gate, so a
         # run that could not ask has not completed. Reported as the gate's
         # own failure rather than allowed out, like every other way this
         # one can stop short.
-        return _failed("credentials", str(e), started)
+        failed = _failed("credentials", str(e), started)
+        failed.evidence = tuple(evidence.values())
+        return failed
     return shape_credentials(
         scan, found, policy, duration_ms=int((time.monotonic() - started) * 1000)
     )
@@ -466,7 +556,7 @@ async def collect_all(
         started = time.monotonic()
         try:
             if gate == "licenses":
-                reports.append(collect_licenses(root))
+                reports.append(collect_licenses(root, config=config))
             elif gate == "packages":
                 reports.append(await collect_packages(root, config))
             else:

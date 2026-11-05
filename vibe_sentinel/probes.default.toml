@@ -322,6 +322,9 @@ default = "lines"
 # The only probe here that measures the environment rather than the
 # source, and it exists because the environment is the part of a project
 # that nothing records.
+# The scanner runtime is the default. [environment] python selects a separate
+# trusted interpreter; scans forward that selection to this built-in reader.
+# environment:identity records the target independently of version/origin keys.
 #
 # A declared constraint is in pyproject.toml and shows up in `git diff`.
 # A lock file is in the repository too — a diff nobody reads, but a diff.
@@ -352,7 +355,7 @@ default = "lines"
 id = "dependency-versions"
 title = "Installed versions and package origins"
 description = """
-Records the version of every installed distribution and whether it came
+Records the selected Python environment, the version of every installed distribution and whether it came
 from an index or from a path, URL or VCS checkout. Detects a dependency
 downgraded to make an error go away, a transitive version that moved
 with nothing in the project asking for it, and a package that stopped
@@ -374,12 +377,14 @@ default = "."
 [[probe.placeholders]]
 name = "SCOPE"
 description = """
-Which distributions to record. `all` is every one on the interpreter's
+Which distributions to record. `all` is every one in the selected environment's
 path and is the honest answer — a version that moved is worth seeing
 whoever pulled it in. `declared` narrows to what the manifest names plus
 everything those transitively require, which is the same supply chain
 minus whatever else happens to be installed; a project with a very large
-environment may prefer it, since every distribution in scope costs two
+environment may prefer it. `declared` uses the project's selected extras and
+dependency groups and evaluates markers against the measured interpreter.
+Every distribution in scope costs two
 rows per scan for the life of the history.
 """
 pattern = "^(all|declared)$"

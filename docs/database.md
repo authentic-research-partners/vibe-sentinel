@@ -17,10 +17,11 @@ vibe-sentinel db reindex    # recreate a declared index that went missing
 
 ## It checks itself automatically, once a day
 
-Any command that is not about the database itself runs a health check first, at most once per `check_interval_hours`. Three properties make this safe to leave switched on: findings go to **stderr** through the logger, so `scan
---format json` piped somewhere stays parseable; it **cannot raise or change the
-exit code**, because a health check that breaks the scan somebody asked for is
-one that gets turned off; and every finding **names the command that fixes it**.
+Regular scans and other project commands can run a health check before their
+main work, at most once per `check_interval_hours`. Database maintenance,
+hooks, historical export, offline summarization and probe listings skip the
+automatic check. Findings go to stderr and leave the command's exit code and
+JSON output intact. Each finding includes a remedy when one is available.
 
 It checks for integrity, missing indexes, free pages, an oversized write-ahead log, pending migrations, and any declared ceiling. Each run appends to
 `db_maintenance`, so "when was this last looked at" travels with the file into a

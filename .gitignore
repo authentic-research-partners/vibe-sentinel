@@ -31,3 +31,7 @@ logs/
 
 # direnv
 .envrc
+
+# Optional Node ecosystem packs: local dependencies and npm artifacts.
+node_modules/
+*.tgz

@@ -66,12 +66,17 @@ import subprocess
 import tomllib
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from pathlib import Path
+from time import monotonic
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict
 
+from vibe_sentinel.schemas import GateDecisionEvidence, GateEvidence
+
 from vibe_sentinel.config import DEFAULT_CONCURRENCY
+from vibe_sentinel.config import endpoint_is_local as endpoint_is_local
 from vibe_sentinel.exceptions import LLMConnectionError
+from vibe_sentinel.log import logger
 from vibe_sentinel.paths import CONFIG_FILENAME
 from vibe_sentinel.probes import EXCLUDED_DIRS
 from vibe_sentinel.policy import PROJECT_CONFIG, accepts_value, check_pins
@@ -1031,6 +1036,7 @@ def search(
     values already reduced to a prefix and a shape. Separated from the
     judgement because this half is reproducible and that half is not.
     """
+    logger.info("credentials: scanning files for candidates")
     path_rules = [s for s in secrets if s.applies_to == "path"]
     content_rules = [s for s in secrets if s.applies_to == "content"]
     path_matchers = [(s, re.compile(s.pattern)) for s in path_rules]
@@ -1084,6 +1090,12 @@ def search(
     resolved = tuple(
         c.model_copy(update={"exposure": mapped.get(c.path, c.exposure)})
         for c in candidates
+    )
+    logger.info(
+        "credentials: scanned {} file(s), skipped {} oversized file(s), found {} candidate(s)",
+        read,
+        skipped,
+        len(resolved),
     )
     return Scan(
         candidates=resolved,
@@ -1202,39 +1214,6 @@ def exposure_map(root: Path, paths: list[str]) -> tuple[dict[str, str], str]:
 # --------------------------------------------------------------------------------------
 
 
-def endpoint_is_local(endpoint: str) -> tuple[bool, str]:
-    """Whether the configured model endpoint is on this machine.
-
-    Every other check here can run against whatever ``[llm] endpoint`` names,
-    because what it sends is a list of package names or a count of modules.
-    This one sends the inside of your ``.env``. So it asks first, and the
-    answer is loopback or nothing — ``allow_remote_model = true`` is how you
-    say you meant it, and it is deliberately not a command-line flag: sending
-    credentials somewhere is not a decision to make while typing.
-    """
-    import ipaddress
-    from urllib.parse import urlparse
-
-    host = (urlparse(endpoint).hostname or "").strip("[]")
-    if not host:
-        return False, f"{endpoint!r} names no host"
-    if host == "localhost" or host.endswith(".localhost"):
-        return True, ""
-    try:
-        address = ipaddress.ip_address(host)
-    except ValueError:
-        return False, (
-            f"{host} is a hostname this cannot resolve to a loopback address"
-        )
-    if address.is_loopback or address.is_unspecified:
-        return True, ""
-    if address.is_private:
-        return False, (
-            f"{host} is on your network but is not this machine — another host, or a VM"
-        )
-    return False, f"{host} is a public address"
-
-
 CREDENTIAL_SYSTEM_PROMPT = """\
 You judge whether a string found in a codebase is a working credential.
 
@@ -1347,6 +1326,7 @@ class Judgement(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
+    evidence: GateDecisionEvidence | None = None
     candidate: Candidate
     verdict: str
     """``real``, ``placeholder``, ``unclear``, or ``pinned``.
@@ -1392,11 +1372,36 @@ class Adjudication(BaseModel):
         )
 
 
+def _record_evidence(
+    evidence: dict[tuple[str, str], GateEvidence] | None,
+    candidate: Candidate,
+    decision: GateDecisionEvidence,
+    *,
+    verdict: str = "",
+    reason: str = "",
+) -> None:
+    if evidence is not None:
+        evidence[(candidate.rule, candidate.path)] = GateEvidence.model_construct(
+            gate="credentials",
+            key=f"{candidate.rule}:{candidate.path}",
+            kind=candidate.rule,
+            subject=candidate.path,
+            risk=candidate.exposure,
+            verdict=verdict,
+            failing=None,
+            reason=reason,
+            matches=len(candidate.lines),
+            decision=decision,
+        )
+
+
 async def review(
     candidates: tuple[Candidate, ...],
     secrets: tuple[Secret, ...],
     config: SentinelConfig,
     policy: Policy,
+    *,
+    evidence: dict[tuple[str, str], GateEvidence] | None = None,
 ) -> list[Judgement]:
     """Ask the local model about each candidate.
 
@@ -1443,27 +1448,48 @@ async def review(
 
     async def ask_all() -> list[Any]:
         limit = asyncio.Semaphore(max(1, policy.concurrency))
+        completed = 0
+        last_update = monotonic()
 
         async def one(candidate: Candidate) -> tuple[Candidate, dict[str, Any] | None]:
+            nonlocal completed, last_update
             secret = by_id.get(candidate.rule)
             if secret is None:
                 return candidate, None
             async with limit:
-                return candidate, await llm_query(
+                _record_evidence(
+                    evidence,
+                    candidate,
+                    GateDecisionEvidence.model_construct(
+                        origin="model",
+                        status="failed",
+                        question=secret.question,
+                        source=secret.source,
+                    ),
+                )
+                answer = await llm_query(
                     contexts[candidate.path],
                     build_question(secret),
                     _SECRET_SCHEMA,
                     f"credential-{candidate.rule}",
                     config=tuned,
                 )
+                completed += 1
+                now = monotonic()
+                if completed == len(candidates) or now - last_update >= 10:
+                    logger.info(
+                        "credentials: {} of {} judge requests finished",
+                        completed,
+                        len(candidates),
+                    )
+                    last_update = now
+                return candidate, answer
 
         return await asyncio.gather(
             *(one(c) for c in candidates), return_exceptions=True
         )
 
     results = await ask_all()
-
-    raise_if_unreachable(results)
 
     judgements: list[Judgement] = []
     unanswered: list[str] = []
@@ -1486,10 +1512,27 @@ async def review(
         judgements.append(
             Judgement(
                 candidate=candidate,
+                evidence=GateDecisionEvidence.model_construct(
+                    origin="model",
+                    status="answered",
+                    question=by_id[candidate.rule].question,
+                    source=by_id[candidate.rule].source,
+                ),
                 verdict=opinion.verdict,
                 reason=opinion.reason,
             )
         )
+
+    for judgement in judgements:
+        assert judgement.evidence is not None
+        _record_evidence(
+            evidence,
+            judgement.candidate,
+            judgement.evidence,
+            verdict=judgement.verdict,
+            reason=judgement.reason,
+        )
+    raise_if_unreachable(results)
 
     # Only candidates that reached neither list: one already named above as
     # "no answer" must not be named again as "did not come back".
@@ -1515,6 +1558,8 @@ async def adjudicate(
     secrets: tuple[Secret, ...],
     policy: Policy,
     config: SentinelConfig | None = None,
+    *,
+    evidence: dict[tuple[str, str], GateEvidence] | None = None,
 ) -> Adjudication:
     """Settle every candidate: by pin, by declared verdict, or by the model.
 
@@ -1537,6 +1582,14 @@ async def adjudicate(
             settled.append(
                 Judgement(
                     candidate=candidate,
+                    evidence=GateDecisionEvidence.model_construct(
+                        origin="pin",
+                        status="not_asked",
+                        source=policy.source,
+                        question=by_id[candidate.rule].question
+                        if candidate.rule in by_id
+                        else "",
+                    ),
                     verdict="pinned",
                     reason=str(pin.get("reason", "")).strip(),
                 )
@@ -1549,6 +1602,12 @@ async def adjudicate(
             settled.append(
                 Judgement(
                     candidate=candidate,
+                    evidence=GateDecisionEvidence.model_construct(
+                        origin="declared_verdict",
+                        status="not_asked",
+                        source=declared.source,
+                        question=declared.question,
+                    ),
                     verdict=declared.verdict,
                     reason=(
                         f"declared {declared.verdict} by this project's rule "
@@ -1559,6 +1618,27 @@ async def adjudicate(
             continue
         to_ask.append(candidate)
 
+    for judgement in settled:
+        assert judgement.evidence is not None
+        _record_evidence(
+            evidence,
+            judgement.candidate,
+            judgement.evidence,
+            verdict=judgement.verdict,
+            reason=judgement.reason,
+        )
+    for candidate in to_ask:
+        rule = by_id.get(candidate.rule)
+        _record_evidence(
+            evidence,
+            candidate,
+            GateDecisionEvidence.model_construct(
+                origin="unknown",
+                status="failed",
+                question=rule.question if rule else "",
+                source=rule.source if rule else "",
+            ),
+        )
     if not to_ask:
         return Adjudication(scan=scan, judgements=tuple(settled))
 
@@ -1583,7 +1663,14 @@ async def adjudicate(
             f"endpoint and meant it."
         )
 
-    judged = await review(tuple(to_ask), secrets, config, policy)
+    logger.info("credentials: asking the judge about {} candidate(s)", len(to_ask))
+    judged = await review(
+        tuple(to_ask),
+        secrets,
+        config,
+        policy,
+        **({"evidence": evidence} if evidence is not None else {}),
+    )
     return Adjudication(
         scan=scan,
         judgements=tuple(settled + judged),

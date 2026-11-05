@@ -609,3 +609,24 @@ def test_v8_records_what_the_gate_did_and_keeps_every_verdict(tmp_path: Path) ->
     assert rows["rm -rf /"].decision == "deny" and rows["rm -rf /"].enforced
     assert rows["rm -rf build"].decision == "allow"
     assert rows["rm -rf build"].verdict == "safe", "no verdict rewritten"
+
+
+def test_v9_preserves_legacy_baseline_and_leaves_provenance_unavailable(
+    tmp_path: Path,
+) -> None:
+    from vibe_sentinel.db import store
+
+    path = _database_at(tmp_path, 8)
+    with sqlite3.connect(path) as conn:
+        conn.execute("UPDATE runs SET is_baseline=1 WHERE id=1")
+    assert run_migration(tmp_path).success
+    with get_db(tmp_path) as conn:
+        row = conn.execute(
+            "SELECT is_baseline,baseline_run_id,provenance_json,result_json FROM runs WHERE id=1"
+        ).fetchone()
+        assert tuple(row) == (1, None, None, None)
+        assert store.load_result(conn, 1) is None
+        snapshot = store.load_snapshot(conn, 1)
+        assert snapshot is not None
+        assert snapshot.context is None
+        assert snapshot.probes["module-organization"].observations[0].value == 9

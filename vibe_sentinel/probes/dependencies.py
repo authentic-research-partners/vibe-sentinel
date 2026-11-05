@@ -48,6 +48,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -132,29 +133,78 @@ def main(argv: list[str] | None = None) -> int:
             "the manifest names, plus everything those transitively require."
         ),
     )
+    parser.add_argument("--config", help="Explicit Sentinel configuration file")
+    parser.add_argument(
+        "--python",
+        default=None,
+        help="Override the selected target Python; empty means scanner runtime",
+    )
+    parser.add_argument(
+        "--environment-timeout",
+        type=float,
+        default=None,
+        help="Override the target inspection timeout in seconds",
+    )
+    parser.add_argument(
+        "--environment-root",
+        default=None,
+        help="Project root for environment selection (default: --root)",
+    )
     args = parser.parse_args(argv)
 
     # Imported here rather than at module scope: this reads the
     # environment the probe is *run in*, which is the point, and
     # `packages` owns that reading for the provenance gate already.
     # Sharing it means the two cannot disagree about what is installed.
-    from vibe_sentinel.packages import (
-        declared_requirements,
-        installed_distributions,
-        requirement_closure,
-    )
+    from vibe_sentinel.config import SentinelConfig, load_config
+    from vibe_sentinel.packages import installed_distributions, take_inventory
+    from vibe_sentinel.paths import CONFIG_FILENAME
+    from vibe_sentinel.python_environment import collect_environment
 
     root = Path(args.root)
-    installed = installed_distributions()
-    if not installed:
+    environment_root = Path(args.environment_root) if args.environment_root else root
+    config_path = (
+        Path(args.config) if args.config else environment_root / CONFIG_FILENAME
+    )
+    try:
+        config = (
+            load_config(config_path)
+            if config_path.is_file() or args.config
+            else SentinelConfig()
+        )
+        overrides = {}
+        if args.python is not None:
+            overrides["environment_python"] = args.python
+        if args.environment_timeout is not None:
+            overrides["environment_timeout"] = args.environment_timeout
+        config = type(config).model_validate({**config.model_dump(), **overrides})
+        snapshot = collect_environment(environment_root, config)
+        installed = installed_distributions(snapshot)
+    except (OSError, ValueError) as e:
+        print(
+            f"probe dependencies: environment inspection failed: {e}", file=sys.stderr
+        )
+        return 2
+    if snapshot.limitations:
+        gaps = not_measured(list(snapshot.limitations))
+        emit([gaps], summary="Selected environment inventory is incomplete")
+        print(
+            "probe dependencies: environment coverage is incomplete: "
+            + "; ".join(snapshot.limitations),
+            file=sys.stderr,
+        )
+        # A partial set would manufacture removals against a complete baseline.
+        # Fail so the runner records this probe as unmeasured and compare skips it.
+        return 2
+    if not installed and snapshot.environment.selection == "runtime":
         # Not zero observations. An interpreter with no distributions on
         # its path is a probe pointed at the wrong python, and recording
         # it as an empty environment would read on the next comparison as
         # every dependency having been removed.
         print(
-            "probe dependencies: no distributions found on this interpreter's "
-            "path. Run it with the project's own python — the one whose "
-            "environment you want measured.",
+            "probe dependencies: no distributions found in the selected "
+            f"environment {snapshot.environment.executable}. Check [environment] "
+            "python and install the project's declared dependencies there.",
             file=sys.stderr,
         )
         return 2
@@ -162,18 +212,56 @@ def main(argv: list[str] | None = None) -> int:
     scope = frozenset(installed)
     skipped: list[str] = []
     if args.scope == "declared":
-        declared = {r.name for r in declared_requirements(root)}
-        if not declared:
+        try:
+            inventory = take_inventory(root, config=config, snapshot=snapshot)
+        except (OSError, ValueError) as e:
+            print(f"probe dependencies: declared scope failed: {e}", file=sys.stderr)
+            return 2
+        if not inventory.active:
+            reason = (
+                f"nothing in {root} declares any dependency"
+                if not inventory.declared
+                else f"no dependency in {root} is active for the selected extras, groups and environment"
+            )
             print(
-                f"probe dependencies: --scope declared, but nothing in {root} "
-                f"declares any dependency. Point --root at the directory "
-                f"holding pyproject.toml, or use --scope all.",
+                f"probe dependencies: --scope declared, but {reason}. "
+                "Check --root, [packages] selections and [environment] python, "
+                "or use --scope all.",
                 file=sys.stderr,
             )
             return 2
-        scope = requirement_closure(set(declared), installed) & frozenset(installed)
+        missing = inventory.closure - frozenset(installed)
+        if missing:
+            print(
+                "probe dependencies: declared dependency closure is incomplete; "
+                "missing installed metadata for "
+                + ", ".join(sorted(missing))
+                + ". Check [packages] selection and install the declared dependencies "
+                "in the selected environment.",
+                file=sys.stderr,
+            )
+            return 2
+        scope = inventory.closure & frozenset(installed)
 
-    observations: list[dict] = []
+    identity = snapshot.environment.model_dump(mode="json")
+    observations: list[dict] = [
+        {
+            "key": "environment:identity",
+            "state": json.dumps(
+                {
+                    key: value
+                    for key, value in identity.items()
+                    if key != "scanner_executable"
+                },
+                sort_keys=True,
+            ),
+            "label": (
+                f"environment: {snapshot.environment.executable} "
+                f"(Python {snapshot.environment.python}; {snapshot.environment.selection})"
+            ),
+            "attrs": identity,
+        }
+    ]
     measured = 0
     direct = 0
     for name in sorted(scope):
@@ -228,7 +316,14 @@ def main(argv: list[str] | None = None) -> int:
         observations,
         summary=(
             f"{measured} distribution(s) in scope {args.scope!r}, "
-            f"{direct} installed from outside an index; {gaps['label']}"
+            f"{direct} installed from outside an index; {gaps['label']}; "
+            f"environment {snapshot.environment.executable} "
+            f"(Python {snapshot.environment.python}; {snapshot.environment.selection})"
+            + (
+                f"; coverage: {'; '.join(snapshot.limitations)}"
+                if snapshot.limitations
+                else ""
+            )
         ),
     )
     return 0

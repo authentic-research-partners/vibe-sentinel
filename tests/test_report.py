@@ -19,6 +19,7 @@ from vibe_sentinel.schemas import (
     Change,
     DriftReport,
     HorizonDrift,
+    LensResult,
     Observation,
     ProbeResult,
     Snapshot,
@@ -43,6 +44,11 @@ def _snapshot() -> Snapshot:
 def _report(**kw) -> DriftReport:
     base = {
         "baseline_at": "2026-01-01T00:00:00+00:00",
+        "lenses": [
+            LensResult(
+                id="organization", title="Organization", asked=True, answered=True
+            )
+        ],
         "changes": [
             Change(
                 probe_id="module-organization",
@@ -583,3 +589,48 @@ def test_agent_render_names_the_missing_probes_even_when_drift_was_found() -> No
 
 def test_agent_render_stays_quiet_when_every_probe_measured() -> None:
     assert "NOT MEASURED" not in render_agent(_report(probes_run=5))
+
+
+def test_unanswered_judge_is_not_rendered_as_reviewed(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    report = _report(
+        lenses=[LensResult(id="organization", title="Organization", asked=True)]
+    )
+    render_terminal(_snapshot(), report)
+    output = capsys.readouterr().out
+    assert "judgement incomplete" in output
+    assert "reviewed by an independent local model" not in output
+    assert "JUDGEMENT INCOMPLETE" in render_agent(report)
+    assert "NO STRUCTURAL DRIFT" not in render_agent(report)
+
+
+def test_partially_failed_first_run_is_not_baseline() -> None:
+    report = DriftReport(first_run=True, probes_run=2, unmeasured=["failed"])
+    output = render_agent(report)
+    assert "BASELINE RECORDED" not in output
+    assert "MEASUREMENT INCOMPLETE" in output
+
+
+def test_missing_baseline_measurements_are_not_rendered_clean(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from vibe_sentinel.results import build_result
+    from vibe_sentinel.schemas import RunProvenance, ScanContext
+
+    snapshot = _snapshot()
+    snapshot.context = ScanContext(
+        provenance=RunProvenance(
+            availability="captured", fingerprint_status="captured"
+        ),
+        baseline_run_id=1,
+        baseline_unmeasured=("commentary-ratio",),
+    )
+    report = DriftReport(baseline_at="old", probes_run=1)
+    result = build_result(snapshot, report)
+    assert result.exit_code == 2
+    render_terminal(snapshot, report)
+    output = capsys.readouterr().out
+    assert "Comparison incomplete" in output
+    assert "No change since" not in output
+    assert "COMPARISON INCOMPLETE" in render_agent(report, result=result)

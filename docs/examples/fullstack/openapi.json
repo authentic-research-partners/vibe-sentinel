@@ -1,0 +1,66 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Local greeting API",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/api/greeting": {
+      "get": {
+        "operationId": "getGreeting",
+        "responses": {
+          "200": {
+            "description": "A greeting relayed by the Node API",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Greeting"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Greeting": {
+        "type": "object",
+        "required": [
+          "message"
+        ],
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "via": {
+            "type": "string"
+          }
+        }
+      },
+      "AlternateGreeting": {
+        "type": "object",
+        "required": [
+          "message"
+        ],
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "via": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "ExampleKey": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Example-Key"
+      }
+    }
+  },
+  "security": []
+}

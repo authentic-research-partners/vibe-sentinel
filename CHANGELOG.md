@@ -7,6 +7,69 @@ All notable changes to this project are recorded here. The format follows
 A release is refused if the version it names has no section here. The date on
 the heading is stamped at release; write `unreleased` and leave it.
 
+## [0.6.0] — 2026-11-05
+
+### Added
+
+- Opt-in JavaScript and TypeScript security checks for offline npm lockfile
+  advisories, selected browser and Node source flows, and credentials in existing
+  Next.js static exports. CLI and Codex reports distinguish findings from
+  incomplete coverage.
+- Managed setup and status for pinned local security tools and a refreshable
+  npm advisory snapshot. Scans use the prepared snapshot offline.
+- Offline, read-only local viewer for aggregate and sensitive local-detail
+  exports, with separate drift, state, judge status and missing-evidence views.
+- Offline aggregate Markdown summaries of recorded results, preserving captured
+  source identity and scan exit status for configured CI workflows.
+- Opt-in Celery declaration reader for named tasks, handlers, exact routes and
+  supported periodic schedules, with explicit static coverage limits.
+- Opt-in Alembic revision topology and JSON Schema 2020-12 declaration readers,
+  with bounded static inspection and explicit unsupported-structure gaps.
+- Opt-in Vite build artifact reader for stable entry relationships, shared
+  ownership and raw file sizes, with explicit coverage and freshness limits.
+- Version 3 scan evidence preserves configured questions, individual validated
+  answers, decision origins and final attribution. Read-only historical export
+  offers aggregate and sensitive local-detail profiles; version 1 and 2 results
+  remain readable without invented evidence.
+- Runnable browser, Node and Python example with composed source/API artifact
+  acceptance checks, persisted results and limited exports.
+- Optional OpenAPI JSON artifact inventory with explicit reference and coverage boundaries.
+
+- Optional Python dependency edges with explicit coverage and scope-guarded history.
+- Workspace-aware npm install targeting with per-manifest declaration checks and
+  explicit review of unsupported targets, without executing package managers.
+- Optional JavaScript pack for workspace declarations and static JS/TS import
+  relationships, packaged separately from the Python engine.
+- Explicit local ecosystem packs with namespaced drift probes, inventory contracts
+  and version 2 provenance; historical version 1 results remain readable.
+- A Codex plugin with local MCP tools, setup skills and a command-safety adapter.
+- Tested Node and frontend starter profiles for source lengths, asset bytes and patterns.
+- Explicit Python target selection for dependency and licence measurements.
+- Versioned scan results with captured run provenance and a limited `--shareable` JSON export.
+
+### Fixed
+
+- Loopback judge requests bypass environment proxies, including credential
+  adjudication and backend readiness checks.
+- Drift review bounds the evidence sent to the judge, reports omitted rows,
+  and preserves measurements and mechanical severities outside the review.
+- Standalone credential checks report progress while awaiting the judge.
+- Default source walks skip generated `out`, `dist`, and `build` directories.
+- Node-only projects report unavailable npm licence and provenance coverage
+  instead of inspecting the scanner's Python environment.
+- The Codex plugin distinguishes incomplete scan coverage from operational
+  errors and explains a missing baseline comparison without disclosing raw
+  diagnostics.
+- Unconfigured gate judges no longer make completed result envelopes fail strict parsing.
+- Public source sync excludes runtime history directories inside examples and other shipped trees.
+- Failed measurements and judge answers remain explicit and cannot become a baseline.
+- Dependency accounting follows requested transitive extras and environment markers.
+
+### Changed
+
+- Package checks select optional extras and dependency groups explicitly; existing
+  development installs need matching `[packages]` selections.
+
 ## [0.5.1] — 2026-10-02
 
 ### Added

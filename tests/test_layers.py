@@ -55,6 +55,7 @@ where a mechanism starts reaching up into the thing that composes it.
 from __future__ import annotations
 
 import ast
+import sys
 from collections import defaultdict
 from pathlib import Path
 
@@ -77,7 +78,8 @@ LAYERS: tuple[tuple[str, frozenset[str]], ...] = (
                 "horizons",
                 "json_schema",
                 "journal",
-                "requirements",
+                "relationships",
+                "node_targets",
                 "rulesets",
                 "probes",
                 "db.schema",
@@ -89,6 +91,8 @@ LAYERS: tuple[tuple[str, frozenset[str]], ...] = (
         frozenset(
             {
                 "schemas",
+                "pack_schemas",
+                "packs",
                 "config",
                 "templates",
                 "policy",
@@ -97,6 +101,7 @@ LAYERS: tuple[tuple[str, frozenset[str]], ...] = (
                 "agents",
                 "agents.claude_code",
                 "agents.cursor",
+                "agents.codex",
             }
         ),
     ),
@@ -105,9 +110,13 @@ LAYERS: tuple[tuple[str, frozenset[str]], ...] = (
         frozenset(
             {
                 "inventory",
+                "requirements",
                 "runner",
                 "trends",
                 "llm",
+                "python_environment",
+                "security_pdf",
+                "_python_inventory",
                 "db.store",
                 "db.gate_store",
                 "db.migration",
@@ -124,13 +133,29 @@ LAYERS: tuple[tuple[str, frozenset[str]], ...] = (
                 "packages",
                 "credentials",
                 "safety",
+                "security_artifacts",
+                "security_osv",
+                "security_setup",
+                "security_source",
                 "db.maintenance",
             }
         ),
     ),
     (
         "composition",
-        frozenset({"gates", "engine", "report", "hook", "db", "protection"}),
+        frozenset(
+            {
+                "gates",
+                "engine",
+                "report",
+                "results",
+                "evidence_summary",
+                "hook",
+                "db",
+                "protection",
+                "security_checks",
+            }
+        ),
     ),
     (
         "entry",
@@ -139,11 +164,19 @@ LAYERS: tuple[tuple[str, frozenset[str]], ...] = (
                 "",  # the package __init__ itself
                 "cli",
                 "__main__",
+                "mcp_server",
                 "probes.comments",
                 "probes.dependencies",
                 "probes.handlers",
                 "probes.length",
                 "probes.modules",
+                "probes.python_edges",
+                "probes.openapi",
+                "probes.vite",
+                "probes.artifact_support",
+                "probes.alembic",
+                "probes.json_schema",
+                "probes.celery",
                 "probes.patterns",
             }
         ),
@@ -294,6 +327,23 @@ def test_the_foundation_depends_on_nothing() -> None:
             f"{sorted(graph[module])}. Either it is not foundation, or that "
             f"import belongs somewhere else."
         )
+
+
+@pytest.mark.parametrize("module", ["requirements", "node_targets"])
+def test_install_target_readers_keep_the_hook_stdlib_boundary(module: str) -> None:
+    """Composition moved requirements up a layer, not into the model stack."""
+    tree = ast.parse((PACKAGE / f"{module}.py").read_text())
+    imports = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imports.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imports.append(node.module)
+    assert all(
+        name.split(".")[0] in sys.stdlib_module_names
+        or (module == "requirements" and name == "vibe_sentinel.node_targets")
+        for name in imports
+    ), imports
 
 
 @pytest.mark.parametrize("name", [name for name, _ in LAYERS])

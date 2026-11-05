@@ -1,0 +1,16 @@
+# A protocol smoke fixture, not an application inventory or source measurement.
+protocol = 1
+id = "protocol-smoke"
+version = "1.0.0"
+ecosystems = ["fixture"]
+supported_inputs = ["protocol-smoke-fixture"]
+
+[[executable]]
+id = "python"
+command = "python"
+
+[[probe]]
+id = "fixture"
+title = "Protocol smoke fixture"
+command = ["python", "-c", "import json; print(json.dumps({'observations': [{'key': 'fixture', 'value': 1}], 'summary': 'Synthetic protocol fixture'}))"]
+timeout_s = 5

@@ -1,0 +1,6 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "sentinel-development",
+  "version": "0.1.0",
+  "description": "Coordinate scoped development work with explicit role templates, model preferences and independent QA."
+}

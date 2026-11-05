@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path
 
 from loguru import logger
@@ -47,17 +48,23 @@ _PROTOCOL = (
 )
 
 
-def run_probe(probe: Probe, values: dict[str, str], cwd: Path) -> ProbeResult:
+def run_probe(
+    probe: Probe, values: dict[str, str], cwd: Path, *, extra_args: Sequence[str] = ()
+) -> ProbeResult:
     """Execute one filled probe and parse its output.
 
     A probe that fails is recorded as a failed result rather than raising:
     one broken template must not lose the other probes' measurements, and
     a silently absent probe would look like "nothing changed" on the next
     drift comparison.
+
+    ``extra_args`` are concrete engine-supplied settings for a known built-in
+    reader. Append them after template validation so paths containing braces
+    remain literal argv elements rather than being treated as placeholders.
     """
     result = ProbeResult(probe_id=probe.id, filled=values)
     try:
-        argv = probe.fill(values)
+        argv = [*probe.fill(values), *extra_args]
     except ValueError as e:
         result.ok = False
         result.error = str(e)

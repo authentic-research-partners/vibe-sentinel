@@ -1,0 +1,24 @@
+# Opt in through [probes] rule_files. No application import or broker access.
+[[probe]]
+id = "celery"
+title = "Celery task and messaging declarations"
+description = "Explicit named tasks, exact literal routes and named schedules from selected source files. Runtime registration and delivery are not assessed."
+command = ["{SCANNER_PYTHON}", "-I", "-m", "vibe_sentinel.probes.celery", "--root", "{ROOT}", "--files", "{FILES}"]
+timeout_s = 60
+tolerance = 0
+compare_parameters = true
+
+[[probe.placeholders]]
+name = "SCANNER_PYTHON"
+description = "Python in the Sentinel installation"
+default = "python"
+
+[[probe.placeholders]]
+name = "ROOT"
+description = "Project root containing the declaration files"
+default = "."
+
+[[probe.placeholders]]
+name = "FILES"
+description = "Comma-separated explicit Python source files relative to ROOT; commas in filenames are unsupported"
+default = "tasks.py,celeryconfig.py"

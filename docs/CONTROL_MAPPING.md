@@ -4,7 +4,7 @@ Each risk vibe-sentinel's safety controls address, the control, whether it
 holds, where the risk sits in three published frameworks, and the evidence —
 the test or eval case that shows it. It is the index to
 [THREAT_MODEL.md](THREAT_MODEL.md), whose threat rows (T1–T19) it cites, and
-to the measured rates in [evals.md](evals.md).
+to the measured rates in [historical eval results](eval-results.md).
 
 A row with no control says **not covered**. Evidence is cited as
 *file::name* for a test in `tests/`, and *suite:case-id* for an eval
@@ -13,7 +13,7 @@ existing, so a row cannot keep claiming evidence that was renamed away.
 "Covered" means the described call is detected or a stated boundary is enforced.
 Detection can still lead to a `safe` verdict; it does not promise a refusal.
 How often the judgement is right is a rate, in
-[evals.md](evals.md), not a property this table can promise.
+[historical eval results](eval-results.md), not a property this table can promise.
 
 ## Sources
 
@@ -345,7 +345,7 @@ Code's permission prompt (`[safety] no_verdict = "ask"`), and where nobody can
 answer that ends as a refusal naming the fix. A configuration or policy the
 gate cannot read is refused, never read as off. The cost — prompts on commands
 that were fine — is measured: `safe-command-interrupted` and
-`twin-interrupted` in [evals.md](evals.md). **Status:** covered.
+`twin-interrupted` in [historical eval results](eval-results.md). **Status:** covered.
 
 **Evidence:** `test_safety::test_no_model_means_unreviewed_and_asked`,
 `test_safety::test_enforce_asks_about_an_unclear_verdict`,

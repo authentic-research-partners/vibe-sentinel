@@ -151,6 +151,10 @@ class ActionRequest:
     tool_name: str = ""
     command: str = ""
     target: str = ""
+    targets: tuple[str, ...] = ()
+    """Every path in a multi-file action, before the display target is clipped."""
+    can_ask: bool = True
+    """False when the host cannot prompt; an undecided enforced call is denied."""
     description: str = ""
     cwd: str = ""
     session_id: str = ""
@@ -179,7 +183,16 @@ class ActionRequest:
         for key, value in data.items():
             if key not in known:
                 continue
-            values[key] = as_mapping(value) if key == "envelope" else as_text(value)
+            if key == "targets":
+                values[key] = (
+                    tuple(as_text(v) for v in value)
+                    if isinstance(value, (list, tuple))
+                    else ()
+                )
+            elif key == "can_ask":
+                values[key] = value is True
+            else:
+                values[key] = as_mapping(value) if key == "envelope" else as_text(value)
         return cls(**values)
 
 

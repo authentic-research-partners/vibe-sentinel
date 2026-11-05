@@ -255,15 +255,19 @@ def test_observe_records_the_verdict_and_blocks_nothing(
     project: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     set_mode(project, "observe")
-    monkeypatch.setattr(hook, "review", _opinion("unsafe", "it deletes your home"))
+    monkeypatch.setattr(
+        hook, "review", _opinion("unsafe", "it deletes home-directory work")
+    )
 
-    outcome, decision = hook.guard(payload(project, "rm -rf ~/"))
+    # Deleting the whole home also removes Codex's control files and is
+    # settled unsafe before asking. This case exercises the model path.
+    outcome, decision = hook.guard(payload(project, "rm -rf ~/scratch"))
 
     assert outcome == "recorded"
     assert decision is None, "observe mode must never stop a command"
     (row,) = reviews(project)
     assert row.verdict == "unsafe"
-    assert row.reason == "it deletes your home"
+    assert row.reason == "it deletes home-directory work"
     assert row.reviewed is True
     assert row.enforced is False
     assert "home-directory" in row.signal_list()

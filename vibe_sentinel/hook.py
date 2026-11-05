@@ -80,7 +80,7 @@ from vibe_sentinel.db.connection import (
     db_path,
     get_db,
 )
-from vibe_sentinel.journal import ActionRequest, Decision
+from vibe_sentinel.journal import MAX_COMMAND_CHARS, ActionRequest, Decision
 
 #: Events that could not reach the database land here, one JSON object
 #: per line. ``vibe-sentinel hook --replay`` drains it.
@@ -340,7 +340,12 @@ def _untriageable(
 
 
 def gate(
-    root: Path, request: ActionRequest, command_id: int, occurred_at: str
+    root: Path,
+    request: ActionRequest,
+    command_id: int,
+    occurred_at: str,
+    *,
+    cwd: Path | None = None,
 ) -> Decision | None:
     """Judge one recorded command, and decide whether to stop it.
 
@@ -360,6 +365,7 @@ def gate(
     under ``enforce`` it becomes a question, and elsewhere the command
     proceeds.
     """
+    working_directory = cwd or (Path(request.cwd) if request.cwd else root)
     mode = "off"
     no_verdict = "allow"
     try:
@@ -388,8 +394,22 @@ def gate(
             )
 
         try:
-            signals = triage(
-                request.tool_name, request.command, request.target, root, dangers
+            # One patch can touch several files. Check each path before
+            # deduplicating signals, so a harmless first file cannot hide
+            # a later edit to the gate itself.
+            signals = tuple(
+                dict.fromkeys(
+                    signal
+                    for target in (request.targets or (request.target,))
+                    for signal in triage(
+                        request.tool_name,
+                        request.command,
+                        target,
+                        root,
+                        dangers,
+                        cwd=working_directory,
+                    )
+                )
             )
         except ManifestUnreadable as e:
             return _untriageable(
@@ -433,12 +453,20 @@ def gate(
         else:
             import asyncio
 
+            review_target = (
+                "\n".join(request.targets) if request.targets else request.target
+            )
+            if len(review_target) > MAX_COMMAND_CHARS:
+                raise ValueError(
+                    "the action names too many paths for a bounded safety review; "
+                    "split it into smaller actions"
+                )
             opinion = asyncio.run(
                 review(
                     request.tool_name,
                     request.command,
-                    request.target,
-                    request.cwd,
+                    review_target,
+                    str(working_directory),
                     root,
                     signals,
                     list(history),
@@ -461,7 +489,7 @@ def gate(
         elif verdict == "unsafe":
             decision = "deny"
         elif verdict in ("unclear", "unreviewed") and no_verdict == "ask":
-            decision = "ask"
+            decision = "ask" if request.can_ask else "deny"
         else:
             decision = "allow"
         enforced = decision == "deny"
@@ -487,6 +515,11 @@ def gate(
             return _ask(
                 _no_verdict_reason(verdict, reason, signals, config.safety_timeout)
             )
+        if decision == "deny" and verdict in ("unclear", "unreviewed"):
+            return _deny(
+                _no_verdict_reason(verdict, reason, signals, config.safety_timeout)
+                + " This agent cannot ask from its tool hook, so the call is refused."
+            )
         if decision != "deny":
             return None
 
@@ -499,21 +532,28 @@ def gate(
         )
     except Exception as e:  # noqa: BLE001 - never block a tool call over a bug
         asking = mode == "enforce" and no_verdict == "ask"
+        unanswered = ("ask" if request.can_ask else "deny") if asking else "allow"
         _record_unreviewed(
             root,
             command_id,
             occurred_at,
             mode,
             f"the safety gate failed: {e}",
-            "ask" if asking else "allow",
+            unanswered,
         )
         if asking:
             logger.warning("safety gate failed ({}) — asking about the command", e)
-            return _ask(
+            return Decision(
+                unanswered,
                 f"vibe-sentinel failed while judging this command ({e}), so it "
                 f"has no verdict. Approve it only if you know what it does. The "
                 f"failure is in the hook log; `vibe-sentinel safety --check "
                 f"'<command>'` runs the same review where the error is visible."
+                + (
+                    " This agent cannot ask from its tool hook, so the call is refused."
+                    if not request.can_ask
+                    else ""
+                ),
             )
         logger.warning("safety gate failed ({}) — command allowed through", e)
         return None
@@ -558,7 +598,7 @@ def guard(
         return (outcome, reader.reply(None, request))
     return (
         outcome,
-        reader.reply(gate(root, request, command_id, occurred_at), request),
+        reader.reply(gate(root, request, command_id, occurred_at, cwd=start), request),
     )
 
 

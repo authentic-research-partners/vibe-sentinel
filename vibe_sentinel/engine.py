@@ -25,34 +25,48 @@ decide what to look at. That is the whole of its job here.
 from __future__ import annotations
 
 import sqlite3
+import sys
 import time
 from pathlib import Path
 
 from loguru import logger
 
-from vibe_sentinel.analyze import Lens, analyze_drift
-from vibe_sentinel.config import SentinelConfig
+from vibe_sentinel.analyze import Lens, analyze_drift, load_lenses
+from vibe_sentinel.config import SentinelConfig, load_config
 from vibe_sentinel.db import get_db
 from vibe_sentinel.db import gate_store, store as db_store
 from vibe_sentinel.gates import collect_all
 from vibe_sentinel import trends
 from vibe_sentinel.horizons import age_days, horizon_cutoff
 from vibe_sentinel.inventory import compare
+from vibe_sentinel.exceptions import LLMConnectionError
+from vibe_sentinel.packs import LoadedPack
+from vibe_sentinel.paths import CONFIG_FILENAME
+from vibe_sentinel.results import capture_provenance, capture_evidence
 from vibe_sentinel.runner import run_probe
 from vibe_sentinel.schemas import (
     DriftReport,
     GateState,
     HorizonDrift,
+    ProbeResult,
+    ScanContext,
     Snapshot,
     TrendFit,
 )
 from vibe_sentinel.templates import Probe
 
 
+# The inner collector owns the selected target's timeout and process cleanup.
+# Give its scanner process bounded room to import, encode and report that result.
+_DEPENDENCY_READER_OVERHEAD_S = 30.0
+
+
 def scan(
     probes: list[Probe],
     root: Path,
     config: SentinelConfig | None = None,
+    *,
+    context: ScanContext | None = None,
 ) -> Snapshot:
     """Run every probe and return the resulting structural snapshot.
 
@@ -66,10 +80,53 @@ def scan(
     snapshot = Snapshot(
         root=root.as_posix(),
         model=(config.llm_model if config else ""),
+        context=context,
     )
     for probe, values in zip(probes, filled, strict=True):
         started = time.monotonic()
-        result = run_probe(probe, values, cwd=root)
+        if (
+            probe.source == "built-in"
+            and probe.id == "dependency-versions"
+            and probe.command[:3]
+            == [sys.executable, "-m", "vibe_sentinel.probes.dependencies"]
+        ):
+            try:
+                selected = config
+                if selected is None:
+                    candidate = root / CONFIG_FILENAME
+                    selected = (
+                        load_config(candidate)
+                        if candidate.is_file()
+                        else SentinelConfig()
+                    )
+                # Forward the selected settings, including programmatic configs.
+                # The outer timeout must allow the inner owner to stop its target.
+                bounded = probe.model_copy(
+                    update={
+                        "timeout_s": max(
+                            probe.timeout_s,
+                            selected.environment_timeout
+                            + _DEPENDENCY_READER_OVERHEAD_S,
+                        )
+                    }
+                )
+                extra_args = [
+                    f"--python={selected.environment_python}",
+                    f"--environment-timeout={selected.environment_timeout}",
+                    f"--environment-root={root.absolute()}",
+                ]
+                if selected.config_path is not None:
+                    extra_args.append(f"--config={selected.config_path.absolute()}")
+                result = run_probe(bounded, values, cwd=root, extra_args=extra_args)
+            except (OSError, ValueError) as exc:
+                result = ProbeResult(
+                    probe_id=probe.id,
+                    filled=values,
+                    ok=False,
+                    error=f"Dependency reader configuration failed: {exc}",
+                )
+        else:
+            result = run_probe(probe, values, cwd=root)
         result.title = probe.title
         result.duration_ms = int((time.monotonic() - started) * 1000)
         snapshot.probes[probe.id] = result
@@ -94,6 +151,27 @@ def drift_over_horizons(
     Runs before the current scan is recorded, so the selector can never
     pick the run being compared.
     """
+    pack_only = bool(snapshot.probes) and all(
+        pid.startswith("pack:") for pid in snapshot.probes
+    )
+    if pack_only:
+        return [
+            HorizonDrift(
+                horizon=horizon,
+                unavailable="Pack history coverage is baseline-only; horizons are not assessed.",
+            )
+            for horizon in horizons
+        ]
+    snapshot = snapshot.model_copy(
+        update={
+            "probes": {
+                pid: result
+                for pid, result in snapshot.probes.items()
+                if not pid.startswith("pack:")
+            }
+        }
+    )
+    probes = [probe for probe in probes if not probe.id.startswith("pack:")]
     out: list[HorizonDrift] = []
     # Two horizons land on one run whenever the history is sparser than
     # the gap between them — `1w` and `2w` against a repository scanned
@@ -121,13 +199,59 @@ def drift_over_horizons(
                 )
             )
             continue
+        previous = previous.model_copy(
+            update={
+                "probes": {
+                    pid: result
+                    for pid, result in previous.probes.items()
+                    if not pid.startswith("pack:")
+                }
+            }
+        )
+        mismatched = {
+            probe.id
+            for probe in probes
+            if probe.compare_parameters
+            and probe.id in snapshot.probes
+            and (
+                probe.id not in previous.probes
+                or not previous.probes[probe.id].ok
+                or previous.probes[probe.id].command
+                != snapshot.probes[probe.id].command
+                or previous.probes[probe.id].filled != snapshot.probes[probe.id].filled
+            )
+        }
+        horizon_current = snapshot
+        if mismatched:
+            previous = previous.model_copy(
+                update={
+                    "probes": {
+                        pid: result
+                        for pid, result in previous.probes.items()
+                        if pid not in mismatched
+                    }
+                }
+            )
+            horizon_current = snapshot.model_copy(
+                update={
+                    "probes": {
+                        pid: result
+                        for pid, result in snapshot.probes.items()
+                        if pid not in mismatched
+                    }
+                }
+            )
         out.append(
             HorizonDrift(
                 horizon=horizon,
+                unavailable="Parameter-guarded probe scopes are incomparable: "
+                + ", ".join(sorted(mismatched))
+                if mismatched
+                else "",
                 run_id=record.id,
                 at=record.started_at,
                 age_days=age_days(record.started_at),
-                changes=compare(previous, snapshot, probes).changes,
+                changes=compare(previous, horizon_current, probes).changes,
             )
         )
     return out
@@ -138,6 +262,8 @@ def fit_trends(
     snapshot: Snapshot,
     limit_runs: int,
     min_runs: int = trends.MIN_RUNS,
+    *,
+    compare_parameters: frozenset[str] = frozenset(),
 ) -> list[TrendFit]:
     """Fit each recorded series, and score what this scan just measured.
 
@@ -170,7 +296,18 @@ def fit_trends(
     }
 
     out: list[TrendFit] = []
+    scopes = {
+        probe_id: db_store.matching_probe_runs(
+            conn, probe_id, result.command, result.filled
+        )
+        for probe_id, result in snapshot.probes.items()
+        if probe_id in compare_parameters
+    }
     for (probe_id, key), points in recorded.items():
+        if probe_id in scopes:
+            points = [point for point in points if point.run_id in scopes[probe_id]]
+        if probe_id.startswith("pack:"):
+            continue
         observation = measured.get((probe_id, key))
         if observation is None or observation.value is None:
             continue
@@ -198,6 +335,8 @@ async def scan_and_compare(
     horizons: list[str] | None = None,
     trend_runs: int = 0,
     lenses: tuple[Lens, ...] | None = None,
+    *,
+    declared_packs: tuple[LoadedPack, ...] = (),
 ) -> tuple[Snapshot, DriftReport, int]:
     """Scan, diff against the baseline run, record, and return the verdict.
 
@@ -219,9 +358,30 @@ async def scan_and_compare(
     three properties as a horizon: no baseline moves, nothing is stored,
     no exit code changes.
 
-    Returns ``(snapshot, report, run_id)``.
+    Returns ``(snapshot, report, run_id)``. A judge failure is recorded with the
+    measured snapshot and ``"judgement" in snapshot.context.stage_errors``;
+    callers must inspect the result status rather than assume a returned tuple
+    means the judgement completed. Failed measurements/judgements never baseline.
     """
-    snapshot = scan(probes, root, config)
+    selected = config
+    if selected is None:
+        candidate = root / CONFIG_FILENAME
+        selected = load_config(candidate) if candidate.is_file() else SentinelConfig()
+    lenses = lenses if lenses is not None else load_lenses(root)
+    context = ScanContext(
+        provenance=capture_provenance(
+            root,
+            selected,
+            probes,
+            lenses,
+            horizons=horizons or [],
+            trend_runs=trend_runs,
+            declared_packs=declared_packs,
+        )
+    )
+    snapshot = scan(probes, root, selected, context=context)
+    if any(not result.ok for result in snapshot.probes.values()):
+        context.stage_error = "measurement"
 
     with get_db(root) as conn:
         baseline_record = db_store.baseline_run(conn)
@@ -230,7 +390,84 @@ async def scan_and_compare(
             if baseline_record
             else None
         )
-        report = compare(baseline, snapshot, probes)
+        context.baseline_run_id = baseline_record.id if baseline_record else None
+        selected_ids = {probe.id for probe in probes}
+        context.baseline_unmeasured = (
+            tuple(
+                probe_id
+                for probe_id in sorted(selected_ids)
+                if probe_id not in baseline.probes or not baseline.probes[probe_id].ok
+            )
+            if baseline is not None
+            else ()
+        )
+        if baseline is not None:
+            from vibe_sentinel.schemas import RunProvenance
+
+            previous_packs = (
+                baseline.context.provenance.packs
+                if baseline.context is not None
+                and isinstance(baseline.context.provenance, RunProvenance)
+                else ()
+            )
+            previous_by_id = {pack.id: pack for pack in previous_packs}
+            unavailable = set(context.baseline_unmeasured)
+            for pack in (
+                context.provenance.packs
+                if isinstance(context.provenance, RunProvenance)
+                else ()
+            ):
+                previous = previous_by_id.get(pack.id)
+                if previous is None or (
+                    previous.version,
+                    previous.protocol,
+                    previous.manifest_sha256,
+                    previous.executables,
+                ) != (
+                    pack.version,
+                    pack.protocol,
+                    pack.manifest_sha256,
+                    pack.executables,
+                ):
+                    unavailable.update(pack.selected_probes)
+                else:
+                    unavailable.update(
+                        set(pack.selected_probes) - set(previous.selected_probes)
+                    )
+            for probe in probes:
+                if not (probe._pack_id or probe.compare_parameters):
+                    continue
+                before = baseline.probes.get(probe.id)
+                current = snapshot.probes.get(probe.id)
+                if (
+                    before is not None
+                    and current is not None
+                    and (
+                        before.filled != current.filled
+                        or before.command != current.command
+                    )
+                ):
+                    unavailable.add(probe.id)
+            context.baseline_unmeasured = tuple(sorted(unavailable))
+
+        comparable_baseline = baseline
+        if baseline is not None:
+            incomparable_probes = {
+                probe.id
+                for probe in probes
+                if (probe._pack_id or probe.compare_parameters)
+                and probe.id in context.baseline_unmeasured
+            }
+            comparable_baseline = baseline.model_copy(
+                update={
+                    "probes": {
+                        probe_id: result
+                        for probe_id, result in baseline.probes.items()
+                        if probe_id not in incomparable_probes
+                    }
+                }
+            )
+        report = compare(comparable_baseline, snapshot, probes)
 
         # Skipped on the first run, where there is nothing behind the
         # baseline to reach back to and every horizon would report the same
@@ -242,26 +479,47 @@ async def scan_and_compare(
         # runs of a project produce nothing here and say so rather than
         # quoting a direction three points cannot support.
         if trend_runs and not report.first_run:
-            report.trends = fit_trends(conn, snapshot, trend_runs)
+            report.trends = fit_trends(
+                conn,
+                snapshot,
+                trend_runs,
+                compare_parameters=frozenset(
+                    probe.id for probe in probes if probe.compare_parameters
+                ),
+            )
 
         # No `report.changes` guard: a lens reads the horizons and the
         # fitted series too, and the run where nothing moved since the
         # baseline is exactly the run where a month-long direction is the
         # only thing there is to say. analyze_drift decides whether there
         # is anything to ask about.
-        if not report.first_run:
+        try:
             report = await analyze_drift(
-                report, snapshot, config, lenses=lenses, root=root
+                report, snapshot, selected, lenses=lenses, root=root
             )
+        except LLMConnectionError as exc:
+            logger.error("Drift judgement failed: {}", exc)
+            context.stage_errors += ("judgement",)
+        if any(lens.asked and not lens.answered for lens in report.lenses):
+            context.stage_errors += ("judgement",)
+
+        complete = (
+            not context.stage_error
+            and not context.stage_errors
+            and not capture_evidence(snapshot, report, GateState()).failure
+        )
+        if report.first_run and not complete:
+            report.assessment = "No baseline recorded: this scan did not complete its measurements, judgement or evidence capture."
 
         run_id = db_store.save_run(
             conn,
             snapshot,
             report,
             baseline_run_id=baseline_record.id if baseline_record else None,
-            # The first run has nothing to compare against, so it becomes
-            # the baseline unconditionally; after that it takes --update.
-            make_baseline=update or report.first_run,
+            # A completed first measurement establishes the initial baseline;
+            # later acceptance takes --update. Failed work never becomes one.
+            make_baseline=complete and (update or report.first_run),
+            analyzed="judgement" not in (context.stage_error, *context.stage_errors),
         )
 
     logger.info("scan recorded as run {}", run_id)

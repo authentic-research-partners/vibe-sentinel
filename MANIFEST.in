@@ -10,5 +10,11 @@
 # the package — clone it to run them.
 prune tests
 
+# Ecosystem implementations ship separately from the Python engine.
+prune packs
+
+# The offline viewer is repository source, not part of the Python runtime.
+prune viewer
+
 # Build and cache output, if a build ran in the tree before this one.
 global-exclude __pycache__ *.py[cod]

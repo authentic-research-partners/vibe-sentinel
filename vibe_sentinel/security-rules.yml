@@ -1,0 +1,96 @@
+# First-party, deliberately narrow intraprocedural checks, not a full JS audit.
+rules:
+  - id: browser-url-to-html
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: Browser URL data reaches an HTML interpretation sink.
+    mode: taint
+    pattern-sources:
+      - pattern-either:
+          - pattern: location.search
+          - pattern: location.hash
+          - pattern: window.location.search
+          - pattern: window.location.hash
+    pattern-sanitizers:
+      - pattern: DOMPurify.sanitize(...)
+    pattern-sinks:
+      - patterns:
+          - pattern: $EL.innerHTML = $VALUE
+          - focus-metavariable: $VALUE
+      - patterns:
+          - pattern: $EL.outerHTML = $VALUE
+          - focus-metavariable: $VALUE
+      - patterns:
+          - pattern: $EL.insertAdjacentHTML($POSITION, $VALUE)
+          - focus-metavariable: $VALUE
+      - pattern: document.write(...)
+  - id: node-request-to-shell
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: Request data reaches a Node shell execution command.
+    mode: taint
+    pattern-sources: &request_sources
+      - pattern-either:
+          - pattern: req.query
+          - pattern: req.params
+          - pattern: req.body
+          - pattern: request.query
+          - pattern: request.params
+          - pattern: request.body
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  const $CP = require("child_process");
+                  ...
+              - pattern-inside: |
+                  const $CP = require("node:child_process");
+                  ...
+              - pattern-inside: |
+                  import * as $CP from "child_process";
+                  ...
+              - pattern-inside: |
+                  import * as $CP from "node:child_process";
+                  ...
+              - pattern-inside: |
+                  import $CP from "child_process";
+                  ...
+              - pattern-inside: |
+                  import $CP from "node:child_process";
+                  ...
+          - pattern-either:
+              - pattern: $CP.exec($COMMAND, ...)
+              - pattern: $CP.execSync($COMMAND, ...)
+          - focus-metavariable: $COMMAND
+  - id: node-request-to-file
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: Request data reaches a Node file read path; verify path confinement.
+    mode: taint
+    pattern-sources: *request_sources
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  const $FS = require("fs");
+                  ...
+              - pattern-inside: |
+                  const $FS = require("node:fs");
+                  ...
+              - pattern-inside: |
+                  import * as $FS from "fs";
+                  ...
+              - pattern-inside: |
+                  import * as $FS from "node:fs";
+                  ...
+              - pattern-inside: |
+                  import $FS from "fs";
+                  ...
+              - pattern-inside: |
+                  import $FS from "node:fs";
+                  ...
+          - pattern-either:
+              - pattern: $FS.readFile($PATH, ...)
+              - pattern: $FS.readFileSync($PATH, ...)
+              - pattern: $FS.createReadStream($PATH, ...)
+          - focus-metavariable: $PATH

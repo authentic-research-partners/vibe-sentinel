@@ -115,7 +115,7 @@ _NO_AUTO_CHECK = frozenset({"db", "migrate", "backups", "hook"})
 #: database's condition is the first thing printed by a command that could
 #: not have been affected by it — and it lands on the reader who was
 #: asking what the tool checks for, not on the one running a scan.
-_DESCRIBE_ONLY = ("print_probes", "print_config", "print_dangers")
+_DESCRIBE_ONLY = ("print_probes", "print_config", "print_dangers", "list_packs")
 
 
 def auto_check(args: argparse.Namespace) -> None:
@@ -263,27 +263,36 @@ def _trend_runs_for(args: argparse.Namespace, config: SentinelConfig) -> int:
     return runs
 
 
-def _scan_exit_code(snapshot: Snapshot, report: DriftReport, gates: GateState) -> int:
-    """0 clean, 1 something to read, 2 something did not finish.
+def render_scan_failure(
+    args: argparse.Namespace,
+    stage: str = "configuration",
+    *,
+    output_format: str | None = None,
+) -> int:
+    """Emit a typed failed attempt without copying arbitrary diagnostics to JSON."""
+    if (output_format or getattr(args, "format", None)) == "json" or getattr(
+        args, "shareable", False
+    ):
+        from vibe_sentinel.results import build_result
+        from vibe_sentinel.schemas import (
+            DriftReport,
+            RunProvenance,
+            ScanContext,
+            Snapshot,
+        )
 
-    A probe that failed and a gate that could not complete are both 2:
-    neither produced the measurement it was asked for, and a run missing
-    one of those is not a run that found nothing.
-
-    Drift and standing findings both fail, and they fail for different
-    reasons: one says the shape moved, the other says something is true
-    of this tree that nobody has settled. A pin clears the second; a new
-    baseline never does.
-    """
-    failed = [p for p, r in snapshot.probes.items() if not r.ok]
-    if failed:
-        logger.error("probe(s) failed: {}", ", ".join(sorted(failed)))
-        return 2
-    broken = gates.broken
-    if broken:
-        logger.error("gate(s) did not complete: {}", ", ".join(r.gate for r in broken))
-        return 2
-    return 1 if report.drifted or gates.failing else 0
+        snapshot = Snapshot(
+            context=ScanContext(provenance=RunProvenance(), stage_error=stage)
+        )
+        report = DriftReport()
+        result = build_result(snapshot, report, gates_ran=False)
+        render_json(
+            snapshot,
+            report,
+            result=result,
+            shareable=bool(getattr(args, "shareable", False)),
+        )
+    return 2
 
 
 def run_scan(args: argparse.Namespace) -> int:
@@ -303,9 +312,11 @@ def run_scan(args: argparse.Namespace) -> int:
 
     from vibe_sentinel.engine import run_gates, scan_and_compare
     from vibe_sentinel.exceptions import LLMConnectionError
+    from vibe_sentinel.results import build_result
+    from vibe_sentinel.schemas import GateState
     from vibe_sentinel.templates import (
         default_probes_path,
-        load_probes,
+        load_probe_catalog,
         packaged_example_path,
     )
 
@@ -318,15 +329,42 @@ def run_scan(args: argparse.Namespace) -> int:
         return 0
 
     config, root = _load(args)
+    fmt = getattr(args, "format", None) or config.output_format
+    if getattr(args, "shareable", False) and fmt != "json":
+        logger.error("--shareable requires --format=json or JSON configured output.")
+        return render_scan_failure(args, output_format=fmt)
     config_arg = getattr(args, "config", None)
     try:
-        pool = load_probes(
+        catalog = load_probe_catalog(
             config_paths=[Path(config_arg)] if config_arg else None,
             project_root=root,
         )
     except (FileNotFoundError, ValueError) as e:
         logger.error(str(e))
-        return 2
+        return render_scan_failure(args, output_format=fmt)
+
+    pool = catalog.probes
+    if getattr(args, "list_packs", False):
+        if not catalog.packs:
+            print("No local packs declared.")
+        selected = {probe.id for probe in pool}
+        for pack in catalog.packs:
+            print(
+                f"{pack.identity.id}@{pack.identity.version}  protocol {pack.identity.protocol}"
+            )
+            print(f"    from: {pack.manifest_path}")
+            print(f"    ecosystems: {', '.join(pack.identity.ecosystems)}")
+            print(f"    inputs: {', '.join(pack.identity.supported_inputs)}")
+            for executable in pack.executables:
+                print(f"    executable: {executable.id} -> {executable.path}")
+            for probe in pack.probes:
+                status = "active" if probe["id"] in selected else "disabled"
+                print(f"    drift: {probe['id']} ({status})")
+            for reader in pack.readers:
+                print(
+                    f"    inventory: {reader['id']} (declared, not executed or assessed)"
+                )
+        return 0
 
     if getattr(args, "list_probes", False):
         _print_probe_set(pool)
@@ -356,7 +394,7 @@ def run_scan(args: argparse.Namespace) -> int:
         trend_runs = _trend_runs_for(args, config)
     except ValueError as e:
         logger.error(str(e))
-        return 2
+        return render_scan_failure(args, output_format=fmt)
 
     logger.info(
         "vibe-sentinel: scanning {} with {} probe(s) (model={})",
@@ -365,7 +403,7 @@ def run_scan(args: argparse.Namespace) -> int:
         config.llm_model,
     )
 
-    async def everything() -> tuple[Snapshot, DriftReport, int, GateState]:
+    async def everything() -> tuple[Snapshot, DriftReport, int, GateState, bool]:
         """Both stages, one event loop.
 
         The gates are a sibling of the drift pipeline, never a step
@@ -383,32 +421,99 @@ def run_scan(args: argparse.Namespace) -> int:
             horizons=horizons,
             trend_runs=trend_runs,
             lenses=lenses,
+            declared_packs=catalog.packs,
         )
-        gates = await run_gates(root, config=config, run_id=run_id)
-        return snapshot, report, run_id, gates
+        try:
+            gates = await run_gates(root, config=config, run_id=run_id)
+        except LLMConnectionError as exc:
+            logger.error("Gate judgement failed: {}", exc)
+            if snapshot.context is not None:
+                snapshot.context.stage_errors += ("gates",)
+            return snapshot, report, run_id, GateState(), False
+        except (sqlite3.Error, SchemaMismatchError) as exc:
+            logger.error("Gate recording failed: {}", exc)
+            if snapshot.context is not None:
+                snapshot.context.stage_errors += ("gates", "storage")
+            return snapshot, report, run_id, GateState(), False
+        return snapshot, report, run_id, gates, True
 
     try:
-        snapshot, report, run_id, gates = asyncio.run(everything())
-    except SchemaMismatchError as e:
+        snapshot, report, run_id, gates, gates_ran = asyncio.run(everything())
+    except (sqlite3.Error, SchemaMismatchError) as e:
         logger.error(str(e))
-        return 2
+        return render_scan_failure(args, "storage", output_format=fmt)
     except LLMConnectionError as e:
         # The endpoint is down. That is a setup problem with a known fix,
         # not a stack trace — say so and name the way out.
         logger.error(str(e))
-        return 2
+        return render_scan_failure(args, "judgement", output_format=fmt)
 
-    fmt = getattr(args, "format", None) or config.output_format
+    result = build_result(snapshot, report, gates, gates_ran=gates_ran)
+    try:
+        with get_db(root) as conn:
+            db_store.save_result(conn, run_id, result)
+    except (sqlite3.Error, SchemaMismatchError, ValueError) as exc:
+        logger.error("Result recording failed: {}", exc)
+        if snapshot.context is not None:
+            snapshot.context.stage_errors += ("storage",)
+        result = build_result(snapshot, report, gates, gates_ran=gates_ran)
     if fmt == "json":
-        render_json(snapshot, report, gates)
+        render_json(
+            snapshot,
+            report,
+            gates,
+            result=result,
+            shareable=bool(getattr(args, "shareable", False)),
+        )
     elif fmt == "agent":
-        print(render_agent(report, gates))
+        print(render_agent(report, gates, result=result))
     else:
         render_terminal(snapshot, report)
         render_gate_state(gates)
         print(f"\nrecorded as run {run_id} in {db_path(root)}")
 
-    return _scan_exit_code(snapshot, report, gates)
+    failed_probes = [stage.id for stage in result.probes if stage.status == "error"]
+    if failed_probes:
+        logger.error("probe(s) failed: {}", ", ".join(failed_probes))
+    failed_gates = [stage.id for stage in result.gates if stage.status == "error"]
+    if failed_gates:
+        logger.error("gate(s) did not complete: {}", ", ".join(failed_gates))
+    return result.exit_code
+
+
+def run_summarize(args: argparse.Namespace) -> int:
+    """Render captured evidence and preserve its scan exit status."""
+    from vibe_sentinel.evidence_summary import read_result, render_summary
+
+    try:
+        result = read_result(Path(args.result_file))
+        summary = render_summary(result)
+    except ValueError as exc:
+        logger.error("Summary failed: {}", exc)
+        return 2
+    print(summary, end="")
+    return result.exit_code
+
+
+def run_export(args: argparse.Namespace) -> int:
+    """Export a finalized captured result without reading today's configuration."""
+    from vibe_sentinel.results import parse_result, project_result
+
+    root = Path(args.root or Path.cwd()).resolve()
+    try:
+        with get_db(root, readonly=True) as conn:
+            result = db_store.load_result(conn, args.run)
+        if result is None:
+            raise ValueError(
+                "No finalized result for this run; choose a completed recorded run with 'vibe-sentinel history'"
+            )
+        result = parse_result(result.model_dump(mode="json"))
+        exported = project_result(result, profile=args.profile)
+    except (OSError, sqlite3.Error, SchemaMismatchError, ValueError) as exc:
+        logger.error("Export failed: {}", exc)
+        return 2
+    print(json.dumps(exported, indent=2))
+    return 0
 
 
 def run_history(args: argparse.Namespace) -> int:
@@ -494,19 +599,56 @@ def run_trend(args: argparse.Namespace) -> int:
     left their trend earlier — which a scan deliberately does not repeat.
     """
     from vibe_sentinel import trends
+    from vibe_sentinel.templates import load_probes
+    from vibe_sentinel.schemas import TrendPoint
 
     config, root = _load(args)
     try:
+        # Declaration scope belongs to the requested project. _load can discover
+        # caller settings when an explicit root has no config; those settings
+        # must not bring the caller's rule files into this project's history.
+        declaration_paths = (
+            [config.config_path]
+            if getattr(args, "config", None) and config.config_path
+            else []
+        )
+        declared = load_probes(declaration_paths, root)
+        guarded = {probe.id: probe for probe in declared if probe.compare_parameters}
         with get_db(root) as conn:
+            scope_runs: dict[str, set[int]] = {}
+
+            def in_scope(probe_id: str, points: list[TrendPoint]) -> list[TrendPoint]:
+                if probe_id not in guarded:
+                    return points
+                if probe_id not in scope_runs:
+                    probe = guarded[probe_id]
+                    filled = probe.defaults()
+                    scope_runs[probe_id] = db_store.matching_probe_runs(
+                        conn, probe_id, probe.fill(filled), filled
+                    )
+                return [
+                    point for point in points if point.run_id in scope_runs[probe_id]
+                ]
+
+            if guarded:
+                print(
+                    "Parameter-guarded trends use the current declared command and parameter scope."
+                )
             key = getattr(args, "key", None)
             if key:
                 probe_id = getattr(args, "probe", None)
                 if not probe_id:
                     logger.error("--probe is required when a key is given.")
                     return 2
+                if probe_id.startswith("pack:"):
+                    logger.error(
+                        "Pack history coverage is baseline-only; trends are not assessed."
+                    )
+                    return 2
                 points = db_store.trend(
                     conn, probe_id, key, limit=int(getattr(args, "limit", 30) or 30)
                 )
+                points = in_scope(probe_id, points)
                 if not points:
                     logger.error("No history for {} / {}", probe_id, key)
                     return 2
@@ -534,9 +676,18 @@ def run_trend(args: argparse.Namespace) -> int:
             runs = int(getattr(args, "runs", None) or config.drift_trend_runs or 50)
             min_runs = int(getattr(args, "min_runs", 0) or trends.MIN_RUNS)
             recorded = db_store.series(conn, limit_runs=runs, min_runs=min_runs)
+            recorded = {
+                identity: in_scope(identity[0], points)
+                for identity, points in recorded.items()
+            }
+            if any(pid.startswith("pack:") for pid, _ in recorded):
+                print(
+                    "Pack history coverage is baseline-only; pack series are excluded from trends."
+                )
             fits = [
                 fit
                 for (probe_id, obs_key), points in recorded.items()
+                if not probe_id.startswith("pack:")
                 if (
                     fit := trends.fit_series(
                         probe_id, key=obs_key, points=points, min_runs=min_runs
@@ -560,7 +711,7 @@ def run_trend(args: argparse.Namespace) -> int:
                 return 2
             fits.sort(key=lambda f: (not f.anomalies, -abs(f.tau), f.probe_id, f.key))
             render_trend_report(fits, runs=runs, min_runs=min_runs)
-    except SchemaMismatchError as e:
+    except (SchemaMismatchError, OSError, ValueError) as e:
         logger.error(str(e))
         return 2
     return 0
@@ -695,9 +846,9 @@ def _record_gate(root: Path, report: GateReport) -> None:
 
 def run_licenses(args: argparse.Namespace) -> int:
     """Check dependency licences. 0 = clean, 1 = violations, 2 = error."""
-    import importlib.metadata as md
-
-    from vibe_sentinel.gates import shape_licenses
+    from vibe_sentinel.gates import node_dependency_coverage_unavailable, shape_licenses
+    from vibe_sentinel.schemas import NODE_GATE_UNAVAILABLE
+    from vibe_sentinel.python_environment import collect_environment
     from vibe_sentinel.licenses import (
         CATEGORIES,
         audit,
@@ -737,6 +888,10 @@ def run_licenses(args: argparse.Namespace) -> int:
         )
         return 0
 
+    if node_dependency_coverage_unavailable(root, config):
+        logger.error(NODE_GATE_UNAVAILABLE)
+        return 2
+
     try:
         policy = load_policy(path, root=root)
     except FileNotFoundError as e:
@@ -749,9 +904,29 @@ def run_licenses(args: argparse.Namespace) -> int:
     # Where a NEW pin belongs: the last layer, which is the project's own.
     policy_source = policy.sources[-1] if policy.sources else str(path)
 
+    try:
+        snapshot = collect_environment(root, config)
+    except (OSError, ValueError) as e:
+        logger.error("Licence environment inspection failed: {}", e)
+        return 2
+    env = snapshot.environment
+    print(
+        f"environment: {env.executable} (Python {env.python}; {env.selection}); "
+        f"scanner: {sys.executable}"
+    )
+    for limitation in snapshot.limitations:
+        print(f"coverage: {limitation}")
+    if snapshot.limitations:
+        logger.error(
+            "Selected environment inventory is incomplete; licence audit not run."
+        )
+        return 2
+    distributions = snapshot.license_distributions()
     explain_name = getattr(args, "explain", None)
     if explain_name:
-        return _explain_package(explain_name, policy, policy_source, config, args)
+        return _explain_package(
+            explain_name, policy, policy_source, config, args, distributions
+        )
 
     if len(policy.sources) > 1:
         # Which rules are actually in force, when more than one file says.
@@ -767,7 +942,7 @@ def run_licenses(args: argparse.Namespace) -> int:
             f"{', '.join(sorted({m.spdx for m in policy.markers}))}"
         )
 
-    ok, bad = audit(list(md.distributions()), policy)
+    ok, bad = audit(distributions, policy)
 
     # The codebase's own licences. A vendored file arrives with a header and
     # never touches pyproject.toml, so no dependency gate would ever see it.
@@ -805,6 +980,7 @@ def run_licenses(args: argparse.Namespace) -> int:
             ),
             policy=policy,
             project_spdx=own.spdx if own else "",
+            environment=f"{env.executable} (Python {env.python}; {env.selection})",
         ),
     )
 
@@ -851,17 +1027,17 @@ def _spdx_terms(expr: str) -> list[str]:
     ]
 
 
-def _find_distribution(name: str) -> md.Distribution | None:
+def _find_distribution(
+    name: str, distributions: list[md.Distribution]
+) -> md.Distribution | None:
     """The installed distribution called ``name``, matched the way pip does.
 
     ``importlib.metadata.distribution`` is exact; a user typing the name off a
     gate failure has no reason to know whether it was ``pip_audit`` or
     ``pip-audit``.
     """
-    import importlib.metadata as md
-
     want = name.lower().replace("_", "-")
-    for dist in md.distributions():
+    for dist in distributions:
         meta_name = dist.metadata and dist.metadata.get("Name")
         if meta_name and meta_name.lower().replace("_", "-") == want:
             return dist
@@ -874,6 +1050,7 @@ def _explain_package(
     policy_source: str,
     config: SentinelConfig,
     args: argparse.Namespace,
+    distributions: list[md.Distribution],
 ) -> int:
     """Show every step of the chain for one package. 0 = passes, 1 = fails.
 
@@ -893,11 +1070,12 @@ def _explain_package(
         explain,
     )
 
-    dist = _find_distribution(name)
+    dist = _find_distribution(name, distributions)
     if dist is None:
         logger.error(
             "No installed distribution named {!r}. The gate reads what is "
-            "INSTALLED, not what is declared — check the name with: pip show {}",
+            "INSTALLED in the reported environment, not what is declared. "
+            "Check its interpreter selection and installed metadata for {}.",
             name,
             name,
         )
@@ -1024,7 +1202,8 @@ def run_packages(args: argparse.Namespace) -> int:
     """
     import asyncio
 
-    from vibe_sentinel.gates import shape_packages
+    from vibe_sentinel.gates import node_dependency_coverage_unavailable, shape_packages
+    from vibe_sentinel.schemas import NODE_GATE_UNAVAILABLE
     from vibe_sentinel.packages import (
         adjudicate,
         audit,
@@ -1040,6 +1219,10 @@ def run_packages(args: argparse.Namespace) -> int:
     config, root = _load(args)
     policy_arg = getattr(args, "policy", None)
 
+    if node_dependency_coverage_unavailable(root, config):
+        logger.error(NODE_GATE_UNAVAILABLE)
+        return 2
+
     try:
         policy = load_policy(Path(policy_arg) if policy_arg else None, root=root)
     except FileNotFoundError as e:
@@ -1049,14 +1232,23 @@ def run_packages(args: argparse.Namespace) -> int:
         logger.error("Package policy is invalid: {}", e)
         return 2
 
-    inventory = take_inventory(root)
+    try:
+        inventory = take_inventory(root, policy, config=config)
+    except (OSError, ValueError) as e:
+        logger.error("Package inventory failed: {}", e)
+        return 2
     env = inventory.environment
 
     # Which environment was read is the first thing on screen, not a footnote.
     # Every number below is a statement about this interpreter and no other, and
     # a check silently run against the wrong env is worse than no check.
     print(f"environment: {env.label} — Python {env.python} at {env.prefix}")
+    print(f"interpreter: {env.executable} ({env.selection}); scanner: {sys.executable}")
     print(f"policy: {policy.source}")
+    print(
+        f"selection: extras={','.join(sorted(inventory.selected_extras)) or '(none)'}, "
+        f"groups={','.join(sorted(inventory.selected_groups)) or '(none)'}"
+    )
     if policy.guidance:
         # The licence gate's rule, and the stronger case for it: a note that
         # steers a drafted sentence is worth disclosing, and one that steers
@@ -1069,7 +1261,11 @@ def run_packages(args: argparse.Namespace) -> int:
         f"{len(inventory.external_imports)} external import(s) in source"
     )
 
-    findings = audit(inventory, policy)
+    try:
+        findings = audit(inventory, policy)
+    except (OSError, ValueError) as e:
+        logger.error("Package audit failed: {}", e)
+        return 2
 
     online = bool(getattr(args, "online", False))
     if online:
@@ -1136,6 +1332,97 @@ def run_packages(args: argparse.Namespace) -> int:
         "for it later."
     )
     return 1 if standing else 0
+
+
+def run_security_environment(args: argparse.Namespace) -> int:
+    """Manage security tools only through an explicitly selected action."""
+    from vibe_sentinel import security_setup
+
+    directory = (
+        Path(args.tools_directory).expanduser() if args.tools_directory else None
+    )
+    report = (
+        security_setup.setup(directory, refresh=args.refresh)
+        if args.security_action == "setup"
+        else security_setup.status(directory)
+    )
+    if args.format == "json":
+        print(json.dumps(report, indent=2))
+    else:
+        print(f"Security environment [{report['status']}]")
+        for name, component in report.get("components", {}).items():
+            details = " ".join(
+                value
+                for value in (
+                    str(component.get("version", "")),
+                    json.dumps(component["path"]) if component.get("path") else "",
+                )
+                if value
+            )
+            print(f"  {name} [{component['status']}] {details}".rstrip())
+        if report.get("diagnostic"):
+            print(report["diagnostic"])
+        if report["status"] == "stale":
+            print("Refresh advisories with 'vibe-sentinel security setup --refresh'.")
+        last = report.get("last_setup", {})
+        if last.get("status") == "error" and last.get("diagnostic"):
+            print(f"Last setup attempt failed. {last['diagnostic']}")
+    return 0 if report["ready"] and report["status"] == "ready" else 2
+
+
+def run_security(args: argparse.Namespace) -> int:
+    """Run application security checks without changing drift history."""
+    import asyncio
+
+    from vibe_sentinel.config import SentinelConfig, apply_env_overrides
+    from vibe_sentinel.exceptions import ConfigError
+    from vibe_sentinel.paths import CONFIG_FILENAME
+    from vibe_sentinel.security_checks import collect
+
+    root = Path(args.root or ".").resolve()
+    config_path = Path(args.config) if args.config else root / CONFIG_FILENAME
+    try:
+        config = (
+            load_config_or_fail(config_path)
+            if args.config
+            or (args.browser_artifacts is not None and config_path.is_file())
+            else apply_env_overrides(SentinelConfig(project_dir=root))
+        )
+    except ConfigError:
+        logger.error("The security check could not load project configuration.")
+        return 2
+    database = (
+        Path(args.advisory_db).expanduser() if args.advisory_db is not None else None
+    )
+    report = asyncio.run(
+        collect(
+            root,
+            config,
+            lockfile=args.lockfile,
+            advisory_db=root / database if database is not None else None,
+            source=args.source,
+            browser_artifacts=args.browser_artifacts,
+            tools_directory=Path(args.tools_directory).expanduser()
+            if args.tools_directory
+            else None,
+        )
+    )
+    if args.format == "json":
+        print(json.dumps(report.model_dump(mode="json", exclude_none=True), indent=2))
+    else:
+        for check in report.checks:
+            print(f"{check.id} [{check.status}] {check.summary}")
+            for finding in check.findings:
+                location = json.dumps(finding.path) if finding.path else ""
+                if finding.line is not None:
+                    location += f":{finding.line}"
+                if finding.advisory:
+                    print(
+                        f"  {finding.advisory} {finding.package}@{finding.version} {location}"
+                    )
+                else:
+                    print(f"  {location} {finding.message}".rstrip())
+    return report.exit_code
 
 
 def run_credentials(args: argparse.Namespace) -> int:
@@ -1419,13 +1706,57 @@ def run_hook(args: argparse.Namespace) -> int:
     from vibe_sentinel import hook
 
     matcher = getattr(args, "matcher", None) or hook.DEFAULT_MATCHER
+    agent = getattr(args, "agent", None) or "claude-code"
+
+    if getattr(args, "configure", False):
+        from vibe_sentinel.safety import configured_safety
+
+        if getattr(args, "managed", False):
+            logger.error(
+                "--configure changes project mode only; it cannot use --managed"
+            )
+            return 2
+        _, root = _load(args)
+        choice = getattr(args, "mode", None)
+        if choice is None:
+            _explain_modes(root)
+            return 2
+        try:
+            path = hook.set_mode(root, hook.INSTALL_MODES[choice])
+            effective, no_verdict = configured_safety(root)
+        except (OSError, ValueError) as e:
+            logger.error(str(e))
+            return 2
+        print(
+            f"Safety mode configured in {path}; effective mode: {effective}, no_verdict: {no_verdict}"
+        )
+        print(
+            "No hook installed or trusted by this command. Check Codex plugin and hook settings."
+        )
+        print("Codex refuses unresolved enforced calls when no_verdict is ask.")
+        return 0
 
     if getattr(args, "print_config", False):
-        entry = hook.settings_entry(matcher=matcher)
+        if agent == "codex":
+            from vibe_sentinel.agents.codex import HOOK_COMMAND
+
+            entry = hook.settings_entry(
+                command=HOOK_COMMAND, matcher=getattr(args, "matcher", None) or ".*"
+            )
+        else:
+            entry = hook.settings_entry(matcher=matcher)
         print(json.dumps({"hooks": {"PreToolUse": [entry]}}, indent=2))
         return 0
 
     if getattr(args, "install", False):
+        if agent == "codex":
+            logger.error(
+                "Install and trust the Codex plugin, then choose its mode with "
+                "`vibe-sentinel hook --configure --mode <choice>`. "
+                "For a manual hook definition use `hook --agent codex --print-config`. "
+                "Automatic or managed Codex hook installation is not supported."
+            )
+            return 2
         _, root = _load(args)
         choice = getattr(args, "mode", None)
         if choice is None:

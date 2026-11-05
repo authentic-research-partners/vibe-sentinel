@@ -1,0 +1,4 @@
+node_modules/
+.vibe-sentinel/
+__pycache__/
+*.py[cod]

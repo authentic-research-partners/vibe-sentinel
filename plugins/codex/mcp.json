@@ -1,0 +1,10 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "vibe-sentinel": {
+      "type": "stdio",
+      "command": "vibe-sentinel-mcp",
+      "args": []
+    }
+  }
+}

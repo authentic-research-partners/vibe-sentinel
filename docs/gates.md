@@ -1,11 +1,28 @@
 # Gates
 
+## Jump to a topic
+
+- **State gates** · [Credentials at rest](#credentials-at-rest) ·
+  [Dependency provenance](#dependency-provenance) · [Licence policy](#licence-policy)
+- **Agent actions** · [Command safety](#command-safety) ·
+  [Coverage by agent](#which-agents-and-what-each-lets-the-gate-do) ·
+  [Managed protection](#out-of-the-agents-reach) · [npm install targets](#npm-install-targets)
+- **Policy and history** · [Pins](#pins-are-not-ignores) ·
+  [Recorded findings and decisions](#recorded-not-only-reported)
+
+## How the gates work
+
 The three state gates — credentials, packages and licences — check what is
 true now. They run inside `vibe-sentinel scan` and as standalone commands.
 Removing the cause or recording an applicable pin settles a finding;
 `scan --update` does not. Exit codes are `0` for no failing findings,
 `1` for findings and `2` for an error. An unconfigured licence gate is
 reported as unconfigured during a scan, not as clean.
+
+Installed Python packages are read from the scanner environment by default.
+Use `[environment] python` to select a separate application interpreter for
+both licence and provenance checks, including licence explanations. See
+[environment selection](environments.md) for trust, coverage, and history behavior.
 
 The safety gate is separate: it reviews proposed agent actions through the
 hook, not through `scan`.
@@ -121,8 +138,8 @@ install. Rates and incidents: see the citations in `packages.py`.
 |---|---|
 | `phantom` | your source imports a name that resolves to nothing |
 | `undeclared` | you import it, it is installed, nothing declares it |
-| `orphan` | installed, nothing declares it, nothing requires it (roots only) |
-| `uninstalled` | a declared dependency is absent from the environment |
+| `orphan` | installed outside the selected dependency closure, with no active installed requirement needing it (roots only) |
+| `uninstalled` | a selected dependency with a matching marker is absent from the environment |
 | `unconstrained` | declared with no version bound |
 | `near-miss` | two installed names one edit apart |
 | `unregistered` | *(`--online`)* the index has no project by that name |
@@ -154,8 +171,55 @@ and this says it before the question is asked.
 It compares your environment against **itself**, never against a shipped list of
 popular names: a published list of "names close to real ones" is a published
 rule, and it enters the next training corpus. Everything is read from the
-interpreter running the check, and that environment is named in the output and
-recorded with the finding.
+selected interpreter (the scanner by default), and that environment is named
+in the output and recorded with the finding.
+
+### Select the dependencies installed in this environment
+
+Base project dependencies are active by default. Select the extras and development
+groups installed in the measured environment explicitly:
+
+```toml
+[packages]
+extras = ["plugin"]
+groups = ["group:dev", "poetry:lint"]
+```
+
+`extras` names `[project.optional-dependencies]` or `[tool.poetry.extras]` entries.
+`group:dev` selects a PEP 735 `[dependency-groups]` entry; `poetry:lint` selects
+`[tool.poetry.group.lint.dependencies]`. Both lists default to empty. Unknown
+selections and missing or cyclic group includes fail the check. Group includes
+are expanded recursively, and names compare after package-name normalization.
+
+This changes the earlier behavior that counted every optional dependency and
+development group as a root. After upgrading, record the choices used to install
+each project. For `uv pip install -e ".[dev]"`, set `extras = ["dev"]`; for a
+runtime-only installation, leave both lists empty. An installed package belonging
+only to an unselected group can now be an orphan. This selection describes the
+environment; it does not install dependencies or activate another interpreter.
+The command prints the selected lists, and inventory JSON records them with the
+active root requirements.
+
+Requested dependency extras propagate transitively: `mcp` requiring
+`pyjwt[crypto]` activates `cryptography`, while unrelated PyJWT extras remain
+inactive. Dependencies and their complete environment-marker expressions are
+evaluated against the running interpreter. Extra sets are revisited until they
+stop growing, including cycles and project extras that reference other extras
+through the current project's name. Installed project metadata cannot replace
+the current manifest's choices. Direct dependency URLs are omitted from exported
+installed dependency metadata.
+
+All manifest declarations still count when checking whether source imports were
+declared, because source scanning includes optional feature code. The safety
+gate likewise recognizes every declared dependency. The selected set controls
+closure and missing-install findings; it does not broaden online lookups beyond
+declared or already flagged names.
+
+Poetry dependency mappings support `extras`, PEP 508 `markers`, and `optional`
+selection through `[tool.poetry.extras]`. Selected multi-constraint arrays and
+Poetry `python` or `platform` conditions are rejected explicitly; express those
+dependencies with supported PEP 508 declarations for this check. Sentinel does
+not resolve versions or execute project code to infer installation choices.
 
 ---
 
@@ -218,13 +282,14 @@ adapter (`vibe-sentinel hook --agent`):
 |---|---|---|---|---|
 | Claude Code | `hook --install --mode …` writes `.claude/settings.json` (`PreToolUse`, matcher `*`) | every tool call: shell, file reads and writes, MCP tools | every tool call | nothing it calls a tool |
 | Cursor | `hook --install --agent cursor --mode …` writes `.cursor/hooks.json` (`beforeShellExecution`, `beforeMCPExecution`, `beforeReadFile`) | shell commands, MCP tools, file reads | shell commands and MCP tools; a read with no verdict is refused instead, because `beforeReadFile` cannot ask | file writes and edits: Cursor's `afterFileEdit` runs after the edit, so it could only record one, and `preToolUse`'s `Write` input is undocumented |
+| Codex | The manually installed and trusted [Codex plugin](codex-plugin.md) invokes `hook --agent codex` on `PreToolUse` | shell commands, every patch target path, MCP and other supported local tool names | no supported ask response; unresolved enforced calls are refused | hosted tools, subsequent `write_stdin` input, and specialized paths that opt out; patch bodies and MCP arguments are excluded |
 
 So under Cursor the home-directory and secret-store rules reach reads as they
 do under Claude Code, and `changing-the-gate` holds for a shell command that
 rewrites the gate's files — but not for Cursor's own edit tool. The adversarial
 suite measures this per adapter: through Cursor, the three attacks made with a
 file-writing tool are missed (`attack-reaches-the-gate-cursor` in
-[evals.md](evals.md)). A file's content, which `beforeReadFile` sends whole,
+[historical eval results](eval-results.md)). A file's content, which `beforeReadFile` sends whole,
 never reaches the journal.
 
 ### Out of the agent's reach
@@ -464,8 +529,56 @@ name it adds; what is asked about is the name, before its install scripts
 run. The same command without names re-syncs and is not read, and neither is
 a global tool install (`-g`, `yarn global add`), for the reason `pipx
 install` is not. A local path, a tarball, a git or GitHub reference and an
-alias (`foo@npm:bar`) are not registry names. The manifest read is the
-project root's: a monorepo sub-package's own `package.json` is not.
+alias (`foo@npm:bar`) are not registry names.
+
+### npm install targets
+
+The hook uses the action's working directory, or its supplied fallback directory,
+and reads the nearest `package.json` within the watched project. A literal
+`cd directory &&` updates that directory for subsequent commands. Python install
+checks retain their existing root `pyproject.toml` scope.
+
+npm supports one `--prefix path` target, or `--workspace name-or-path` / `-w`
+selectors, before or after the install verb; `--option=value` also works.
+Workspaces must be declared by the nearest ancestor manifest's `workspaces`
+array or `workspaces.packages` array. Patterns support literal directory segments
+and a whole-segment `*`, with bounded expansion. Selectors match an exact package
+name or an exact declared directory, not an arbitrary glob or parent directory.
+Relative directory selectors are supported from the workspace declaration root;
+use a package name when starting inside a workspace.
+
+```bash
+npm --prefix apps/api install example
+npm install example -w @example/api
+npm install example -w @example/api -w @example/web
+cd apps/api && npm install example
+```
+
+Each selected manifest is compared independently. In the third command, a name
+declared only by the web application remains undeclared for the API. The review
+context identifies each compared manifest and its missing names; it never unions
+workspace declarations.
+
+Unsupported targeting is sent to the existing `undeclared-install` question as
+**not compared**, without asserting names are declared or undeclared. This
+includes unknown or conflicting name/path workspace selectors, combined prefix/workspace options,
+repeated prefixes, unsupported pnpm/Yarn/Bun filters or directory options,
+dynamic package operands, uncertain shell control flow and wrapped directory
+changes. Directory targets outside the watched project and symlink targets are
+not followed. A symlink or malformed selected `package.json` is unreadable,
+not an empty manifest. Plain npm-family named installs remain supported at a
+known current directory; a no-argument sync remains outside this named-install
+check.
+
+This is a bounded static interpretation, not an actual-install guarantee.
+Explicit `--userconfig` and targeting keys in local `.npmrc` files or inherited
+`npm_config_*` variables make npm targeting unknown. Local config values,
+including credentials, are never included in the comparison evidence. User and
+global npm configuration outside the watched tree, shell aliases/functions,
+package-manager wrappers and configuration evaluated by those tools are not
+reconstructed. No Node process, package manager, project script or network lookup
+runs during this check. Journal, observe, enforce and no-verdict behavior remain
+the existing safety policy.
 
 A `pyproject.toml` that will not parse is not that case, and is not treated
 as it. Read as "no manifest", it would declare nothing, so no install could be
@@ -476,12 +589,10 @@ name in a tree whose manifest will not parse is handled the way an unloadable
 `off` does nothing. A command that installs nothing never reads the file.
 `scan` checks it up front, and the `packages` gate fails on it.
 
-Every one of those is the same rule, and it points one way: when in doubt, say
-nothing. A missed install leaves things as they were before the check existed.
-A gate that blocks `uv pip install -e ".[dev]"` is uninstalled by Thursday, and
-then it guards nothing. So the model is told which names are undeclared — that
-part is mechanical — and asked only whether those names are ones the work
-actually wanted.
+The reader reports only names it can compare. A supported non-name install
+such as `uv pip install -e ".[dev]"` is outside this check; uncertain npm targeting
+is explicitly not compared. The model receives the measured declaration gaps
+and any targeting uncertainty, then judges whether the command fits the work.
 
 It ships asking a question. One line makes it a decision instead, with no model
 call and no latency, holding with the backend off:

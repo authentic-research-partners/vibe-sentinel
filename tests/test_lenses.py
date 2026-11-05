@@ -259,6 +259,45 @@ def test_house_guidance_rides_above_every_question() -> None:
     assert "<HOUSE_NOTES>\nWe vendor on purpose.\n</HOUSE_NOTES>" in context
 
 
+def test_large_report_limits_judge_input_without_losing_measurements(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    large = _change("p", "unseen")
+    large.label = "界" * 2700
+    changes = [_change("p", f"change-{i}") for i in range(200)]
+    changes.extend([large, _change("other", "seen", severity="high")])
+    report = _report(
+        *changes,
+        horizons=[HorizonDrift(horizon="1m", run_id=4, age_days=31, changes=changes)],
+        trends=[_fit(key=f"trend-{i}") for i in range(100)],
+    )
+    sent = _record(
+        monkeypatch,
+        {
+            "assessment": "reviewed",
+            "changes": [
+                {"key": "unseen", "probe_id": "p", "severity": "high", "note": "no"},
+                {"key": "seen", "probe_id": "other", "severity": "high", "note": "yes"},
+            ],
+        },
+    )
+    reviewed = asyncio.run(analyze_drift(report, _snapshot(), lenses=(_lens("one"),)))
+    prompt, _ = sent[0]
+    assert len(prompt.encode("utf-8")) < 9000
+    assert (
+        "key='seen'" in prompt
+        and "key='unseen'" not in prompt.split("</CHANGES_SINCE>")[0]
+    )
+    assert len(reviewed.changes) == 202
+    assert len(reviewed.horizons[0].changes) == 202
+    assert len(reviewed.trends) == 100
+    assert reviewed.changes[-2].severity == "low"
+    assert reviewed.changes[-1].note == "yes"
+    assert "182 baseline change(s)" in reviewed.assessment
+    assert "horizon row(s)" in reviewed.assessment
+    assert "trend row(s)" in reviewed.assessment
+
+
 # --- the fan-out -----------------------------------------------------------
 
 

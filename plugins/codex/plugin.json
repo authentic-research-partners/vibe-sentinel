@@ -1,0 +1,12 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "vibe-sentinel",
+  "version": "0.1.0",
+  "description": "Measure repository drift, inspect recorded findings, and review supported Codex actions with Vibe Sentinel's configured judge.",
+  "extensions": {
+    "com.openai": {
+      "onboardingSkill": "./skills/sentinel-setup/SKILL.md",
+      "hooks": "./hooks/hooks.json"
+    }
+  }
+}

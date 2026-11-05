@@ -24,6 +24,7 @@ from types import ModuleType
 ADAPTERS: dict[str, str] = {
     "claude-code": "vibe_sentinel.agents.claude_code",
     "cursor": "vibe_sentinel.agents.cursor",
+    "codex": "vibe_sentinel.agents.codex",
 }
 
 

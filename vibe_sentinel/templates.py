@@ -41,14 +41,24 @@ is a load-time error, not a shell metacharacter.
 
 from __future__ import annotations
 
+import math
 import re
 import sys
 import tomllib
 from collections.abc import Sequence
 from pathlib import Path
 
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    ValidationError,
+    field_validator,
+)
 
+from vibe_sentinel.config import PackSettings
+from vibe_sentinel.packs import LoadedPack, load_packs
 from vibe_sentinel.paths import CONFIG_FILENAME
 from vibe_sentinel.rulesets import rule_file_paths, source_label, tables_in_file
 
@@ -106,6 +116,9 @@ class Placeholder(BaseModel):
 class Probe(BaseModel):
     """One templated script plus the blanks it needs filled."""
 
+    _pack_id: str = PrivateAttr(default="")
+    _pack_manifest_sha256: str = PrivateAttr(default="")
+
     id: str
     title: str
     source: str = "built-in"
@@ -121,6 +134,8 @@ class Probe(BaseModel):
     command: list[str] = Field(default_factory=list)
     placeholders: list[Placeholder] = Field(default_factory=list)
     timeout_s: float = 120.0
+    compare_parameters: bool = Field(default=False, strict=True)
+    """Compare only runs with the same filled parameters and executed argv."""
     tolerance: float | str = 0.0
     """How far an observation's value may move between runs before it
     counts as drift, in one of two forms.
@@ -292,6 +307,10 @@ def load_probes_from_toml(path: Path) -> list[Probe]:
 
     seen: set[str] = set()
     for p in probes:
+        if p.id.startswith("pack:"):
+            raise ValueError(
+                f"{path}: probe namespace 'pack:' is reserved for explicitly loaded packs"
+            )
         if p.id in seen:
             raise ValueError(
                 f"vibe-sentinel config {path} declares probe id {p.id!r} twice."
@@ -415,10 +434,64 @@ def _apply_parameters(
             placeholder.default = placeholder.validate_value(str(value))
 
 
+class ProbeCatalog(BaseModel):
+    """One resolved declaration set with its immutable loaded pack evidence."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    probes: list[Probe]
+    packs: tuple[LoadedPack, ...] = ()
+
+
+def _pack_probe(raw: dict, pack: LoadedPack, *, reader: bool = False) -> Probe:
+    table = dict(raw)
+    if reader:
+        table.pop("ecosystem")
+        table.pop("supported_inputs")
+    unknown = set(table) - set(Probe.model_fields)
+    if unknown:
+        raise ValueError(
+            f"Pack {pack.identity.id!r} has unknown reader fields: {', '.join(sorted(unknown))}"
+        )
+    timeout = table.get("timeout_s", 120.0)
+    tolerance = table.get("tolerance", 0.0)
+    if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError(
+            f"Pack {pack.identity.id!r} timeout_s must be finite and positive"
+        )
+    if not isinstance(tolerance, str) and (
+        type(tolerance) not in (int, float)
+        or not math.isfinite(tolerance)
+        or tolerance < 0
+    ):
+        raise ValueError(
+            f"Pack {pack.identity.id!r} tolerance must be finite and nonnegative"
+        )
+    for placeholder in table.get("placeholders", []):
+        if not isinstance(placeholder, dict) or set(placeholder) - set(
+            Placeholder.model_fields
+        ):
+            raise ValueError(
+                f"Pack {pack.identity.id!r} has invalid placeholder fields"
+            )
+    probe = Probe.model_validate(table)
+    probe.check_consistent()
+    probe._pack_id = pack.identity.id
+    probe._pack_manifest_sha256 = pack.manifest_sha256
+    return probe
+
+
 def load_probes(
     config_paths: Sequence[Path] | None = None,
     project_root: Path | None = None,
 ) -> list[Probe]:
+    """Compatibility wrapper returning the executable drift declarations only."""
+    return load_probe_catalog(config_paths, project_root).probes
+
+
+def load_probe_catalog(
+    config_paths: Sequence[Path] | None = None,
+    project_root: Path | None = None,
+) -> ProbeCatalog:
     """Resolve the effective probe set.
 
     The built-in set is the base layer; your config is merged on top:
@@ -447,9 +520,13 @@ def load_probes(
         paths = [candidate] if candidate.is_file() else []
 
     settings = ProbeSettings()
+    pack_settings = PackSettings()
     for path in paths:
         if path.is_file():
             settings = load_probe_settings(path)
+            pack_settings = PackSettings.model_validate(
+                tomllib.loads(path.read_text()).get("packs", {})
+            )
 
     # Rule files first, the project's own config last, so a shared set can
     # be kept in its own file and still overridden here by id.
@@ -461,10 +538,21 @@ def load_probes(
         where=paths[-1] if paths else root / CONFIG_FILENAME,
     )
 
+    packs = load_packs(root, pack_settings.manifests)
     merged: dict[str, Probe] = {}
     if settings.use_builtins:
         for probe in default_probes():
             merged[probe.id] = probe
+    for pack in packs:
+        for raw in pack.probes:
+            probe = _pack_probe(raw, pack)
+            if probe.id in merged:
+                raise ValueError(f"Duplicate loaded probe {probe.id!r}")
+            merged[probe.id] = probe
+        for raw in pack.readers:
+            _pack_probe(
+                raw, pack, reader=True
+            )  # Validation only; inventories are not probes.
     for path in rule_paths:
         # For the presence check only. A file globbed as a probe rule set
         # and holding no probes is an error; `load_probes_from_toml` reads
@@ -491,7 +579,7 @@ def load_probes(
     for pid in settings.disable:
         del merged[pid]
 
-    return list(merged.values())
+    return ProbeCatalog(probes=list(merged.values()), packs=packs)
 
 
 def select_probes(ids: list[str] | None, pool: Sequence[Probe]) -> list[Probe]:

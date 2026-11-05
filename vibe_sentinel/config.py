@@ -15,7 +15,7 @@ import tomllib
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from vibe_sentinel.horizons import parse_horizon
 from vibe_sentinel.paths import CONFIG_FILENAME
@@ -39,12 +39,32 @@ NoVerdict = Literal["ask", "allow"]
 DEFAULT_CONCURRENCY = 1
 
 
+class PackSettings(BaseModel):
+    """Explicit local manifests only; discovery never installs executable code."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    manifests: list[str] = Field(default_factory=list)
+
+    @field_validator("manifests")
+    @classmethod
+    def valid_manifests(cls, values: list[str]) -> list[str]:
+        if any(not value.strip() for value in values):
+            raise ValueError("[packs] manifests must contain nonempty local paths")
+        return values
+
+
 class SentinelConfig(BaseModel):
     """Resolved configuration for a vibe-sentinel run."""
 
     # Where the TOML was found (None when running on built-in defaults)
     config_path: Path | None = None
     project_dir: Path = Path(".")
+    pack_manifests: list[str] = Field(default_factory=list)
+
+    # Empty selects the scanner's runtime. Configured paths are project-relative,
+    # never resolved through PATH and never silently replaced after failure.
+    environment_python: str = ""
+    environment_timeout: float = Field(default=30.0, gt=0, le=120)
 
     # --- Output ---
     output_format: str = "terminal"
@@ -225,6 +245,31 @@ class SentinelConfig(BaseModel):
         return value
 
 
+def endpoint_is_local(endpoint: str) -> tuple[bool, str]:
+    """Classify the configured endpoint for credential and transport policy."""
+    import ipaddress
+    from urllib.parse import urlparse
+
+    host = (urlparse(endpoint).hostname or "").strip("[]")
+    if not host:
+        return False, f"{endpoint!r} names no host"
+    if host == "localhost" or host.endswith(".localhost"):
+        return True, ""
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False, (
+            f"{host} is a hostname this cannot resolve to a loopback address"
+        )
+    if address.is_loopback or address.is_unspecified:
+        return True, ""
+    if address.is_private:
+        return False, (
+            f"{host} is on your network but is not this machine — another host, or a VM"
+        )
+    return False, f"{host} is a public address"
+
+
 #: Environment variables that override ``[llm]``, and the field each one
 #: sets. Deliberately four, and deliberately all of them about *which
 #: backend this machine can reach*: the config file states what the project
@@ -315,6 +360,17 @@ def load_config(path: Path | None = None) -> SentinelConfig:
 
     config.config_path = toml_path
     config.project_dir = toml_path.parent
+
+    config.pack_manifests = PackSettings.model_validate(data.get("packs", {})).manifests
+
+    environment = data.get("environment", {})
+    if "python" in environment:
+        value = environment["python"]
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("[environment] python must be a nonempty interpreter path")
+        config.environment_python = value
+    if "timeout" in environment:
+        config.environment_timeout = environment["timeout"]
 
     output = data.get("output", {})
     if "format" in output:

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vibe-sentinel"
-version = "0.5.1"
+version = "0.6.0"
 description = "Safeguards a codebase against the problems AI coding agents introduce: structural drift, secrets at rest, unvetted dependencies, and dangerous commands."
 requires-python = ">=3.13,<3.14"
 license = "MIT"
@@ -37,6 +37,7 @@ classifiers = [
 dependencies = [
     "httpx>=0.28",
     "loguru>=0.7",
+    "packaging>=24",
     "pydantic>=2.10",
 ]
 
@@ -47,9 +48,11 @@ Documentation = "https://github.com/authentic-research-partners/vibe-sentinel#re
 Issues = "https://github.com/authentic-research-partners/vibe-sentinel/issues"
 
 [project.optional-dependencies]
+plugin = ["mcp>=1.20,<2"]
 # `uv pip install -e ".[dev]"` brings in every tool used by the mandatory
 # checks and the release pipeline.
 dev = [
+    "mcp>=1.20,<2",
     # Mandatory checks — run after every code change
     "pytest>=9.0.3",
     "pytest-xdist>=3.0",
@@ -66,6 +69,7 @@ dev = [
 
 [project.scripts]
 vibe-sentinel = "vibe_sentinel.__main__:main"
+vibe-sentinel-mcp = "vibe_sentinel.mcp_server:main"
 
 [tool.setuptools.packages.find]
 include = ["vibe_sentinel*"]
@@ -76,6 +80,8 @@ include = ["vibe_sentinel*"]
     "probes.default.toml",
     "dangers.default.toml",
     "secrets.default.toml",
+    "security-rules.yml",
+    "security-jsx.cjs",
 ]
 
 [tool.pytest.ini_options]

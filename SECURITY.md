@@ -38,9 +38,9 @@ expected hosts, policy writes hidden inside interpreter code, and others. A repo
 is exploitable is welcome, but it is a known gap rather than a new finding.
 So is:
 
-- a wrong verdict from the local model — that is a rate, measured in
-  [docs/evals.md](docs/evals.md); a case that reproduces it is best filed
-  as an eval case;
+- A wrong verdict from the local model. See the
+  [recorded results](docs/eval-results.md) for measured rates and the
+  [eval guide](docs/evals.md#add-a-case) for filing a reproducible case.
 - anything that needs an attacker already running code as the user. The
   safety gate is a guardrail inside the agent's trust domain, not a
   sandbox. `hook --install --managed` and the system policy move its

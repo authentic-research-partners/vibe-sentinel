@@ -1,0 +1,12 @@
+{
+  "name": "@vibe-sentinel/javascript",
+  "version": "0.1.0",
+  "description": "Offline workspace and static JavaScript/TypeScript relationship readers for Vibe Sentinel",
+  "type": "module",
+  "license": "MIT",
+  "engines": { "node": ">=22" },
+  "bin": { "vibe-sentinel-javascript": "bin/vibe-sentinel-javascript.js" },
+  "files": ["bin/", "src/", "pack.toml", "README.md", "LICENSE"],
+  "scripts": { "test": "node --test test/*.test.js" },
+  "dependencies": { "typescript": "6.0.3" }
+}

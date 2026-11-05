@@ -1,0 +1,37 @@
+protocol = 1
+id = "javascript"
+version = "0.1.0"
+ecosystems = ["npm"]
+supported_inputs = ["package.json", "npm-yarn-workspaces", "javascript", "typescript", "tsconfig.json", "jsconfig.json"]
+
+[[executable]]
+id = "reader"
+command = "./bin/vibe-sentinel-javascript.js"
+
+[[executable]]
+id = "node"
+command = "node"
+
+[[probe]]
+id = "workspaces"
+title = "JavaScript workspace components"
+command = ["reader", "workspaces", "--root", "{ROOT}"]
+timeout_s = 60
+tolerance = 0
+
+[[probe.placeholders]]
+name = "ROOT"
+description = "Project directory containing package.json"
+default = "."
+
+[[probe]]
+id = "imports"
+title = "JavaScript and TypeScript dependency edges"
+command = ["reader", "imports", "--root", "{ROOT}"]
+timeout_s = 60
+tolerance = 0
+
+[[probe.placeholders]]
+name = "ROOT"
+description = "Project directory containing package.json"
+default = "."

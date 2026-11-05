@@ -459,3 +459,55 @@ def test_a_state_free_observation_round_trips_as_empty(project: Path) -> None:
         loaded = store.load_snapshot(conn, run_id)
     assert loaded is not None
     assert loaded.probes["p"].by_key()["a"].state == ""
+
+
+def test_result_preserves_zero_change_baseline_and_exact_provenance(
+    project: Path,
+) -> None:
+    from vibe_sentinel.results import build_result
+    from vibe_sentinel.schemas import RunProvenance, ScanContext
+
+    first = _save(project, _snapshot([]), DriftReport(first_run=True))
+    snapshot = _snapshot([])
+    snapshot.context = ScanContext(
+        provenance=RunProvenance(
+            availability="captured",
+            fingerprint_status="captured",
+            source_revision="a" * 40,
+        )
+    )
+    report = DriftReport()
+    with get_db(project) as conn:
+        current = store.save_run(conn, snapshot, report, first, make_baseline=False)
+        result = build_result(snapshot, report)
+        store.save_result(conn, current, result)
+        assert store.load_result(conn, current) == result
+        store.save_result(conn, current, result)
+        loaded = store.load_snapshot(conn, current)
+        assert loaded is not None and loaded.context is not None
+        assert loaded.context.baseline_run_id == first
+        assert loaded.context.provenance.source_revision == "a" * 40
+        replacement = result.model_copy(update={"generated_at": "changed"})
+        with pytest.raises(ValueError, match="cannot be replaced"):
+            store.save_result(conn, current, replacement)
+        assert store.load_result(conn, current) == result
+        # Identity is evidence, including when the compared baseline is pruned.
+        conn.execute("DELETE FROM runs WHERE id = ?", (first,))
+        conn.commit()
+        assert store.load_result(conn, current).baseline_run_id == first
+
+
+def test_unanalyzed_failure_cannot_become_baseline(project: Path) -> None:
+    with get_db(project) as conn:
+        with pytest.raises(ValueError, match="cannot become"):
+            store.save_run(
+                conn, _snapshot([]), DriftReport(), None, True, analyzed=False
+            )
+        run_id = store.save_run(
+            conn, _snapshot([]), DriftReport(), None, False, analyzed=False
+        )
+        row = conn.execute(
+            "SELECT analyzed,is_baseline FROM runs WHERE id=?", (run_id,)
+        ).fetchone()
+        assert tuple(row) == (0, 0)
+        assert store.load_result(conn, run_id) is None

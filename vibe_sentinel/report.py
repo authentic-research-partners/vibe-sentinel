@@ -24,6 +24,7 @@ from vibe_sentinel.journal import (
     ReviewRecord,
 )
 from vibe_sentinel.schemas import (
+    NODE_GATE_UNAVAILABLE,
     Anomaly,
     DriftReport,
     GateState,
@@ -37,6 +38,7 @@ if TYPE_CHECKING:  # pragma: no cover - annotations only, never imported
     from vibe_sentinel.credentials import Adjudication, Policy, Secret
     from vibe_sentinel.db.maintenance import DatabaseSize, HealthReport, PruneResult
     from vibe_sentinel.protection import Protection
+    from vibe_sentinel.schemas import ScanResult
 
 _SEVERITY_RANK = {"high": 0, "medium": 1, "low": 2, "info": 3}
 _KIND_MARK = {
@@ -59,6 +61,15 @@ def _ordered(report: DriftReport):
 
 def render_terminal(snapshot: Snapshot, report: DriftReport) -> None:
     """Print the structure and any drift."""
+    if snapshot.context is not None:
+        from vibe_sentinel.schemas import RunProvenance
+
+        if isinstance(snapshot.context.provenance, RunProvenance) and any(
+            pack.selected_probes for pack in snapshot.context.provenance.packs
+        ):
+            print(
+                "Pack history coverage is baseline-only; pack horizons and trends are not assessed."
+            )
     print("Structure")
     for probe_id in sorted(snapshot.probes):
         result = snapshot.probes[probe_id]
@@ -72,12 +83,30 @@ def render_terminal(snapshot: Snapshot, report: DriftReport) -> None:
             params = ", ".join(f"{k}={v}" for k, v in sorted(result.filled.items()))
             print(f"    parameters: {params}")
 
+    judgement_failed = (
+        snapshot.context is not None
+        and "judgement"
+        in (snapshot.context.stage_error, *snapshot.context.stage_errors)
+    ) or any(lens.asked and not lens.answered for lens in report.lenses)
+    if judgement_failed:
+        print(
+            "\nJudgement incomplete. No baseline was accepted; measured changes remain available."
+        )
+
     if report.first_run:
         print(f"\n{report.assessment}")
         return
 
+    from vibe_sentinel.results import build_result
+
+    comparison_incomplete = build_result(snapshot, report).comparison == "incomplete"
     if not report.changes:
-        print(f"\nNo change since {report.baseline_at}.")
+        if comparison_incomplete:
+            print(
+                "\nComparison incomplete: current or baseline measurements are missing."
+            )
+        else:
+            print(f"\nNo change since {report.baseline_at}.")
         # Not a return. "Nothing since the baseline" is exactly the run
         # where a horizon has something to say — the baseline may be two
         # days old, and the thing that has been growing for a month is
@@ -90,14 +119,14 @@ def render_terminal(snapshot: Snapshot, report: DriftReport) -> None:
         _render_lenses(report)
         return
 
-    # Said before the severities rather than after them, because it is what
-    # they mean: every severity below was rated by a model of a different
-    # family from whatever wrote the code. There is no other kind of drift
-    # report any more — a run whose model did not answer failed instead of
-    # printing this.
-    print(
-        f"\nDrift since {report.baseline_at} (reviewed by an independent local model)"
+    review = (
+        "judgement incomplete; measured changes only"
+        if judgement_failed
+        else "reviewed by an independent local model"
+        if any(lens.answered for lens in report.lenses)
+        else "mechanical comparison; no judge answer recorded"
     )
+    print(f"\nDrift since {report.baseline_at} ({review})")
     for c in _ordered(report):
         mark = _KIND_MARK.get(c.kind, "?")
         print(f"  {mark} [{c.severity}] {c.describe()}")
@@ -314,7 +343,12 @@ def render_trend_report(fits: list[TrendFit], runs: int, min_runs: int) -> None:
 
 
 def render_json(
-    snapshot: Snapshot, report: DriftReport, gates: GateState | None = None
+    snapshot: Snapshot,
+    report: DriftReport,
+    gates: GateState | None = None,
+    *,
+    result: ScanResult | None = None,
+    shareable: bool = False,
 ) -> None:
     """Write structure, drift and gate state as one JSON object to stdout.
 
@@ -322,19 +356,31 @@ def render_json(
     run. A consumer that has to tell "no findings" from "not checked"
     should not have to infer it from a missing field.
     """
+    from vibe_sentinel.results import build_result, project_result
+
+    result = result or build_result(
+        snapshot, report, gates, gates_ran=gates is not None
+    )
     json.dump(
-        {
-            "snapshot": snapshot.model_dump(),
-            "drift": report.model_dump(),
-            "gates": (gates or GateState()).model_dump(),
-        },
+        project_result(
+            result,
+            snapshot,
+            report,
+            gates or GateState(),
+            profile="shareable" if shareable else "local",
+        ),
         sys.stdout,
         indent=2,
     )
     sys.stdout.write("\n")
 
 
-def render_agent(report: DriftReport, gates: GateState | None = None) -> str:
+def render_agent(
+    report: DriftReport,
+    gates: GateState | None = None,
+    *,
+    result: ScanResult | None = None,
+) -> str:
     """Return the drift, and what stands, as a block addressed to the agent.
 
     The gate findings are appended rather than merged. An agent told
@@ -354,6 +400,11 @@ def render_agent(report: DriftReport, gates: GateState | None = None) -> str:
         + _agent_trend_block(report)
     )
 
+    if result is not None and any(
+        pack.selected_probes for pack in result.provenance.packs
+    ):
+        standing += "\n\nPack history coverage is baseline-only; pack horizons and trends are not assessed."
+
     # Before every other verdict, because every other verdict is a
     # statement about measurements. A scan whose probes all failed has
     # not found the codebase unchanged and has not recorded its
@@ -365,6 +416,28 @@ def render_agent(report: DriftReport, gates: GateState | None = None) -> str:
             "No probe produced a measurement this run. This is not a clean "
             "result, it is an absent one: nothing here says the organization "
             "of this codebase is unchanged." + standing
+        )
+
+    if result is not None and result.counts.baseline_unmeasured:
+        return (
+            "VIBE SENTINEL: COMPARISON INCOMPLETE\n"
+            "The baseline has missing measurements. No conclusion about unchanged "
+            "organization can be drawn for those probes." + standing
+        )
+
+    judgement_failed = (
+        result is not None and "judgement" in result.failed_stages
+    ) or any(lens.asked and not lens.answered for lens in report.lenses)
+    if judgement_failed:
+        return (
+            "VIBE SENTINEL: JUDGEMENT INCOMPLETE\n"
+            "Measurements were recorded, but the requested review did not complete. "
+            "No baseline was accepted. Inspect the local report and retry." + standing
+        )
+    if report.first_run and report.unmeasured:
+        return (
+            "VIBE SENTINEL: MEASUREMENT INCOMPLETE\n"
+            "Some probes did not report. No baseline was accepted." + standing
         )
 
     if report.first_run:
@@ -394,7 +467,11 @@ def render_agent(report: DriftReport, gates: GateState | None = None) -> str:
             f"{report.baseline_at}.{read}" + standing
         )
 
-    reviewed = " and reviewed by an independent local model"
+    reviewed = (
+        " and reviewed by an independent local model"
+        if any(lens.answered for lens in report.lenses)
+        else "; no judge answer recorded"
+    )
     lines = [
         "VIBE SENTINEL: STRUCTURAL DRIFT DETECTED",
         "",
@@ -564,6 +641,9 @@ def _agent_gate_block(gates: GateState | None) -> str:
         )
         lines.append("")
     for report in unconfigured:
+        if report.error == NODE_GATE_UNAVAILABLE:
+            lines.extend((f"The {report.gate} gate did not run. {report.error}", ""))
+            continue
         lines.append(
             f"The {report.gate} gate has no policy in this project, so it did "
             f"not run. Do not report it as passing."
@@ -596,6 +676,9 @@ def render_gate_state(state: GateState) -> None:
     print("\nState")
     for report in state.reports:
         if not report.configured:
+            if report.error == NODE_GATE_UNAVAILABLE:
+                print(f"  {report.gate}: {report.error}")
+                continue
             # Not a failure and not a pass. Naming the missing block is
             # the whole content of this line.
             print(f"  {report.gate}: no policy declared — this gate did not run")
@@ -1217,7 +1300,7 @@ def render_protection(report: Protection, meaning: dict[str, str]) -> None:
     print("Hook")
     if not report.installed:
         print(
-            "  NOT INSTALLED — no agent's tool calls are recorded or judged here.\n"
+            "  NOT INSTALLED in the inspected Claude Code or Cursor settings.\n"
             "  Install it with: vibe-sentinel hook --install --mode observe"
         )
     for site in report.sites:
@@ -1235,6 +1318,11 @@ def render_protection(report: Protection, meaning: dict[str, str]) -> None:
             f"  {agent}'s hook is installed at {n} levels, so each call runs it "
             f"{n} times. Keep the managed or enterprise one and remove the rest."
         )
+    print(
+        "  Codex plugin hooks: enablement and trust are not discoverable here.\n"
+        "  Check Codex plugin and hook settings, then verify a new call with\n"
+        "  vibe-sentinel commands. A past journal entry does not prove current protection."
+    )
     print()
 
     print("System policy")
@@ -1261,10 +1349,12 @@ def render_protection(report: Protection, meaning: dict[str, str]) -> None:
             print(f"  mode {report.mode}: {meaning.get(report.mode, '')}")
         else:
             print(
-                f"  mode {report.mode}, with no hook to apply it: nothing is recorded"
+                f"  configured mode {report.mode}; no file-based hook detected. "
+                "Codex plugin activation is unverified."
             )
         if report.mode == "enforce":
             print(f"  no_verdict = {report.no_verdict}")
+            print("  Codex cannot ask from PreToolUse; an ask decision becomes deny.")
     print()
 
     print("Judge")
@@ -1273,7 +1363,7 @@ def render_protection(report: Protection, meaning: dict[str, str]) -> None:
     if not report.judge_reachable and report.mode not in ("", "off"):
         print(
             "  With no answer the gate records 'unreviewed' and, under enforce, "
-            "asks you. Check it with: vibe-sentinel backend status"
+            "asks you (Codex refuses). Check it with: vibe-sentinel backend status"
         )
     print()
 

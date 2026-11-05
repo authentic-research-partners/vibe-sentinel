@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "vibe-sentinel hook --agent codex",
+            "timeout": 20,
+            "statusMessage": "Checking Vibe Sentinel policy"
+          }
+        ]
+      }
+    ]
+  }
+}

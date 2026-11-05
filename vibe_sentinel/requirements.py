@@ -16,13 +16,11 @@ either would blow the hook's whole budget. ``tomllib`` (4.1 ms) and
 ``shlex`` (0.2 ms) are imported inside the functions that need them,
 because the common command is not an install and should pay for neither.
 
-**When in doubt about a command, do not report.** Every unknown in the
-text resolves the quiet way: a token the parser cannot read is not a
-package name, a tree with no manifest is not a tree full of undeclared
-dependencies, and a name it cannot resolve — ``pip install $PKG`` — is not
-a finding. The failure that matters there is the false positive. A gate
-that blocks ``uv pip install -e ".[dev]"`` is a gate switched off by
-Thursday, and then it guards nothing.
+**Never invent a package name or a declaration.** Non-name install specs
+stay outside the comparison. Python retains its existing parser and root
+manifest scope. npm-family targets are read by the stdlib-only
+``node_targets`` module; unsupported targets are explicitly not compared
+and reach the existing safety question rather than using root declarations.
 
 **A manifest that will not parse is not one of those unknowns.** It raises
 :class:`ManifestUnreadable`. Answering ``None`` — "no manifest" — made the
@@ -42,6 +40,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from vibe_sentinel.node_targets import InstallTarget
 
 
 def normalize(name: str) -> str:
@@ -71,6 +70,8 @@ class Declared(NamedTuple):
     specifier: str  # "" when no version bound was given
     marker: str
     group: str  # project | extra:<name> | group:<name> | poetry[:<group>]
+    extras: tuple[str, ...] = ()  # extras requested from this dependency
+    optional: bool = False  # Poetry's optional dependency declaration
 
 
 def parse(raw: str, group: str) -> Declared | None:
@@ -79,13 +80,16 @@ def parse(raw: str, group: str) -> Declared | None:
     match = REQUIREMENT_RE.match(head)
     if not match:
         return None
-    name, _extras, specifier = match.groups()
+    name, extras, specifier = match.groups()
     return Declared(
         name=normalize(name),
         raw=raw.strip(),
         specifier=specifier.strip(),
         marker=marker.strip(),
         group=group,
+        extras=tuple(
+            sorted({normalize(e) for e in (extras or "")[1:-1].split(",") if e.strip()})
+        ),
     )
 
 
@@ -186,9 +190,130 @@ def _poetry(tool: dict[str, Any]) -> Iterator[Declared]:
                 name=normalize(name),
                 raw=f"{name} = {constraint!r}",
                 specifier="" if spec in ("", "*") else spec,
-                marker="",
+                marker=str(constraint.get("markers", ""))
+                if isinstance(constraint, dict)
+                else "",
                 group=group_label,
+                extras=tuple(
+                    sorted({normalize(str(e)) for e in constraint.get("extras", ())})
+                )
+                if isinstance(constraint, dict)
+                else (),
+                optional=bool(constraint.get("optional", False))
+                if isinstance(constraint, dict)
+                else False,
             )
+
+
+def _normalized_tables(tables: dict[str, Any]) -> dict[str, Any]:
+    """Names in extras and dependency groups compare under PEP 503 normalization."""
+    out: dict[str, Any] = {}
+    for name, value in tables.items():
+        key = normalize(name)
+        if key in out:
+            raise ValueError(
+                f"Duplicate dependency selection name after normalization: {name!r}"
+            )
+        out[key] = value
+    return out
+
+
+def _group_requirements(
+    groups: dict[str, Any], name: str, visiting: tuple[str, ...] = ()
+) -> Iterator[Declared]:
+    """Expand a selected PEP 735 group, retaining each requirement's source group."""
+    if name in visiting:
+        raise ValueError(f"Dependency group cycle: {' -> '.join((*visiting, name))}")
+    if name not in groups:
+        raise ValueError(
+            f"Unknown dependency group {name!r}; fix [packages] groups or include-group"
+        )
+    entries = groups[name]
+    if not isinstance(entries, list):
+        raise ValueError(f"Dependency group {name!r} must be an array")
+    for raw in entries:
+        if isinstance(raw, str):
+            entry = parse(raw, f"group:{name}")
+            if entry is None:
+                raise ValueError(
+                    f"Unreadable requirement in dependency group {name!r}: {raw!r}"
+                )
+            yield entry
+        elif (
+            isinstance(raw, dict)
+            and set(raw) == {"include-group"}
+            and isinstance(raw["include-group"], str)
+        ):
+            yield from _group_requirements(
+                groups, normalize(raw["include-group"]), (*visiting, name)
+            )
+        else:
+            raise ValueError(f"Unsupported entry in dependency group {name!r}: {raw!r}")
+
+
+def selected_requirements(
+    data: dict[str, Any],
+    *,
+    extras: frozenset[str] = frozenset(),
+    groups: frozenset[str] = frozenset(),
+) -> Iterator[Declared]:
+    """Base declarations plus explicitly selected extras and dependency groups.
+
+    Selection is separate from :func:`iter_declared`: the safety gate must still
+    recognize an install of anything a manifest declares. Markers are retained
+    for the packages subject to evaluate against the measured interpreter.
+    """
+    project = data.get("project", {}) or {}
+    poetry = (data.get("tool", {}) or {}).get("poetry", {}) or {}
+    project_extras = _normalized_tables(project.get("optional-dependencies", {}) or {})
+    poetry_extras = _normalized_tables(poetry.get("extras", {}) or {})
+    missing = extras - project_extras.keys() - poetry_extras.keys()
+    if missing:
+        raise ValueError(
+            f"Unknown project extras {sorted(missing)!r}; fix [packages] extras"
+        )
+    optional_names = {
+        normalize(name) for extra in extras for name in poetry_extras.get(extra, ())
+    }
+    poetry_groups = _normalized_tables(poetry.get("group", {}) or {})
+    pep_groups = _normalized_tables(data.get("dependency-groups", {}) or {})
+    for selector in sorted(groups):
+        kind, _, name = selector.partition(":")
+        if kind == "group":
+            yield from _group_requirements(pep_groups, name)
+        elif kind != "poetry" or name not in poetry_groups:
+            raise ValueError(
+                f"Unknown dependency group selector {selector!r}; use group:<name> or poetry:<name>"
+            )
+    for entry in iter_declared(data):
+        kind, _, name = entry.group.partition(":")
+        selected = (
+            entry.group in {"project", "poetry"}
+            or (kind == "extra" and normalize(name) in extras)
+            or (kind == "poetry" and f"poetry:{normalize(name)}" in groups)
+        )
+        if selected and (not entry.optional or entry.name in optional_names):
+            if kind == "poetry":
+                table = poetry if not name else poetry_groups[normalize(name)]
+                constraints = {
+                    normalize(key): value
+                    for key, value in (table.get("dependencies", {}) or {}).items()
+                }
+                constraint = constraints[entry.name]
+                if isinstance(constraint, list):
+                    raise ValueError(
+                        f"Selected Poetry dependency {entry.name!r} uses a multi-constraint array; "
+                        "declare supported PEP 508 requirements for package accounting"
+                    )
+                if (
+                    isinstance(constraint, dict)
+                    and {"python", "platform"} & constraint.keys()
+                ):
+                    raise ValueError(
+                        f"Selected Poetry dependency {entry.name!r} uses python/platform conditions; "
+                        "use a PEP 508 markers expression for package accounting"
+                    )
+            yield entry
 
 
 def name_of(data: dict[str, Any]) -> str:
@@ -348,17 +473,23 @@ def js_installs(command: str) -> tuple[str, ...]:
     return _read_installs(command).js
 
 
-def unreadable_install(command: str, root: Path | None) -> bool:
-    """Whether this command names an installer, cannot be read, and runs in
-    a tree with a manifest to compare it against.
+def unreadable_install(
+    command: str, root: Path | None, *, cwd: Path | None = None
+) -> bool:
+    """Whether install names or their npm target cannot be compared safely.
 
-    Then which names it installs is unknown, and the safety gate asks the
-    model to read the command rather than concluding it installs nothing.
-    A tree with no manifest reports nothing, as :func:`undeclared_installs`
-    does: nowhere to read a declaration is not a declaration of nothing.
-    Raises :class:`ManifestUnreadable` as that does, for the same reason.
+    Unsupported npm targeting is explicit uncertainty, never root fallback.
+    The legacy Python unparseable-command check still requires a manifest.
+    Raises :class:`ManifestUnreadable` for malformed selected declarations.
     """
-    if root is None or not _read_installs(command).unreadable:
+    if root is None:
+        return False
+    if any(
+        target.status == "unknown"
+        for target in js_install_targets(command, root, cwd=cwd)
+    ):
+        return True
+    if not _read_installs(command).unreadable:
         return False
     return declared_names(root) is not None or declared_js_names(root) is not None
 
@@ -413,92 +544,51 @@ def _names_in(segment: list[str]) -> list[str]:
     return names
 
 
-def undeclared_installs(command: str, root: Path | None) -> tuple[str, ...]:
-    """Names this command would install that no manifest in ``root`` declares.
+def undeclared_installs(
+    command: str, root: Path | None, *, cwd: Path | None = None
+) -> tuple[str, ...]:
+    """Names absent from at least one declaration actually compared.
 
-    The whole check, in the order that keeps it cheap: a regex over the
-    text, then a tokenize, then — only for a command that really does
-    install something by name — one read of the manifest for that
-    ecosystem: ``pyproject.toml`` for pip, ``package.json`` for npm, pnpm,
-    yarn and bun. That read raises :class:`ManifestUnreadable` when the file
-    will not parse, so a broken manifest is noticed by the one kind of
-    command it affects. A tree with no manifest for the ecosystem reports
-    nothing for it: nowhere to read a declaration is not a declaration of
-    nothing.
+    Python keeps its root pyproject.toml scope. npm-family named installs
+    compare each supported target separately; unsupported targets contribute
+    no invented names and are exposed by :func:`unreadable_install` instead.
+    Missing manifests do not mean empty declarations. Malformed selected
+    manifests raise :class:`ManifestUnreadable`.
     """
     if root is None or not command:
         return ()
-    python, js, _ = _read_installs(command)
+    python, _, _ = _read_installs(command)
     undeclared: list[str] = []
     if python:
         declared = declared_names(root)
         if declared is not None:
             undeclared += [name for name in python if name not in declared]
-    if js:
-        declared_js = declared_js_names(root)
-        if declared_js is not None:
-            undeclared += [name for name in js if name not in declared_js]
-    return tuple(undeclared)
+    for target in js_install_targets(command, root, cwd=cwd):
+        undeclared.extend(target.undeclared)
+    return tuple(dict.fromkeys(undeclared))
+
+
+def js_install_targets(
+    command: str, root: Path | None, *, cwd: Path | None = None
+) -> tuple[InstallTarget, ...]:
+    """Per-target npm-family evidence, including explicit unsupported targeting."""
+    from vibe_sentinel.node_targets import NodeManifestUnreadable, assess
+
+    try:
+        return assess(command, root, cwd)
+    except NodeManifestUnreadable as exc:
+        raise ManifestUnreadable(str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------
 # The JavaScript package managers
 # ---------------------------------------------------------------------------
 
-#: The subcommand that adds a named package, per manager. ``yarn install``
-#: takes no names, so only ``add`` is read for it.
-_JS_ADD = {
-    "npm": frozenset({"install", "i", "in", "add"}),
-    "pnpm": frozenset({"add", "install", "i"}),
-    "yarn": frozenset({"add"}),
-    "bun": frozenset({"add", "install", "i"}),
-}
-#: Options whose value is the next token, so it is not read as a name.
-_JS_OPTIONS_WITH_A_VALUE = frozenset(
-    {
-        "--registry", "--prefix", "-w", "--workspace", "--filter", "-F",
-        "--cwd", "--tag", "--save-prefix", "--omit", "--include", "--cache",
-        "--dir", "-C",
-    }
-)  # fmt: skip
-_JS_GLOBAL = frozenset({"-g", "--global", "--location=global"})
-_JS_NOT_A_NAME = ("file:", "link:", "git+", "git:", "github:", "http:", "https:",
-                  "workspace:", "portal:", "patch:")  # fmt: skip
-
 
 def _js_names_in(segment: list[str]) -> list[str]:
-    """Every bare npm package name one segment would add to the project."""
-    index = 0
-    while index < len(segment) and (
-        segment[index] in WRAPPERS or _ENV_ASSIGNMENT_RE.match(segment[index])
-    ):
-        index += 1
-    head = segment[index:]
-    if len(head) < 2 or head[0] not in _JS_ADD:
-        return []
-    manager, rest = head[0], head[1:]
-    if manager == "yarn" and rest[:1] == ["global"]:
-        return []
-    verb_at = next((i for i, tok in enumerate(rest) if not tok.startswith("-")), None)
-    if verb_at is None or rest[verb_at] not in _JS_ADD[manager]:
-        return []
-    arguments = rest[:verb_at] + rest[verb_at + 1 :]
-    if any(tok in _JS_GLOBAL for tok in arguments):
-        return []
+    from vibe_sentinel.node_targets import names_in_segment
 
-    names: list[str] = []
-    skip = False
-    for token in arguments:
-        if skip:
-            skip = False
-            continue
-        if token.startswith("-"):
-            skip = token in _JS_OPTIONS_WITH_A_VALUE
-            continue
-        name = js_package_name(token)
-        if name:
-            names.append(name)
-    return names
+    return names_in_segment(segment)
 
 
 def js_package_name(spec: str) -> str:
@@ -508,24 +598,9 @@ def js_package_name(spec: str) -> str:
     names. A path, a tarball, a URL, a git or workspace reference, an alias
     (``foo@npm:bar``) and anything holding a shell expansion are not.
     """
-    if (
-        not spec
-        or spec.startswith((".", "/", "~", *_JS_NOT_A_NAME))
-        or "://" in spec
-        or "$" in spec
-        or "`" in spec
-        or "@npm:" in spec
-        or spec.endswith((".tgz", ".tar.gz"))
-    ):
-        return ""
-    if spec.startswith("@"):
-        scope, _, rest = spec.partition("/")
-        if not rest:
-            return ""
-        return f"{scope}/{rest.split('@', 1)[0]}".lower()
-    if "/" in spec:
-        return ""  # user/repo — a GitHub shorthand, not a registry name
-    return spec.split("@", 1)[0].lower()
+    from vibe_sentinel.node_targets import package_name
+
+    return package_name(spec)
 
 
 def declared_js_names(root: Path) -> frozenset[str] | None:
@@ -535,33 +610,12 @@ def declared_js_names(root: Path) -> frozenset[str] | None:
     and will not parse raises :class:`ManifestUnreadable`, for the reason
     ``load_manifest`` does.
     """
-    import json
+    from vibe_sentinel.node_targets import (
+        NodeManifestUnreadable,
+        declared_names as node_names,
+    )
 
-    path = root / "package.json"
-    if not path.is_file():
-        return None
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, UnicodeDecodeError) as e:
-        raise ManifestUnreadable(
-            f"{path} could not be read: {e}. The safety gate reads it to know "
-            f"which npm packages this project declares, and until it parses it "
-            f"cannot tell a declared dependency from a name that came from "
-            f"nowhere. Fix the file, then run the command again."
-        ) from e
-    if not isinstance(data, dict):
-        raise ManifestUnreadable(f"{path} is not a JSON object.")
-    names: set[str] = set()
-    for table in (
-        "dependencies",
-        "devDependencies",
-        "optionalDependencies",
-        "peerDependencies",
-    ):
-        section = data.get(table)
-        if isinstance(section, dict):
-            names.update(str(key).lower() for key in section)
-    own = data.get("name")
-    if isinstance(own, str) and own:
-        names.add(own.lower())
-    return frozenset(names)
+        return node_names(root)
+    except NodeManifestUnreadable as exc:
+        raise ManifestUnreadable(str(exc)) from exc

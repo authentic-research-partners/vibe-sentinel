@@ -1,0 +1,29 @@
+# Opt in through [probes] rule_files. No build is executed by this declaration.
+[[probe]]
+id = "vite-build"
+title = "Vite build artifact weights"
+description = "Logical entries, shared artifact ownership and raw bytes in an existing manifest. Source freshness and runtime performance are not assessed."
+command = ["{SCANNER_PYTHON}", "-I", "-m", "vibe_sentinel.probes.vite", "--root", "{ROOT}", "--manifest", "{MANIFEST}", "--out-dir", "{OUT_DIR}"]
+timeout_s = 60
+tolerance = 0
+compare_parameters = true
+
+[[probe.placeholders]]
+name = "SCANNER_PYTHON"
+description = "Python in the Sentinel installation"
+default = "python"
+
+[[probe.placeholders]]
+name = "ROOT"
+description = "Project root containing the artifacts"
+default = "."
+
+[[probe.placeholders]]
+name = "MANIFEST"
+description = "Existing Vite manifest JSON relative to ROOT"
+default = "dist/.vite/manifest.json"
+
+[[probe.placeholders]]
+name = "OUT_DIR"
+description = "Existing Vite output directory relative to ROOT"
+default = "dist"

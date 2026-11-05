@@ -6,8 +6,8 @@ and it is as true on the two-hundredth scan as on the first. A probe reports a
 package's commentary ratio halved. A transition is right to report once, when it
 happens, and `scan --update` accepts it.
 
-Drift is the part of this tool that needs history, and the first scan is only
-ever a baseline. What it can tell you grows with the record:
+Drift comparison needs history. A completed first scan establishes a baseline
+for later runs. It reports current state separately, including any gate findings.
 
 | Reading | Needs | Answers |
 |---|---|---|
@@ -35,7 +35,7 @@ flowchart TB
   RPT["changes · horizons · fitted series"]
   L["[[lens]] rates each change.<br/>It may not add one or drop one"]
   OUT(["drift report"])
-  UPD["only --update makes this run the new baseline"]
+  UPD["accept a later baseline with --update"]
   P --> OBS
   OBS --> CMP & HOR & TRD
   CMP & HOR & TRD --> RPT
@@ -65,9 +65,11 @@ Drift since 2026-09-01T15:59:11+00:00
 vibe-sentinel: 5 change(s), 5 worth attention.
 ```
 
-`scan --update` accepts this and makes this run the baseline that the next scan compares against. Without it, a scan that finds drift does not become the new
-baseline — every scan is *recorded* either way, but accepting drift is a
-deliberate act.
+Use `scan --update` to accept the current measurements as the new baseline.
+This requires successful measurement and required judgement. If an existing
+baseline lacks comparable coverage, the accepting run still reports that gap.
+The next scan compares against the newly accepted baseline. State findings
+remain subject to their own policies. [Scan outcomes](getting-started.md#read-the-scan-outcome)
 
 ### The four kinds of change
 
@@ -349,9 +351,8 @@ to keep improving.
 
 ## Lenses
 
-A probe says what is measured. A **lens** says what to make of it: one question
-about the whole report — the changes, what the same measurements did over each
-horizon, and what the fitted series are doing — asked in your words.
+A probe says what is measured. A **lens** asks a question in your words about
+baseline changes, comparisons over longer horizons, or fitted trends.
 
 ```toml
 [[lens]]
@@ -365,7 +366,7 @@ thin: route, validate, one call into a service.
 """
 ```
 
-Each lens is its own request, with the report as a shared prefix. The benefit
+Each lens is its own request, with the same bounded evidence as a shared prefix. The benefit
 of caching and concurrency depends on the backend: the recorded Ollama run
 benefited from a shared prefix but not wider concurrency; earlier batching-server
 runs behaved differently. See [Benchmarks](../benchmarks/README.md) and its dated
@@ -373,7 +374,16 @@ results. Concurrency defaults to 1.
 `watch` names the probes a lens is about and is what keeps that true: a lens whose probes did not move, did not move over a horizon, and have no fitted trend gets skipped entirely, and is reported as not asked rather than as having found
 nothing. Raise `[drift] concurrency` only for a backend measured to benefit.
 
-A lens can only rate changes the comparison already found, using the same boundary as the built-in analysis. `[drift] guidance` is a standing note placed in front of
+Large reports reserve separate space for baseline changes, horizon comparisons,
+trends, and probe summaries. The judge receives at most 20 baseline changes,
+with higher severities first and space shared across probes of equal severity.
+The scan assessment counts omitted rows. Measurements remain in the full report,
+and a change omitted from the input keeps its mechanical severity. The input
+limits are in UTF-8 bytes and do not depend on the backend's tokenizer.
+Keep each lens question short. A request whose question message exceeds 4 KiB
+is reported as an incomplete judgement.
+
+A lens can only rate measured changes included in its input. `[drift] guidance` is a standing note placed in front of
 every question; `use`, `disable` and `use_builtins` select from the set the same
 way they do for probes and dangers.
 

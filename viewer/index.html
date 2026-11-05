@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'none'; img-src 'none'; font-src 'none'; base-uri 'none'; object-src 'none'; form-action 'none'">
+  <title>Evidence viewer | Vibe Sentinel</title>
+  <link rel="stylesheet" href="viewer.css">
+  <script src="contract.js" defer></script>
+  <script src="examples/synthetic.js" defer></script>
+  <script src="viewer.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#workspace">Skip to evidence</a>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark" aria-hidden="true">vs</span><span>Vibe Sentinel <span class="brand-section">Evidence viewer</span></span></div>
+    <span class="local-indicator"><span aria-hidden="true"></span>Offline · Read only</span>
+  </header>
+  <div class="shell">
+    <aside class="sidebar" aria-label="Opened evidence">
+      <div class="sidebar-heading">Local evidence</div>
+      <label class="open-button" for="evidence-file">Open a result file</label>
+      <input id="evidence-file" class="file-input" type="file" accept=".json,application/json">
+      <p class="sidebar-hint">Or drop a JSON export anywhere in this window.</p>
+      <div id="file-context" hidden></div>
+      <div class="sidebar-foot"><strong>Your file stays here.</strong><p>Read in this browser tab. No server or upload. The viewer does not save the file in browser storage.</p><button id="clear-file" class="quiet-button" hidden>Close result</button></div>
+    </aside>
+    <main id="workspace" tabindex="-1">
+      <div id="status-message" class="message" role="status" aria-live="polite" hidden></div>
+      <section id="empty-state" class="empty-state" aria-labelledby="empty-title">
+        <div class="empty-intro"><p class="context-label">Recorded evidence, opened locally</p><h1 id="empty-title">Follow a finding<br>back to its evidence.</h1><p>Inspect what moved, which question was asked, and what the judge actually answered.</p></div>
+        <div class="evidence-path" aria-label="The evidence chain"><div><span class="path-symbol" aria-hidden="true">↔</span><strong>Measurement</strong><p>The recorded values and source identity.</p></div><div><span class="path-symbol" aria-hidden="true">?</span><strong>Configured question</strong><p>The question in force for that scan.</p></div><div><span class="path-symbol" aria-hidden="true">≡</span><strong>Recorded answer</strong><p>Each answer and its final attribution.</p></div></div>
+        <div class="start-actions"><label class="primary-button" for="evidence-file">Choose JSON export</label><button id="load-example" class="secondary-button">Explore a synthetic example</button></div>
+        <details class="export-help"><summary>Get an export from Sentinel</summary><p>For local detail:</p><code>vibe-sentinel export /path/to/project --run 42 --profile local-detail &gt; evidence.json</code><p>Aggregate exports open too. Their private evidence remains withheld.</p></details>
+      </section>
+      <div id="loaded-state" hidden>
+        <div id="result-heading"></div>
+        <div id="result-notice"></div>
+        <div class="tabs" role="tablist" aria-label="Evidence sections">
+          <button id="tab-drift" role="tab" aria-selected="true" aria-controls="panel-drift" data-tab="drift">Baseline drift</button>
+          <button id="tab-gates" role="tab" aria-selected="false" aria-controls="panel-gates" tabindex="-1" data-tab="gates">State gates</button>
+          <button id="tab-questions" role="tab" aria-selected="false" aria-controls="panel-questions" tabindex="-1" data-tab="questions">Questions &amp; answers</button>
+          <button id="tab-coverage" role="tab" aria-selected="false" aria-controls="panel-coverage" tabindex="-1" data-tab="coverage">Coverage &amp; source</button>
+        </div>
+        <section id="panel-drift" role="tabpanel" aria-labelledby="tab-drift"></section>
+        <section id="panel-gates" role="tabpanel" aria-labelledby="tab-gates" hidden></section>
+        <section id="panel-questions" role="tabpanel" aria-labelledby="tab-questions" hidden></section>
+        <section id="panel-coverage" role="tabpanel" aria-labelledby="tab-coverage" hidden></section>
+        <footer class="workspace-foot">This is a record of a scan, not a guarantee of correctness or a current measurement. Baseline acceptance and policy decisions happen in Sentinel.</footer>
+      </div>
+    </main>
+  </div>
+  <div id="drop-overlay" hidden><strong>Open this result locally</strong><span>Drop one JSON export</span></div>
+</body>
+</html>

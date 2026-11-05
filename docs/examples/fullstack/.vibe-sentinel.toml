@@ -1,0 +1,60 @@
+# Copy the example before installing tools or recording history.
+# Keep the judge configured as documented in docs/fullstack-example.md.
+[probes]
+use_builtins = false
+
+[packs]
+manifests = ["node_modules/@vibe-sentinel/javascript/pack.toml"]
+
+[probes.parameters.python-dependency-edges]
+SOURCE_ROOT = "services/python"
+
+# Python declarations are scoped separately from the JavaScript workspaces.
+# Set SCANNER_PYTHON to the Sentinel installation's Python if it is not on PATH.
+[[probe]]
+id = "python-dependency-edges"
+title = "Python source dependency relationships"
+description = "Static Python module relationships with explicit resolution coverage. Separate from existing import counts."
+command = ["{SCANNER_PYTHON}", "-I", "-m", "vibe_sentinel.probes.python_edges", "--root", "{ROOT}", "--source-root", "{SOURCE_ROOT}"]
+timeout_s = 60
+tolerance = 0
+compare_parameters = true
+
+[[probe.placeholders]]
+name = "SCANNER_PYTHON"
+description = "Python in the Sentinel installation, not necessarily the application's interpreter"
+default = "python"
+
+[[probe.placeholders]]
+name = "ROOT"
+description = "Project root used for portable file identities"
+default = "."
+
+[[probe.placeholders]]
+name = "SOURCE_ROOT"
+description = "Import-search directory relative to ROOT, such as src for a src-layout project"
+default = "."
+
+[[probe]]
+id = "openapi-artifact"
+title = "OpenAPI declaration relationships"
+description = "Versioned API artifact structure, not runtime route or authorization verification."
+command = ["{SCANNER_PYTHON}", "-I", "-m", "vibe_sentinel.probes.openapi", "--root", "{ROOT}", "--artifact", "{ARTIFACT}"]
+timeout_s = 60
+tolerance = 0
+compare_parameters = true
+
+[[probe.placeholders]]
+name = "SCANNER_PYTHON"
+description = "Python in the Sentinel installation"
+default = "python"
+
+[[probe.placeholders]]
+name = "ROOT"
+description = "Project root containing the committed API artifact"
+default = "."
+
+[[probe.placeholders]]
+name = "ARTIFACT"
+description = "OpenAPI JSON artifact relative to ROOT"
+default = "openapi.json"

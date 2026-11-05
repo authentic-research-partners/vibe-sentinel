@@ -581,7 +581,7 @@ def test_status_says_nothing_is_installed_in_those_words(
     assert main(["status", str(project)]) == 1
     out = capfd.readouterr().out
     assert "NOT INSTALLED" in out
-    assert "nothing is recorded" in out
+    assert "Codex plugin activation is unverified" in out
 
 
 def test_status_names_where_the_hook_is_and_the_mode(
@@ -827,8 +827,17 @@ def test_match_measures_a_pattern_against_real_history(
 # --- the gates -------------------------------------------------------------
 
 
+@pytest.mark.parametrize("command", ["licenses", "packages"])
+def test_node_dependency_gate_does_not_inspect_scanner_environment(
+    command: str, tmp_path: Path, logged: list[str]
+) -> None:
+    (tmp_path / "package.json").write_text("{}")
+    assert main([command, str(tmp_path)]) == 2
+    assert "npm dependency and license coverage is unavailable." in "".join(logged)
+
+
 def test_credentials_says_which_model_judged(
-    tmp_path: Path, capfd: pytest.CaptureFixture[str]
+    tmp_path: Path, capfd: pytest.CaptureFixture[str], logged: list[str]
 ) -> None:
     """Who decided is part of the finding. There is no listing that is not
     a verdict any more — a run that could not ask exits 2 instead."""
@@ -836,6 +845,11 @@ def test_credentials_says_which_model_judged(
     assert main(["credentials", str(tmp_path)]) == 1
     out = capfd.readouterr().out
     assert "adjudicated by" in out
+    progress = "".join(logged)
+    assert "credentials: scanning files for candidates" in progress
+    assert "credentials: asking the judge about " in progress
+    assert "judge requests finished" in progress
+    assert "notarealkeyatall" not in progress
 
 
 def test_credentials_redacts_what_it_prints(

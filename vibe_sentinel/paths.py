@@ -87,3 +87,14 @@ def cursor_enterprise_hooks_path() -> Path:
         "/etc/cursor/hooks.json",
         r"C:\ProgramData\Cursor\hooks.json",
     )
+
+
+def codex_home() -> Path:
+    """Codex's own user configuration location, including its host override.
+
+    This locates user-owned files to protect; it does not relocate the
+    administrator-owned Vibe Sentinel policy.
+    """
+    import os
+
+    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")

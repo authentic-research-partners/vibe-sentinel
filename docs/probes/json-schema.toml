@@ -1,0 +1,24 @@
+# Opt in through [probes] rule_files. This declaration executes no application code.
+[[probe]]
+id = "json-schema"
+title = "JSON Schema data contract structure"
+description = "Types, properties, required names and local relationships from an explicit JSON Schema 2020-12 artifact. Instances and database state are not assessed."
+command = ["{SCANNER_PYTHON}", "-I", "-m", "vibe_sentinel.probes.json_schema", "--root", "{ROOT}", "--artifact", "{ARTIFACT}"]
+timeout_s = 60
+tolerance = 0
+compare_parameters = true
+
+[[probe.placeholders]]
+name = "SCANNER_PYTHON"
+description = "Python in the Sentinel installation"
+default = "python"
+
+[[probe.placeholders]]
+name = "ROOT"
+description = "Project root containing the declarations"
+default = "."
+
+[[probe.placeholders]]
+name = "ARTIFACT"
+description = "Existing declaration JSON file relative to ROOT"
+default = "schema.json"

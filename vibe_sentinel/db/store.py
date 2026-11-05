@@ -17,6 +17,10 @@ from vibe_sentinel.schemas import (
     Observation,
     ProbeResult,
     RunRecord,
+    ScanContext,
+    VersionedScanResult,
+    decode_provenance,
+    decode_result,
     Snapshot,
     TrendPoint,
 )
@@ -32,6 +36,8 @@ def save_run(
     report: DriftReport,
     baseline_run_id: int | None,
     make_baseline: bool,
+    *,
+    analyzed: bool = True,
 ) -> int:
     """Insert one scan — run, probes, observations, changes — atomically.
 
@@ -39,12 +45,15 @@ def save_run(
     observations would look like a scan that found nothing, which is
     indistinguishable from a codebase that genuinely emptied out.
     """
+    if make_baseline and not analyzed:
+        raise ValueError("An unanalyzed run cannot become the baseline")
     conn.execute("BEGIN")
     try:
         cursor = conn.execute(
             "INSERT INTO runs (started_at, root, model, used_model,"
-            " analyzed, is_baseline, probe_count, observation_count, change_count)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " analyzed, is_baseline, probe_count, observation_count, change_count,"
+            " baseline_run_id, provenance_json)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 snapshot.generated_at,
                 snapshot.root,
@@ -53,11 +62,15 @@ def save_run(
                 # mandatory; the columns stay because earlier rows say
                 # otherwise truthfully and the history is never rewritten.
                 1,
-                1,
+                int(analyzed),
                 0,  # set below, after any previous baseline is cleared
                 len(snapshot.probes),
                 sum(len(p.observations) for p in snapshot.probes.values()),
                 len(report.changes),
+                baseline_run_id,
+                snapshot.context.provenance.model_dump_json()
+                if snapshot.context
+                else None,
             ),
         )
         run_id = int(cursor.lastrowid or 0)
@@ -126,6 +139,9 @@ def save_run(
             conn.execute("UPDATE runs SET is_baseline = 1 WHERE id = ?", (run_id,))
 
         conn.commit()
+        if snapshot.context is not None:
+            snapshot.context.run_id = run_id
+            snapshot.context.baseline_run_id = baseline_run_id
     except Exception:
         conn.rollback()
         raise
@@ -231,6 +247,13 @@ def load_snapshot(conn: sqlite3.Connection, run_id: int) -> Snapshot | None:
         model=run["model"],
         used_model=bool(run["used_model"]),
     )
+
+    if run["provenance_json"] is not None:
+        snapshot.context = ScanContext(
+            provenance=decode_provenance(json.loads(run["provenance_json"])),
+            run_id=run_id,
+            baseline_run_id=run["baseline_run_id"],
+        )
 
     observations: dict[str, list[Observation]] = {}
     for row in conn.execute(
@@ -437,3 +460,68 @@ def parameter_history(
             (probe_id, limit),
         )
     ]
+
+
+def save_result(
+    conn: sqlite3.Connection, run_id: int, result: VersionedScanResult
+) -> None:
+    """Finalize captured evidence once, without changing earlier evidence."""
+    result = decode_result(result.model_dump(mode="json"))
+    if result.run_id != run_id:
+        raise ValueError("Result identity does not match the recorded run")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            "SELECT baseline_run_id, provenance_json, result_json FROM runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("Cannot finalize an unknown run")
+        if row["baseline_run_id"] != result.baseline_run_id:
+            raise ValueError("Result baseline does not match the recorded comparison")
+        if (
+            row["provenance_json"] is not None
+            and decode_provenance(json.loads(row["provenance_json"]))
+            != result.provenance
+        ):
+            raise ValueError("Result provenance does not match the captured run")
+        encoded = result.model_dump_json()
+        if row["result_json"] is not None and row["result_json"] != encoded:
+            raise ValueError("A finalized result cannot be replaced")
+        conn.execute("UPDATE runs SET result_json = ? WHERE id = ?", (encoded, run_id))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def load_result(conn: sqlite3.Connection, run_id: int) -> VersionedScanResult | None:
+    """Return captured evidence; legacy and unfinished runs have no envelope."""
+    row = conn.execute(
+        "SELECT result_json FROM runs WHERE id = ?", (run_id,)
+    ).fetchone()
+    if row is None or row["result_json"] is None:
+        return None
+    return decode_result(json.loads(row["result_json"]))
+
+
+def matching_probe_runs(
+    conn: sqlite3.Connection,
+    probe_id: str,
+    command: list[str],
+    filled: dict[str, str],
+) -> set[int]:
+    """Recorded successful measurements with exactly the requested scope.
+
+    Decode existing JSON rather than compare JSON text: old writers need not
+    have serialized mapping keys in the same order. No historical row changes.
+    """
+    return {
+        row["run_id"]
+        for row in conn.execute(
+            "SELECT run_id, command_json, parameters_json FROM probe_runs WHERE probe_id = ? AND ok = 1",
+            (probe_id,),
+        )
+        if json.loads(row["command_json"]) == command
+        and json.loads(row["parameters_json"]) == filled
+    }

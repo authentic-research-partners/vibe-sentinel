@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 from vibe_sentinel.rulesets import rule_file_paths, source_label, tables_in_file
 from vibe_sentinel.requirements import (
     WRAPPERS,
+    js_install_targets,
     undeclared_installs,
     unreadable_install,
 )
@@ -502,6 +503,8 @@ def triage(
     target: str,
     root: Path | None = None,
     dangers: tuple[Danger, ...] | None = None,
+    *,
+    cwd: Path | None = None,
 ) -> tuple[str, ...]:
     """The ids of the dangers this command matches, or an empty tuple.
 
@@ -521,9 +524,9 @@ def triage(
         if danger.applies_to == "outside-project":
             matched = tool_name in _WRITING_TOOLS and _writes_outside(target, root)
         elif danger.applies_to == "undeclared-install":
-            matched = bool(undeclared_installs(text, root)) or unreadable_install(
-                text, root
-            )
+            matched = bool(
+                undeclared_installs(text, root, cwd=cwd)
+            ) or unreadable_install(text, root, cwd=cwd)
         elif danger.applies_to == "control-file":
             matched = _changes_control_file(tool_name, text, target, root)
         elif danger.applies_to == "home-outside-project":
@@ -616,6 +619,8 @@ CONTROL_FILES = (
     ".claude/settings.json",
     ".claude/settings.local.json",
     ".cursor/hooks.json",
+    ".codex/hooks.json",
+    ".codex/config.toml",
 )
 #: Directories that make up the gate: its record — the history database,
 #: the journal, the verdicts. Relative to the project root.
@@ -679,6 +684,7 @@ def control_paths(root: Path) -> tuple[frozenset[Path], frozenset[Path]]:
 
     base = root.resolve()
     files = {base / name for name in CONTROL_FILES}
+    dirs = {base / name for name in CONTROL_DIRS}
     # Outside the tree, and on a machine set up for it not writable by the
     # agent at all — but `sudo` is asked about, not prevented, so an attempt
     # is settled here too. Each as written and as resolved: on macOS /etc is
@@ -687,16 +693,23 @@ def control_paths(root: Path) -> tuple[frozenset[Path], frozenset[Path]]:
         paths.system_policy_path(),
         paths.claude_managed_hook_path(),
         paths.cursor_enterprise_hooks_path(),
+        paths.codex_home() / "config.toml",
+        paths.codex_home() / "hooks.json",
     ):
         files.add(Path(os.path.normpath(outside)))
         files.add(outside.resolve())
+    # Codex supplies this to plugin hooks. Protect the actual installed
+    # bundle, not just a similarly named directory in the working tree.
+    plugin_root = os.environ.get("PLUGIN_ROOT")
+    if plugin_root:
+        dirs.add(Path(plugin_root).resolve())
     data = _project_config(base)
     for table in _RULE_TABLES:
         section = data.get(table)
         patterns = section.get("rule_files", []) if isinstance(section, dict) else []
         for pattern in patterns if isinstance(patterns, list) else []:
             files.update(path.resolve() for path in base.glob(str(pattern)))
-    return frozenset(files), frozenset(base / name for name in CONTROL_DIRS)
+    return frozenset(files), frozenset(dirs)
 
 
 def _spelling(path: Path, base: Path) -> str:
@@ -876,6 +889,10 @@ def _changes_control_file(
     """
     if root is None:
         return False
+    if re.fullmatch(r"mcp__.*(?:__|_)configure_safety", tool_name):
+        # The bundled MCP tool changes the same policy as hook --configure.
+        # Its arguments need not be retained to know which file it writes.
+        return True
     controls = control_paths(root)
     if tool_name in _WRITING_TOOLS:
         return bool(target) and _names_control(target, root, controls)
@@ -905,7 +922,7 @@ def _reinstalls_the_hook(verb: str, args: list[str]) -> bool:
     return (
         any(Path(w).name in _THIS_TOOL for w in words)
         and "hook" in args
-        and any(a == "--install" for a in args)
+        and any(a in ("--install", "--configure") for a in args)
     )
 
 
@@ -1293,19 +1310,37 @@ def build_prompt(
         # The one thing a model reading this command cannot work out for
         # itself: which of these names the manifests already carry. It is
         # mechanical, so it is stated rather than asked about.
-        if unreadable_install(command, root):
+        directory = Path(cwd) if cwd else root
+        targets = js_install_targets(command, root, cwd=directory)
+        if not targets and unreadable_install(command, root, cwd=directory):
             lines.append(
                 "Which names this would install could not be read: the command "
                 "does not split into words here, so the manifests were not "
-                "compared with it. Read the command itself to see what it "
-                "installs."
+                "compared with it. Read the command itself to see what it installs."
             )
         else:
-            undeclared = undeclared_installs(command, root)
-            lines.append(
-                "Names this would install that no manifest in the project "
-                f"declares: {', '.join(undeclared) or '(none)'}"
-            )
+            undeclared = undeclared_installs(command, root, cwd=directory)
+            if targets:
+                lines.append(
+                    "Names missing from at least one compared install target: "
+                    f"{', '.join(undeclared) or '(none among targets actually compared)'}"
+                )
+            else:
+                lines.append(
+                    "Names this command would install that no manifest in the project "
+                    f"declares: {', '.join(undeclared) or '(none)'}"
+                )
+            for install in targets:
+                if install.status == "unknown":
+                    lines.append(
+                        f"{install.manager} target not compared: {install.reason}. "
+                        "This does not establish that its requested names are declared or undeclared."
+                    )
+                else:
+                    lines.append(
+                        f"Compared {install.manifest}: requested {', '.join(install.names)}; "
+                        f"undeclared {', '.join(install.undeclared) or '(none)'}."
+                    )
         lines.append("")
     structural = {"home-outside-project", "egress"}
     if command and any(d.applies_to in structural for d in asked):

@@ -59,7 +59,7 @@ from __future__ import annotations
 import importlib
 from typing import TYPE_CHECKING, Any
 
-__version__ = "0.5.1"
+__version__ = "0.6.0"
 
 if TYPE_CHECKING:
     from vibe_sentinel.analyze import analyze_drift

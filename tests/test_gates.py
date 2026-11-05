@@ -311,6 +311,25 @@ def test_a_gate_that_cannot_load_its_policy_does_not_raise(tmp_path: Path) -> No
     assert any(not r.ok for r in state.reports)
 
 
+def test_node_only_project_reports_unavailable_dependency_gates(tmp_path: Path) -> None:
+    import asyncio
+
+    from vibe_sentinel.gates import collect_all
+    from vibe_sentinel.schemas import NODE_GATE_UNAVAILABLE
+
+    (tmp_path / "package.json").write_text("{}")
+    (tmp_path / ".vibe-sentinel.toml").write_text(
+        '[licenses]\nallowed_categories = ["permissive"]\n'
+    )
+    state = asyncio.run(collect_all(tmp_path))
+    assert [(gate.gate, gate.error) for gate in state.unconfigured] == [
+        ("licenses", NODE_GATE_UNAVAILABLE),
+        ("packages", NODE_GATE_UNAVAILABLE),
+    ]
+    assert state.reports[-1].gate == "credentials"
+    assert state.reports[-1].ok
+
+
 def test_a_gate_that_could_not_ask_does_not_complete(tmp_path: Path) -> None:
     """Collection is mechanical for all three gates; the credentials
     verdict is not, and there is no shorter answer it can give. A gate

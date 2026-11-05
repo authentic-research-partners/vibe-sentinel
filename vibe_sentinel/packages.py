@@ -53,19 +53,22 @@ import ast
 import fnmatch
 import importlib.metadata as md
 import importlib.util
-import os
 import re
 import sys
 import tomllib
 from datetime import UTC, datetime
 from pathlib import Path
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING, Any
 
 import httpx
-from pydantic import BaseModel, ConfigDict
+from packaging.markers import Marker
+from packaging.requirements import Requirement as PackagingRequirement
+from pydantic import BaseModel, ConfigDict, Field
 
-from vibe_sentinel.config import DEFAULT_CONCURRENCY
+from vibe_sentinel.schemas import GateDecisionEvidence, GateEvidence
+
+from vibe_sentinel.config import DEFAULT_CONCURRENCY, find_config, load_config
 from vibe_sentinel.probes import EXCLUDED_DIRS
 from vibe_sentinel.policy import PROJECT_CONFIG, accepts_value, check_pins
 from vibe_sentinel.policy import declared_layers
@@ -76,8 +79,17 @@ from vibe_sentinel.requirements import (
     load_manifest,
     name_of,
     normalize,
+    selected_requirements,
 )
 from vibe_sentinel.requirements import parse as parse_declared
+from vibe_sentinel.python_environment import (
+    Environment,
+    EnvironmentInspectionError,
+    EnvironmentSnapshot,
+    collect_environment,
+    runtime_environment,
+    validate_marker_environment,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - the offline path must not pay for this
     from vibe_sentinel.config import SentinelConfig
@@ -140,63 +152,9 @@ def severity_rank(kind: str) -> int:
 # result reads as real drift.
 
 
-class Environment(BaseModel):
-    """Which interpreter's installed packages were read."""
-
-    model_config = ConfigDict(frozen=True)
-
-    kind: str  # conda | venv | poetry | uv | system
-    name: str
-    prefix: str
-    python: str
-    executable: str
-
-    @property
-    def label(self) -> str:
-        return f"{self.kind}:{self.name}"
-
-
-def _venv_flavour(prefix: Path) -> str:
-    """Distinguish plain venv from the tools that create one.
-
-    ``pyvenv.cfg`` is written by whoever built the environment and names itself:
-    uv writes a ``uv =`` key, poetry keeps its environments under a ``pypoetry``
-    path. Nothing here changes what is measured — it only makes the record say
-    which tool the reader should go and ask.
-    """
-    if os.environ.get("POETRY_ACTIVE") or "pypoetry" in prefix.as_posix():
-        return "poetry"
-    config = prefix / "pyvenv.cfg"
-    if config.is_file():
-        text = config.read_text(encoding="utf-8", errors="replace").lower()
-        if re.search(r"^\s*uv\s*=", text, re.MULTILINE):
-            return "uv"
-    return "venv"
-
-
 def environment() -> Environment:
-    """Identify the interpreter whose packages this module is reading."""
-    prefix = Path(sys.prefix)
-    conda = os.environ.get("CONDA_PREFIX")
-    version = ".".join(str(p) for p in sys.version_info[:3])
-
-    if conda and Path(conda) == prefix:
-        kind = "conda"
-        name = os.environ.get("CONDA_DEFAULT_ENV") or prefix.name
-    elif sys.prefix != sys.base_prefix:
-        kind = _venv_flavour(prefix)
-        name = prefix.name
-    else:
-        kind = "system"
-        name = prefix.name
-
-    return Environment(
-        kind=kind,
-        name=name,
-        prefix=prefix.as_posix(),
-        python=version,
-        executable=sys.executable,
-    )
+    """Compatibility entry point for the shared current-runtime identity."""
+    return runtime_environment()
 
 
 # --------------------------------------------------------------------------------------
@@ -226,6 +184,8 @@ class Requirement(BaseModel):
     specifier: str  # "" when no version bound was given
     marker: str
     group: str  # project | extra:<name> | group:<name> | poetry[:<group>]
+    extras: tuple[str, ...] = ()
+    optional: bool = False
 
 
 def _as_requirement(entry: Declared) -> Requirement:
@@ -337,7 +297,7 @@ class Installed(BaseModel):
 
     name: str  # normalized
     version: str
-    requires: tuple[str, ...] = ()  # normalized, extras-only requirements dropped
+    requires: tuple[str, ...] = ()  # name, extras, bound and marker; no dependency URLs
     installer: str = ""  # pip, uv, conda, ... — '' when the wheel recorded none
     direct_url: str = ""  # set when installed from a path/URL, not an index
     provenance_recorded: bool = False
@@ -359,25 +319,12 @@ class Installed(BaseModel):
     that is the fact an edit distance cannot reach."""
 
 
-_EXTRA_MARKER = re.compile(r";.*\bextra\s*==", re.IGNORECASE)
-
-
 def _requires(dist: md.Distribution) -> tuple[str, ...]:
-    """Names this distribution needs unconditionally.
-
-    Requirements guarded by ``extra == "..."`` are dropped: they arrive only when
-    somebody asks for that extra, and treating them as always-required would put
-    half of PyPI in the closure and hide real orphans behind it.
-    """
-    out: set[str] = set()
-    for raw in dist.metadata.get_all("Requires-Dist") or []:
-        text = str(raw)
-        if _EXTRA_MARKER.search(text):
-            continue
-        req = parse_requirement(text, "installed")
-        if req:
-            out.add(req.name)
-    return tuple(sorted(out))
+    """Retain dependency activation facts, without exporting direct URLs."""
+    return tuple(
+        _metadata_requirement(str(raw)).raw
+        for raw in dist.metadata.get_all("Requires-Dist") or []
+    )
 
 
 def _dist_text(dist: md.Distribution, name: str) -> str:
@@ -399,7 +346,9 @@ def _records_provenance(dist: md.Distribution, installer: str, direct_url: str) 
     return bool(installer or direct_url) or _dist_text(dist, "WHEEL") != ""
 
 
-def installed_distributions() -> dict[str, Installed]:
+def installed_distributions(
+    snapshot: EnvironmentSnapshot | None = None,
+) -> dict[str, Installed]:
     """Every distribution on this interpreter's path, keyed by normalized name.
 
     Two entries for one name — a ``.egg-info`` beside the ``.dist-info``,
@@ -418,7 +367,9 @@ def installed_distributions() -> dict[str, Installed]:
     carried across it.
     """
     out: dict[str, Installed] = {}
-    for dist in md.distributions():
+    for dist in (
+        snapshot.license_distributions() if snapshot is not None else md.distributions()
+    ):
         if not (dist.metadata and dist.metadata.get("Name")):
             continue
         name = normalize(str(dist.metadata.get("Name")))
@@ -452,25 +403,102 @@ def installed_distributions() -> dict[str, Installed]:
     return out
 
 
-def requirement_closure(
-    declared: set[str], installed: dict[str, Installed]
-) -> frozenset[str]:
-    """Declared names plus everything they transitively require.
+def _metadata_requirement(raw: str) -> Requirement:
+    """Validate installed metadata rather than silently dropping unknown edges."""
+    try:
+        req = PackagingRequirement(raw)
+    except ValueError:
+        # Parser errors quote their input, which may be a credential-bearing URL.
+        raise ValueError(
+            "Invalid installed dependency metadata. Repair the distribution's "
+            "Requires-Dist metadata and retry `vibe-sentinel packages`."
+        ) from None
+    extras = tuple(sorted(normalize(extra) for extra in req.extras))
+    clean = normalize(req.name)
+    if extras:
+        clean += f"[{','.join(extras)}]"
+    clean += str(req.specifier)
+    if req.marker:
+        clean += f"; {req.marker}"
+    return Requirement(
+        name=normalize(req.name),
+        raw=clean,
+        specifier=str(req.specifier),
+        marker=str(req.marker or ""),
+        group="installed",
+        extras=extras,
+    )
 
-    Anything installed and outside this set is in the environment for a reason
-    nothing in the project records.
+
+def _marker_matches(
+    marker: str,
+    extras: Iterable[str],
+    marker_environment: Mapping[str, str] | None = None,
+) -> bool:
+    """Evaluate the whole expression in each active parent-extra context."""
+    if marker_environment is not None:
+        validate_marker_environment(marker_environment)
+    if not marker:
+        return True
+    expression = Marker(marker)
+    # Base dependencies remain active when extras add dependencies. In particular
+    # an OR expression may match the interpreter without matching an extra.
+    try:
+        return any(
+            expression.evaluate({**(marker_environment or {}), "extra": extra})
+            for extra in {"", *extras}
+        )
+    except (KeyError, ValueError) as exc:
+        raise ValueError(
+            f"Cannot evaluate dependency marker {marker!r}: {exc}. "
+            "Fix the requirement or installed package metadata and retry `vibe-sentinel packages`."
+        ) from exc
+
+
+def dependency_graph(
+    declared: Iterable[Requirement | str],
+    installed: dict[str, Installed],
+    marker_environment: Mapping[str, str] | None = None,
+) -> dict[str, frozenset[str]]:
+    """Follow active requirements until both names and requested extras settle.
+
+    A name may be reached again with another extra through a diamond or cycle.
+    Revisit its edges whenever that set grows, not just on its first visit.
     """
-    seen: set[str] = set()
-    stack = [name for name in declared]
-    while stack:
-        current = stack.pop()
-        if current in seen:
+    active: dict[str, set[str]] = {}
+    edges: dict[str, set[str]] = {}
+    parsed: dict[str, tuple[Requirement, ...]] = {}
+    pending = [
+        r if isinstance(r, Requirement) else _metadata_requirement(r) for r in declared
+    ]
+    while pending:
+        req = pending.pop()
+        requested = set(req.extras)
+        if req.name in active and requested <= active[req.name]:
             continue
-        seen.add(current)
-        dist = installed.get(current)
-        if dist:
-            stack.extend(dist.requires)
-    return frozenset(seen)
+        active.setdefault(req.name, set()).update(requested)
+        needs = edges.setdefault(req.name, set())
+        if req.name not in parsed:
+            dist = installed.get(req.name)
+            parsed[req.name] = (
+                tuple(_metadata_requirement(raw) for raw in dist.requires)
+                if dist
+                else ()
+            )
+        for child in parsed[req.name]:
+            if _marker_matches(child.marker, active[req.name], marker_environment):
+                needs.add(child.name)
+                pending.append(child)
+    return {name: frozenset(needs) for name, needs in edges.items()}
+
+
+def requirement_closure(
+    declared: Iterable[Requirement | str],
+    installed: dict[str, Installed],
+    marker_environment: Mapping[str, str] | None = None,
+) -> frozenset[str]:
+    """Selected direct requirements and their active transitive dependencies."""
+    return frozenset(dependency_graph(declared, installed, marker_environment))
 
 
 def import_owners() -> dict[str, tuple[str, ...]]:
@@ -572,6 +600,8 @@ class Policy(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     ignore: frozenset[str] = DEFAULT_IGNORE
+    extras: frozenset[str] = frozenset()
+    groups: frozenset[str] = frozenset()
     pins: tuple[dict[str, Any], ...] = ()
     new_package_days: int = 90
     source: str = "defaults"
@@ -637,6 +667,20 @@ def policy_from_data(data: dict[str, Any], where: str) -> Policy:
     # its reason and its date is an ignore, and one with a misspelled key is
     # a pin that reads as a decision and accepts nothing.
     check_pins(data.get("pin", ()) or (), subject="packages", where=where)
+    selections: dict[str, frozenset[str]] = {}
+    for key in ("extras", "groups"):
+        values = data.get(key, [])
+        if not isinstance(values, list) or any(
+            not isinstance(value, str) or not value.strip() for value in values
+        ):
+            raise ValueError(f"{where}: {key} must be an array of nonempty strings")
+        normalized = frozenset(normalize(value) for value in values)
+        if key == "groups" and any(
+            not re.fullmatch(r"(?:group|poetry):[a-z0-9][a-z0-9.-]*", value)
+            for value in normalized
+        ):
+            raise ValueError(f"{where}: groups must use group:<name> or poetry:<name>")
+        selections[key] = normalized
     return Policy(
         ignore=frozenset(DEFAULT_IGNORE | ignore),
         pins=tuple(data.get("pin", ())),
@@ -644,6 +688,8 @@ def policy_from_data(data: dict[str, Any], where: str) -> Policy:
         source=where,
         concurrency=int(data.get("concurrency", DEFAULT_CONCURRENCY)),
         guidance=str(data.get("guidance", "")).strip(),
+        extras=selections["extras"],
+        groups=selections["groups"],
     )
 
 
@@ -702,6 +748,16 @@ class Inventory(BaseModel):
     imports: tuple[SourceImport, ...]
     first_party: frozenset[str]
     project: str
+    active: tuple[Requirement, ...] = ()
+    selected_extras: frozenset[str] = frozenset()
+    selected_groups: frozenset[str] = frozenset()
+    marker_environment: dict[str, str] | None = None
+    stdlib_modules: frozenset[str] = Field(
+        default_factory=lambda: frozenset(sys.stdlib_module_names)
+    )
+    import_owners: dict[str, tuple[str, ...]] | None = None
+    importable: frozenset[str] | None = None
+    limitations: tuple[str, ...] = ()
 
     @property
     def direct(self) -> frozenset[str]:
@@ -713,33 +769,107 @@ class Inventory(BaseModel):
         return tuple(
             imp
             for imp in self.imports
-            if imp.module not in sys.stdlib_module_names
+            if imp.module not in self.stdlib_modules
             and imp.module not in self.first_party
         )
 
 
-def take_inventory(root: Path) -> Inventory:
+def take_inventory(
+    root: Path,
+    policy: Policy | None = None,
+    *,
+    config: SentinelConfig | None = None,
+    snapshot: EnvironmentSnapshot | None = None,
+) -> Inventory:
     """Read the environment and the project without judging either."""
-    installed = installed_distributions()
+    if snapshot is None:
+        config_path = find_config(root) if config is None else None
+        if config is None and config_path:
+            config = load_config(config_path)
+        if config is not None and config.environment_python:
+            snapshot = collect_environment(root, config)
+    if snapshot is not None and snapshot.limitations:
+        raise EnvironmentInspectionError(
+            "Target inventory is incomplete because startup/import hooks or unsupported paths were not evaluated. "
+            "Use a static wheel or path-only environment without startup hooks; dynamic metadata paths cannot be audited safely."
+        )
+    installed = (
+        installed_distributions(snapshot)
+        if snapshot is not None
+        else installed_distributions()
+    )
+    marker_environment = snapshot.marker_environment if snapshot is not None else None
     declared = declared_requirements(root)
+    policy = policy if policy is not None else load_policy(root=root)
+    data = load_manifest(root)
+    own = name_of(data or {})
+    expanded_extras = set(policy.extras)
+    while True:
+        selected = selected_requirements(
+            data or {}, extras=frozenset(expanded_extras), groups=policy.groups
+        )
+        matched = tuple(
+            _as_requirement(entry)
+            for entry in selected
+            if _marker_matches(entry.marker, expanded_extras, marker_environment)
+        )
+        requested = {
+            extra for req in matched if req.name == own for extra in req.extras
+        }
+        if requested <= expanded_extras:
+            break
+        expanded_extras.update(requested)
+    active = tuple(req for req in matched if req.name != own)
+    # The manifest describes this checkout; stale installed project metadata must
+    # not reactivate extras or groups that this audit did not select.
+    dependencies = {name: dist for name, dist in installed.items() if name != own}
     return Inventory(
-        environment=environment(),
+        environment=snapshot.environment if snapshot is not None else environment(),
         declared=tuple(declared),
         installed=installed,
-        closure=requirement_closure({r.name for r in declared}, installed),
+        closure=requirement_closure(active, dependencies, marker_environment),
         imports=tuple(source_imports(root)),
         first_party=first_party(root),
-        project=project_name(root),
+        project=own,
+        active=active,
+        selected_extras=policy.extras,
+        selected_groups=policy.groups,
+        marker_environment=marker_environment,
+        stdlib_modules=snapshot.stdlib_modules
+        if snapshot is not None
+        else frozenset(sys.stdlib_module_names),
+        import_owners=snapshot.import_owners if snapshot is not None else None,
+        importable=snapshot.importable if snapshot is not None else None,
+        limitations=snapshot.limitations if snapshot is not None else (),
     )
 
 
-def required_by(installed: dict[str, Installed]) -> dict[str, frozenset[str]]:
+def required_by(
+    installed: dict[str, Installed],
+    active: Iterable[Requirement] = (),
+    marker_environment: Mapping[str, str] | None = None,
+) -> dict[str, frozenset[str]]:
     """Reverse of ``Requires-Dist``: name -> the installed packages needing it."""
     out: dict[str, set[str]] = {}
-    for dist in installed.values():
-        for need in dist.requires:
-            out.setdefault(need, set()).add(dist.name)
+    for name, needs in dependency_graph(
+        [*installed, *active], installed, marker_environment
+    ).items():
+        for need in needs:
+            out.setdefault(need, set()).add(name)
     return {name: frozenset(users) for name, users in out.items()}
+
+
+def _inventory_users(inventory: Inventory) -> dict[str, frozenset[str]]:
+    """Installed active edges, with the current manifest owning project facts."""
+    return required_by(
+        {
+            name: dist
+            for name, dist in inventory.installed.items()
+            if name != inventory.project
+        },
+        inventory.active,
+        inventory.marker_environment,
+    )
 
 
 def outside_closure(inventory: Inventory) -> frozenset[str]:
@@ -750,7 +880,7 @@ def outside_closure(inventory: Inventory) -> frozenset[str]:
     reporting it separately would be one finding per node of a tree whose only
     actionable member is the top.
     """
-    users = required_by(inventory.installed)
+    users = _inventory_users(inventory)
     return frozenset(
         name
         for name in inventory.installed
@@ -762,8 +892,16 @@ def outside_closure(inventory: Inventory) -> frozenset[str]:
 
 def dragged_in(inventory: Inventory, root: str) -> frozenset[str]:
     """Packages present only because ``root`` requires them, directly or not."""
+    installed = {
+        name: dist
+        for name, dist in inventory.installed.items()
+        if name != inventory.project
+    }
+    edges = dependency_graph(
+        [root, *inventory.active], installed, inventory.marker_environment
+    )
     found: set[str] = set()
-    stack = list(inventory.installed[root].requires)
+    stack = list(edges.get(root, ()))
     while stack:
         current = stack.pop()
         if current in found or current in inventory.closure:
@@ -771,7 +909,7 @@ def dragged_in(inventory: Inventory, root: str) -> frozenset[str]:
         if current not in inventory.installed:
             continue
         found.add(current)
-        stack.extend(inventory.installed[current].requires)
+        stack.extend(edges.get(current, ()))
     return frozenset(found)
 
 
@@ -783,12 +921,21 @@ def audit(inventory: Inventory, policy: Policy) -> list[Finding]:
     also an undeclared dependency.
     """
     findings: list[Finding] = []
-    owners = import_owners()
+    owners = (
+        inventory.import_owners
+        if inventory.import_owners is not None
+        else import_owners()
+    )
     direct = inventory.direct
 
     # --- imports that resolve to nothing -----------------------------------------
     for imp in inventory.external_imports:
-        if imp.module in owners or is_importable(imp.module):
+        if imp.module in owners or (
+            imp.module in inventory.importable
+            if inventory.environment.selection == "configured"
+            and inventory.importable is not None
+            else is_importable(imp.module)
+        ):
             continue
         if policy.accepts(imp.module, "phantom"):
             continue
@@ -861,8 +1008,8 @@ def audit(inventory: Inventory, policy: Policy) -> list[Finding]:
                 kind="orphan",
                 name=name,
                 detail=(
-                    f"{name} {dist.version} is installed, nothing declares it, and "
-                    f"no installed package requires it"
+                    f"{name} {dist.version} is installed outside the selected "
+                    f"dependencies, and no active installed requirement needs it"
                     + (f"; it pulls in {', '.join(dragged)}" if dragged else "")
                 ),
                 remediation=(
@@ -884,9 +1031,7 @@ def audit(inventory: Inventory, policy: Policy) -> list[Finding]:
     #
     # Only unconditional project dependencies count: an extra nobody asked for and
     # a requirement behind a platform marker are both legitimately absent.
-    for req in inventory.declared:
-        if req.group != "project" or req.marker:
-            continue
+    for req in inventory.active:
         if req.name in inventory.installed or policy.accepts(req.name, "uninstalled"):
             continue
         findings.append(
@@ -1257,6 +1402,7 @@ class NearMissJudgement(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
+    evidence: GateDecisionEvidence | None = None
     finding: Finding
     verdict: str = "standing"
     """``distinct``, ``typosquat``, ``unclear``, ``pinned`` or ``standing``.
@@ -1312,7 +1458,7 @@ def build_near_miss_context(
     reason: it is the project's standing note and identical across the
     fan-out, so it is prefilled once instead of repeated per pair.
     """
-    users = required_by(inventory.installed)
+    users = _inventory_users(inventory)
     imported = {i.module for i in inventory.imports}
     lines = [NEAR_MISS_SYSTEM_PROMPT, ""]
     if guidance.strip():
@@ -1353,17 +1499,48 @@ def build_near_miss_context(
     return "\n".join(lines)
 
 
+def near_miss_question(finding: Finding) -> str:
+    """The question portion, shared by the request and its evidence record."""
+    pair = " and ".join(repr(n) for n in finding.evidence[:2])
+    return (
+        f"{pair} are both installed and are one edit apart. Are these two "
+        f"real packages, or is one of them a misspelling of the other?"
+    )
+
+
 def build_near_miss_question(finding: Finding) -> str:
     """The divergent half: one pair, named."""
     from vibe_sentinel.schemas import BREVITY, every_field
 
-    pair = " and ".join(repr(n) for n in finding.evidence[:2])
     return (
         f"Answer about this one pair, and nothing else.\n\n"
-        f"{pair} are both installed and are one edit apart. Are these two "
-        f"real packages, or is one of them a misspelling of the other?\n\n"
+        f"{near_miss_question(finding)}\n\n"
         f"{BREVITY} {every_field('suspect')}"
     )
+
+
+def _record_evidence(
+    evidence: dict[str, GateEvidence] | None,
+    finding: Finding,
+    decision: GateDecisionEvidence,
+    *,
+    verdict: str = "",
+    reason: str = "",
+    suspect: str = "",
+) -> None:
+    if evidence is not None:
+        evidence[finding.name] = GateEvidence.model_construct(
+            gate="packages",
+            key=f"near-miss:{finding.name}",
+            kind="near-miss",
+            subject=finding.name,
+            risk="",
+            verdict=verdict,
+            failing=None,
+            reason=reason,
+            suspect=suspect,
+            decision=decision,
+        )
 
 
 async def review_near_misses(
@@ -1371,6 +1548,8 @@ async def review_near_misses(
     inventory: Inventory,
     policy: Policy,
     config: SentinelConfig | None = None,
+    *,
+    evidence: dict[str, GateEvidence] | None = None,
 ) -> list[NearMissJudgement]:
     """Ask about each pair. One request each, over one shared context.
 
@@ -1403,6 +1582,16 @@ async def review_near_misses(
 
         async def one(finding: Finding) -> tuple[Finding, dict[str, Any] | None]:
             async with limit:
+                _record_evidence(
+                    evidence,
+                    finding,
+                    GateDecisionEvidence.model_construct(
+                        origin="model",
+                        status="failed",
+                        question=near_miss_question(finding),
+                        source="built-in",
+                    ),
+                )
                 return finding, await llm_query(
                     context,
                     build_near_miss_question(finding),
@@ -1414,8 +1603,6 @@ async def review_near_misses(
         return await asyncio.gather(*(one(f) for f in findings), return_exceptions=True)
 
     results = await ask_all()
-    raise_if_unreachable(results)
-
     judgements: list[NearMissJudgement] = []
     for item in results:
         if isinstance(item, BaseException) or not isinstance(item, tuple):
@@ -1440,6 +1627,12 @@ async def review_near_misses(
         judgements.append(
             NearMissJudgement(
                 finding=finding,
+                evidence=GateDecisionEvidence.model_construct(
+                    origin="model",
+                    status="answered",
+                    question=near_miss_question(finding),
+                    source="built-in",
+                ),
                 verdict=opinion.verdict,
                 suspect=opinion.suspect,
                 reason=opinion.reason,
@@ -1453,6 +1646,22 @@ async def review_near_misses(
         for f in findings
         if f.name not in settled
     ]
+    for judgement in judgements:
+        decision = judgement.evidence or GateDecisionEvidence.model_construct(
+            origin="model",
+            status="failed",
+            question=near_miss_question(judgement.finding),
+            source="built-in",
+        )
+        _record_evidence(
+            evidence,
+            judgement.finding,
+            decision,
+            verdict=judgement.verdict if decision.status == "answered" else "",
+            reason=judgement.reason if decision.status == "answered" else "",
+            suspect=judgement.suspect if decision.status == "answered" else "",
+        )
+    raise_if_unreachable(results)
     return judgements
 
 
@@ -1461,6 +1670,8 @@ async def adjudicate(
     findings: list[Finding],
     policy: Policy,
     config: SentinelConfig | None = None,
+    *,
+    evidence: dict[str, GateEvidence] | None = None,
 ) -> Adjudication:
     """Settle every near-miss: by pin, or by the model, or not at all.
 
@@ -1475,6 +1686,12 @@ async def adjudicate(
     settled = [
         NearMissJudgement(
             finding=f,
+            evidence=GateDecisionEvidence.model_construct(
+                origin="pin",
+                status="not_asked",
+                question=near_miss_question(f),
+                source=policy.source,
+            ),
             verdict="pinned",
             reason=str(
                 (policy.pin_for(f.name, "near-miss") or {}).get("reason", "")
@@ -1485,10 +1702,25 @@ async def adjudicate(
     ]
     to_ask = [f for f in pairs if not policy.accepts(f.name, "near-miss")]
 
+    for judgement in settled:
+        assert judgement.evidence is not None
+        _record_evidence(
+            evidence,
+            judgement.finding,
+            judgement.evidence,
+            verdict=judgement.verdict,
+            reason=judgement.reason,
+        )
     if not to_ask:
         return Adjudication(findings=others, judgements=tuple(settled))
 
-    judged = await review_near_misses(to_ask, inventory, policy, config)
+    judged = await review_near_misses(
+        to_ask,
+        inventory,
+        policy,
+        config,
+        **({"evidence": evidence} if evidence is not None else {}),
+    )
     return Adjudication(findings=others, judgements=tuple(settled + judged))
 
 

@@ -47,7 +47,7 @@ from typing import Any
 import httpx
 from loguru import logger
 
-from vibe_sentinel.config import SentinelConfig
+from vibe_sentinel.config import SentinelConfig, endpoint_is_local
 from vibe_sentinel.exceptions import LLMConnectionError
 
 #: Retries for transient failures — a connection refused, a timeout, a
@@ -189,8 +189,11 @@ async def llm_query(
     url = config.llm_endpoint.rstrip("/") + "/chat/completions"
     own_client = client is None
     if own_client:
+        # A loopback URL is not a privacy boundary if the HTTP client can
+        # route it through an environment proxy.
         client = httpx.AsyncClient(
-            timeout=httpx.Timeout(config.llm_timeout, connect=_CONNECT_TIMEOUT_S)
+            timeout=httpx.Timeout(config.llm_timeout, connect=_CONNECT_TIMEOUT_S),
+            trust_env=not endpoint_is_local(config.llm_endpoint)[0],
         )
     assert client is not None  # narrowing for mypy
 
@@ -201,7 +204,7 @@ async def llm_query(
             try:
                 response = await client.post(url, json=body, headers=headers)
             except (httpx.TimeoutException, httpx.TransportError) as e:
-                last_error = f"{type(e).__name__}: {e}"
+                last_error = type(e).__name__
                 logger.warning(
                     "{}: request failed (attempt {}/{}): {}",
                     schema_name,
@@ -214,7 +217,7 @@ async def llm_query(
                 continue
 
             if response.status_code in _RETRYABLE_STATUS:
-                last_error = f"HTTP {response.status_code}: {response.text[:200]}"
+                last_error = f"HTTP {response.status_code}"
                 logger.warning(
                     "{}: server busy or starting (attempt {}/{}): {}",
                     schema_name,
@@ -232,9 +235,9 @@ async def llm_query(
                 # a field extra_body added. Retrying produces the same
                 # error, so say what happened instead.
                 logger.error(
-                    "{}: request rejected (HTTP {}): {}\n"
+                    "{}: request rejected (HTTP {})\n"
                     "  endpoint: {}\n  model: {}\n  structured_output: {}\n"
-                    "  extra_body: {}\n"
+                    "  extra_body keys: {}\n"
                     "  If the backend does not support this mode, set "
                     "[llm] structured_output to 'json_object' or 'none'.\n"
                     "  If it rejects a field extra_body sends, declare "
@@ -242,11 +245,10 @@ async def llm_query(
                     "nothing.",
                     schema_name,
                     response.status_code,
-                    response.text[:300],
                     config.llm_endpoint,
                     config.llm_model,
                     mode,
-                    config.extra_body,
+                    sorted(config.extra_body),
                 )
                 return None
 
@@ -370,9 +372,7 @@ def _parse_completion(
 
     parsed = _extract_json(content, salvage=mode == "none")
     if parsed is None:
-        logger.warning(
-            "{}: model response was not JSON: {}", schema_name, content[:200]
-        )
+        logger.warning("{}: model response was not JSON", schema_name)
     return parsed
 
 
@@ -393,7 +393,9 @@ async def check_endpoint(config: SentinelConfig) -> tuple[bool, str]:
     if config.api_key:
         headers["Authorization"] = f"Bearer {config.api_key}"
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(
+            timeout=10.0, trust_env=not endpoint_is_local(config.llm_endpoint)[0]
+        ) as client:
             response = await client.get(url, headers=headers)
     except (httpx.TimeoutException, httpx.TransportError) as e:
         return False, f"{type(e).__name__}: {e}"

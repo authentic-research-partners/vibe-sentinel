@@ -25,6 +25,24 @@ ruff format . && ruff check .
 mypy vibe_sentinel/
 ```
 
+The optional JavaScript pack has a separate Node 22+ toolchain. When changing
+that pack, install its exact declared parser dependency deliberately and run
+both its tests and the Python integration tests:
+
+```bash
+(cd packs/javascript && npm ci --ignore-scripts --no-audit --no-fund)
+(cd packs/javascript && npm test)
+pytest tests/test_javascript_pack.py -q
+```
+
+The installation command can access the configured npm registry. Tests use
+local fixtures; the artifact smoke test installs temporary local tarballs with
+network access disabled. Python-only contributors do not need Node, and the
+optional integration tests report missing prerequisites as skips. Maintainer
+release preflight requires the Node runtime and declared dependencies when the
+JavaScript pack source is present, then runs its tests without installing or
+fetching anything. See [JavaScript pack setup](javascript-pack.md).
+
 The ruff rule set is pinned with `select`, not `extend-select`: the default set
 widens between releases, and a gate that shifts under a routine tool upgrade
 cannot gate anything. Adopting a rule is a deliberate edit.

@@ -60,6 +60,8 @@ from vibe_sentinel.schemas import (
     DriftAnalysis,
     DriftReport,
     LensResult,
+    LensEvidence,
+    RatingEvidence,
     Snapshot,
 )
 
@@ -441,88 +443,140 @@ def _facts(change: Change) -> str:
     return " ".join(f"{name}={value}" for name, value in short.items())
 
 
-def build_context(report: DriftReport, current: Snapshot, guidance: str = "") -> str:
-    """The shared half of the prompt: the whole report, once.
+# Reserve separate space for each kind of evidence. Count UTF-8 bytes so
+# Unicode and punctuation-heavy identities cannot inflate the wire input.
+# These are input limits, independent of the model's configured answer budget.
+_JUDGE_CHANGES = 20
+_QUESTION_BYTES = 4096
 
-    This is the **system** message and it is byte-identical for every lens
-    asked about this run, so a server that caches prefixes prefills the
-    report once however many questions are asked of it. The
-    divergent tail is one lens's question, from :func:`build_question`.
-    """
-    summaries = "\n".join(
-        f"- {pid}: {r.summary}"
-        for pid, r in sorted(current.probes.items())
-        if r.summary
-    )
-    changes = "\n".join(
-        f"- key={c.key!r} probe={c.probe_id} kind={c.kind} {_ends(c)}"
-        f"{' ' + facts if (facts := _facts(c)) else ''} :: {c.label}"
-        for c in report.changes
-    )
 
+def _select_rows(
+    rows: list[str], budget: int, *, limit: int | None = None
+) -> list[int]:
+    """Select whole rows, leaving the report and exact rating keys intact."""
+    selected: list[int] = []
+    for index, row in enumerate(rows):
+        if limit is not None and len(selected) >= limit:
+            break
+        size = len(row.encode("utf-8")) + 1
+        if size <= budget:
+            selected.append(index)
+            budget -= size
+    return selected
+
+
+def _bounded_context(
+    report: DriftReport, current: Snapshot, guidance: str
+) -> tuple[str, set[tuple[str, str]], str]:
+    """Build the shared prefix and account for evidence outside its budget."""
     blocks = [ANALYZE_SYSTEM_PROMPT]
+    omissions = []
+
+    def add(
+        opening: str,
+        rows: list[str],
+        budget: int,
+        label: str,
+        *,
+        empty: str = "",
+        limit: int | None = None,
+    ) -> list[int]:
+        selected = _select_rows(rows, budget, limit=limit)
+        lines = [rows[index] for index in selected]
+        omitted = len(rows) - len(selected)
+        if omitted:
+            omissions.append(f"{omitted} {label}")
+            lines.append(f"({omitted} {label} omitted from this review)")
+        elif not lines and empty:
+            lines.append(empty)
+        if lines:
+            name = opening.removeprefix("<").split()[0].removesuffix(">")
+            blocks.append(f"{opening}\n" + "\n".join(lines) + f"\n</{name}>")
+        return selected
+
     if guidance.strip():
-        # The licence gate's convention: a project's standing note about
-        # how it wants things read, in front of every question rather
-        # than repeated in each one.
-        blocks.append(f"<HOUSE_NOTES>\n{guidance.strip()}\n</HOUSE_NOTES>")
-    blocks.append(
-        f"<CURRENT_STRUCTURE>\n{summaries or '(no probe summaries)'}\n"
-        f"</CURRENT_STRUCTURE>"
+        add("<HOUSE_NOTES>", [guidance.strip()], 600, "guidance note(s)")
+    add(
+        "<CURRENT_STRUCTURE>",
+        [
+            f"- {pid}: {r.summary}"
+            for pid, r in sorted(current.probes.items())
+            if r.summary
+        ],
+        750,
+        "probe summary row(s)",
+        empty="(no probe summaries)",
     )
-    blocks.append(
-        f"<CHANGES_SINCE baseline={report.baseline_at!r}>\n"
-        f"{changes or '(nothing moved since the baseline)'}\n</CHANGES_SINCE>"
+
+    # Prefer meaningful changes. Within each severity, take the first row
+    # from each probe before taking its second, so a noisy probe cannot
+    # fill the entire sample with otherwise equal-priority changes.
+    by_probe: dict[tuple[int, str], int] = {}
+    change_order = []
+    for index, change in enumerate(report.changes):
+        group = (_rank(change.severity), change.probe_id)
+        change_order.append((-group[0], by_probe.get(group, 0), index))
+        by_probe[group] = by_probe.get(group, 0) + 1
+    changes = [report.changes[index] for _, _, index in sorted(change_order)]
+    selected = add(
+        f"<CHANGES_SINCE baseline={report.baseline_at!r}>",
+        [
+            f"- key={c.key!r} probe={c.probe_id} kind={c.kind} {_ends(c)}"
+            f"{' ' + facts if (facts := _facts(c)) else ''} :: {c.label}"
+            for c in changes
+        ],
+        2700,
+        "baseline change(s)",
+        empty="(nothing moved since the baseline)",
+        limit=_JUDGE_CHANGES,
     )
-    horizons = _horizon_block(report)
-    if horizons:
-        blocks.append(horizons)
-    timelines = _timeline_block(report)
-    if timelines:
-        blocks.append(timelines)
-    return "\n\n".join(blocks)
+    add("<OVER_LONGER_HORIZONS>", _horizon_rows(report), 1400, "horizon row(s)")
+    add("<TIMELINES>", _timeline_rows(report), 950, "trend row(s)")
+
+    if omissions:
+        blocks.append(
+            "This report excerpt omits evidence. Limit your conclusions to the rows shown."
+        )
+
+    coverage = (
+        "Drift judge input was limited. Omitted: "
+        + ", ".join(omissions)
+        + ". Full measurements are in the report."
+        if omissions
+        else ""
+    )
+    shown = {(changes[index].probe_id, changes[index].key) for index in selected}
+    return "\n\n".join(blocks), shown, coverage
 
 
-def _horizon_block(report: DriftReport) -> str:
-    """The same measurements, against runs further back.
+def build_context(report: DriftReport, current: Snapshot, guidance: str = "") -> str:
+    """The same bounded system message goes to every lens."""
+    return _bounded_context(report, current, guidance)[0]
 
-    A horizon that reached nothing says so. A comparison labelled ``1m``
-    that found an empty history is not one that found the codebase
-    unchanged, and a model told the second thing will say the second
-    thing.
-    """
-    if not report.horizons:
-        return ""
-    lines: list[str] = []
+
+def _horizon_rows(report: DriftReport) -> list[str]:
+    """Give each row its own horizon so partial input still makes sense."""
+    lines = []
     for horizon in report.horizons:
         if horizon.unavailable:
             lines.append(f"- {horizon.horizon}: not measured — {horizon.unavailable}")
             continue
         moved = [c for c in horizon.changes if c.severity != "info"]
-        head = f"- {horizon.horizon} (against a run {horizon.age_days:.0f} days old)"
+        head = f"{horizon.horizon} (against a run {horizon.age_days:.0f} days old)"
         if not moved:
-            lines.append(f"{head}: no movement")
+            lines.append(f"- {head}: no movement")
             continue
-        lines.append(f"{head}: {len(moved)} change(s)")
-        lines += [
-            f"    key={c.key!r} probe={c.probe_id} kind={c.kind} {_ends(c)}"
+        lines.extend(
+            f"- {head}: key={c.key!r} probe={c.probe_id} kind={c.kind} {_ends(c)}"
             for c in moved
-        ]
-    return "<OVER_LONGER_HORIZONS>\n" + "\n".join(lines) + "\n</OVER_LONGER_HORIZONS>"
+        )
+    return lines
 
 
-def _timeline_block(report: DriftReport) -> str:
-    """What the whole recorded series is doing, fitted.
-
-    Only the fits worth quoting reach the report at all — a direction the
-    Mann–Kendall test called, or a point that left its own trend — so this
-    is short by construction rather than by truncation.
-    """
-    if not report.trends:
-        return ""
-    lines: list[str] = []
+def _timeline_rows(report: DriftReport) -> list[str]:
+    lines = []
     for fit in report.trends:
-        lines.append(
+        line = (
             f"- key={fit.key!r} probe={fit.probe_id} {fit.direction} over "
             f"{fit.runs} runs: {fit.first_value:g} -> {fit.last_value:g} "
             f"(slope {fit.slope:+.3g}/run, tau {fit.tau:+.2f}, "
@@ -530,11 +584,12 @@ def _timeline_block(report: DriftReport) -> str:
         )
         for hit in fit.anomalies:
             z = "?" if hit.z is None else f"{hit.z:+.1f}"
-            lines.append(
-                f"    off its own trend this run: {hit.value:g} where the fit "
+            line += (
+                f"\n    off its own trend this run: {hit.value:g} where the fit "
                 f"expected {hit.expected:.4g} ({z} robust deviations)"
             )
-    return "<TIMELINES>\n" + "\n".join(lines) + "\n</TIMELINES>"
+        lines.append(line)
+    return lines
 
 
 def build_question(lens: Lens) -> str:
@@ -573,6 +628,24 @@ def watched(lens: Lens, report: DriftReport) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _lens_result(lens: Lens, **values: Any) -> LensResult:
+    result = LensResult(id=lens.id, title=lens.title, **values)
+    result.evidence = LensEvidence.model_construct(
+        id=lens.id,
+        title=lens.title,
+        source=lens.source,
+        question=lens.question,
+        watch=lens.watch,
+        status="answered"
+        if result.answered
+        else "failed"
+        if result.asked
+        else "not_asked",
+        assessment=result.assessment,
+    )
+    return result
+
+
 async def analyze_drift(
     report: DriftReport,
     current: Snapshot,
@@ -592,17 +665,15 @@ async def analyze_drift(
     question nobody asked must not read as a question that found nothing,
     which is the same rule an unavailable horizon keeps.
     """
-    if report.first_run:
-        return report
-    if not (
+    config = config or SentinelConfig()
+    active = lenses if lenses is not None else load_lenses(root)
+    if report.first_run or not (
         report.changes
         or report.trends
         or any(horizon.moved for horizon in report.horizons)
     ):
+        report.lenses = [_lens_result(lens) for lens in active]
         return report
-
-    config = config or SentinelConfig()
-    active = lenses if lenses is not None else load_lenses(root)
     if not active:
         return report
 
@@ -613,9 +684,8 @@ async def analyze_drift(
             asked.append(lens)
         else:
             results.append(
-                LensResult(
-                    id=lens.id,
-                    title=lens.title,
+                _lens_result(
+                    lens,
                     note=(
                         "not asked — nothing it watches moved, over any "
                         "horizon, and none of it has a fitted trend"
@@ -626,9 +696,12 @@ async def analyze_drift(
         report.lenses = results
         return report
 
-    context = build_context(report, current, config.drift_guidance)
+    context, shown, coverage = _bounded_context(report, current, config.drift_guidance)
+    if coverage:
+        report.assessment = coverage
+        logger.info("{}", coverage)
     tuned = config.model_copy(
-        update={"max_tokens": answer_budget(len(report.changes), config.max_tokens)}
+        update={"max_tokens": answer_budget(len(shown), config.max_tokens)}
     )
 
     async def ask_all() -> list[Any]:
@@ -638,10 +711,13 @@ async def analyze_drift(
         limit = asyncio.Semaphore(max(1, tuned.drift_concurrency))
 
         async def one(lens: Lens) -> tuple[Lens, dict[str, Any] | None]:
+            question = build_question(lens)
+            if len(question.encode("utf-8")) > _QUESTION_BYTES:
+                raise ValueError("Lens question exceeds the drift judge input limit")
             async with limit:
                 return lens, await llm_query(
                     context,
-                    build_question(lens),
+                    question,
                     _ANALYSIS_SCHEMA,
                     f"analyze-drift-{lens.id}",
                     config=tuned,
@@ -652,7 +728,6 @@ async def analyze_drift(
         )
 
     outcomes = await ask_all()
-    raise_if_unreachable(outcomes)
 
     by_pair = {(c.probe_id, c.key): c for c in report.changes}
     by_key: dict[str, list[Change]] = {}
@@ -662,16 +737,22 @@ async def analyze_drift(
     #: can raise it and never lower it.
     best: dict[tuple[str, str], str] = {}
 
-    for item in outcomes:
+    for requested, item in zip(asked, outcomes, strict=True):
         if isinstance(item, BaseException) or not isinstance(item, tuple):
             logger.warning("drift analysis: a lens failed ({})", item)
+            results.append(
+                _lens_result(
+                    requested,
+                    asked=True,
+                    note="asked, but the judge request did not produce a usable answer",
+                )
+            )
             continue
         lens, raw = item
         if raw is None:
             results.append(
-                LensResult(
-                    id=lens.id,
-                    title=lens.title,
+                _lens_result(
+                    lens,
                     asked=True,
                     note="asked, but the model did not answer",
                 )
@@ -682,29 +763,29 @@ async def analyze_drift(
         except Exception as e:  # noqa: BLE001 - one bad answer must not lose the rest
             logger.warning("drift analysis: unusable answer from {} ({})", lens.id, e)
             results.append(
-                LensResult(
-                    id=lens.id,
-                    title=lens.title,
+                _lens_result(
+                    lens,
                     asked=True,
-                    note=f"asked, but the answer was unusable: {e}",
+                    note="asked, but the answer did not match the required schema",
                 )
             )
             continue
-        rated = _apply(analysis, report, lens, by_pair, by_key, best)
-        results.append(
-            LensResult(
-                id=lens.id,
-                title=lens.title,
-                asked=True,
-                answered=True,
-                assessment=analysis.assessment,
-                rated=rated,
-            )
+        ratings: list[RatingEvidence] = []
+        rated = _apply(
+            analysis, report, lens, by_pair, by_key, best, ratings, shown=shown
         )
+        result = _lens_result(
+            lens, asked=True, answered=True, assessment=analysis.assessment, rated=rated
+        )
+        assert result.evidence is not None
+        result.evidence.ratings = tuple(ratings)
+        result.evidence.dropped_ratings = len(analysis.changes) - len(ratings)
+        results.append(result)
 
     order = {lens.id: i for i, lens in enumerate(active)}
     results.sort(key=lambda r: order.get(r.id, len(order)))
     report.lenses = results
+    raise_if_unreachable(outcomes)
 
     answered = [r for r in results if r.answered]
     if not answered:
@@ -719,6 +800,8 @@ async def analyze_drift(
         report.assessment = "\n\n".join(
             f"{r.title or r.id}: {r.assessment}" for r in answered if r.assessment
         )
+    if coverage:
+        report.assessment = "\n\n".join(filter(None, (coverage, report.assessment)))
     logger.info(
         "drift analysis: {}/{} lens(es) answered, {} change(s) rated",
         len(answered),
@@ -735,6 +818,9 @@ def _apply(
     by_pair: dict[tuple[str, str], Change],
     by_key: dict[str, list[Change]],
     best: dict[tuple[str, str], str],
+    ratings: list[RatingEvidence] | None = None,
+    *,
+    shown: set[tuple[str, str]],
 ) -> int:
     """Attach one lens's ratings. Returns how many landed.
 
@@ -778,12 +864,26 @@ def _apply(
             )
             continue
         pair = (change.probe_id, change.key)
+        if pair not in shown:
+            continue
         seen = best.get(pair)
-        if seen is not None and _rank(item.severity) <= _rank(seen):
+        applied = seen is None or _rank(item.severity) > _rank(seen)
+        if ratings is not None:
+            ratings.append(
+                RatingEvidence.model_construct(
+                    probe_id=change.probe_id,
+                    key=change.key,
+                    severity=item.severity,
+                    note=item.note,
+                    applied=applied,
+                )
+            )
+        if not applied:
             continue
         best[pair] = item.severity
         change.severity = item.severity
         change.note = item.note
+        change.rating_lens = lens.id
         rated += 1
     return rated
 

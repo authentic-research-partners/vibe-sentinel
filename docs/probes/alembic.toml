@@ -1,0 +1,24 @@
+# Opt in through [probes] rule_files. This declaration executes no application code.
+[[probe]]
+id = "alembic"
+title = "Alembic revision topology"
+description = "Literal revision, parent, dependency and branch declarations. Migration code and deployed database state are not assessed."
+command = ["{SCANNER_PYTHON}", "-I", "-m", "vibe_sentinel.probes.alembic", "--root", "{ROOT}", "--versions", "{VERSIONS}"]
+timeout_s = 60
+tolerance = 0
+compare_parameters = true
+
+[[probe.placeholders]]
+name = "SCANNER_PYTHON"
+description = "Python in the Sentinel installation"
+default = "python"
+
+[[probe.placeholders]]
+name = "ROOT"
+description = "Project root containing the declarations"
+default = "."
+
+[[probe.placeholders]]
+name = "VERSIONS"
+description = "Existing declaration directory relative to ROOT"
+default = "alembic/versions"

@@ -16,6 +16,14 @@
 #
 # Reference: README.md and docs/
 #
+# Installed Python metadata is read from the scanner's environment by default.
+# To inspect a separate trusted application Python (3.10+), set its executable.
+# Relative paths are based at the project root. This executes the interpreter
+# with a bundled collector; it installs nothing and imports no application code.
+# See docs/environments.md for startup-hook and import-resolution coverage.
+# [environment]
+# python = ".venv/bin/python"      # Windows: .venv/Scripts/python.exe
+# timeout = 30
 #
 # --- Where the probes look ---------------------------------------------------
 # Probe parameters are declared, never inferred. The built-in default for the
@@ -580,6 +588,9 @@ allowed_categories = ["permissive", "public-domain"]
 # declare `guidance` BEFORE the [[packages.pin]] entries below.
 #
 # [packages]
+# extras = []                       # project extras installed here, e.g. ["dev"]
+# groups = []                       # explicit groups, e.g. ["group:test", "poetry:lint"]
+#                                   # empty lists select only base dependencies
 # ignore = []                       # names allowed to sit undeclared. pip,
 #                                   # setuptools, wheel and uv are always ignored
 # new_package_days = 90             # younger than this, a package is "newborn"

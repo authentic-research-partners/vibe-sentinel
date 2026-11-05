@@ -1,0 +1,53 @@
+# Node service starter. See ../starter-profiles.md before the first scan.
+# Custom commands use the `python` on PATH; it must import vibe_sentinel.
+[probes]
+use_builtins = false
+
+[[probe]]
+id = "source-lines"
+title = "JavaScript and TypeScript source file lengths"
+description = "Counts source lines per file, including tests under SOURCE_ROOT. No imports or syntax are resolved."
+command = [
+    "python", "-m", "vibe_sentinel.probes.length",
+    "--root", "{SOURCE_ROOT}",
+    "--categories", "source=*.js,*.mjs,*.cjs,*.jsx,*.ts,*.mts,*.cts,*.tsx",
+    "--unit", "lines",
+]
+tolerance = 0
+
+[[probe.placeholders]]
+name = "SOURCE_ROOT"
+description = "Project-relative source root. Excluded dependency and build directories are skipped below it."
+default = "."
+
+[[probe]]
+id = "fetch-typescript"
+title = "Direct fetch call locations in TypeScript"
+description = "Counts syntactic fetch(...) calls per directory in ast-grep's TypeScript input. No name resolution or network behavior is inferred."
+command = [
+    "python", "-m", "vibe_sentinel.probes.patterns",
+    "--root", "{SOURCE_ROOT}", "--lang", "typescript",
+    "--pattern", "fetch($$$ARGS)",
+]
+tolerance = 0
+
+[[probe.placeholders]]
+name = "SOURCE_ROOT"
+description = "Project-relative root for the TypeScript pattern census."
+default = "."
+
+[[probe]]
+id = "fetch-javascript"
+title = "Direct fetch call locations in JavaScript"
+description = "Counts syntactic fetch(...) calls per directory in ast-grep's JavaScript input. Aliases and member calls are outside this pattern."
+command = [
+    "python", "-m", "vibe_sentinel.probes.patterns",
+    "--root", "{SOURCE_ROOT}", "--lang", "javascript",
+    "--pattern", "fetch($$$ARGS)",
+]
+tolerance = 0
+
+[[probe.placeholders]]
+name = "SOURCE_ROOT"
+description = "Project-relative root for the JavaScript pattern census."
+default = "."

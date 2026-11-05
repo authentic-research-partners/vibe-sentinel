@@ -103,7 +103,7 @@ PINNED: dict[str, str] = {
     "schemas.BREVITY": "1aeeb15ea99979c9",
     "schemas.every_field(resolves_to)": "b9f9fd68c90e2c77",
     "schemas.every_field(suspect)": "6bb7470deeb6803d",
-    "dangers.default.toml": "74efc256a281c35e",
+    "dangers.default.toml": "8715d46642db83d7",
     "secrets.default.toml": "324d0735ed994d09",
 }
 
@@ -151,9 +151,8 @@ def test_only_a_shipped_question_is_pinned() -> None:
     subtraction always emptied the set it went on to check. It needed a
     guard (`assert declared`) to look like it was doing something, and a
     test that must first check its subject exists never built one. And
-    its meaning depended on the directory it ran in, so it passed here
-    and failed the moment the release synced it to a tree without
-    `rules/`.
+    its meaning depended on the directory it ran in, and it passed only in
+    a tree that happened to carry `rules/`.
     """
     shipped = {lens.id for lens in analyze.BUILTIN_LENSES}
     pinned = {n.removeprefix("lens:") for n in PINNED if n.startswith("lens:")}

@@ -846,6 +846,11 @@ def _license_files(dist: md.Distribution) -> list[tuple[str, str]]:
     entry to ``read_text`` therefore double-prefixes the path and silently returns None.
     ``locate_file`` is the correct pairing.
     """
+    from vibe_sentinel.python_environment import CapturedDistribution
+
+    if isinstance(dist, CapturedDistribution):
+        return list(dist.captured_license_files)
+
     out: list[tuple[str, str]] = []
     for path in dist.files or []:
         name = Path(str(path)).name
