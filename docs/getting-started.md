@@ -8,13 +8,13 @@ commands from the repository you want to inspect.
 | --- | --- |
 | Scan a repository | [Install the CLI](#1-install), [check the model backend](#2-start-the-model-backend) and [run your first scan](#3-run-your-first-scan) |
 | Record or review agent commands | [Install the Claude Code or Cursor hook](#4-add-an-agent-hook) |
-| Use Sentinel in Codex | [Install the checkout preview](codex-plugin.md) |
+| Use Sentinel in Codex | [Install the Codex plugin](codex-plugin.md) |
 | Work on Vibe Sentinel itself | [Set up the development environment](development.md) |
 
-Version 0.5.1 includes CLI status, Claude Code and Cursor hooks, explicit safety
-modes and managed installation. Codex integration and the new artifact readers,
-historical evidence export, CI summary and local viewer are available in the
-development checkout, pending release. See the [roadmap](roadmap.md) for scope.
+Version 0.6.0 includes the Codex integration, optional artifact readers,
+historical evidence exports, CI summaries, and the offline viewer. For npm
+advisories, selected JS/TS source rules, and Next.js export credential review,
+see the [separate security command](security-checks.md).
 
 ## 1. Install
 
@@ -35,8 +35,8 @@ ast-grep on PATH. A scan without it records that probe as unmeasured.
 
 By default, the package, licence and dependency-version checks inspect the
 scanner's installed Python environment. To audit your application's environment,
-set `[environment] python` to its trusted interpreter in the development
-checkout. Selecting a project root alone does not activate its virtualenv.
+set `[environment] python` to its trusted interpreter. Selecting a project root
+alone does not activate its virtualenv.
 For supported targets and startup-hook coverage, see [measured environments](environments.md).
 
 ## 2. Start the model backend
@@ -118,7 +118,7 @@ already report findings. The licence gate requires a policy to evaluate.
 | `1` | The scan completed and reported findings. |
 | `2` | Work failed or coverage was incomplete. Read the reported gap before drawing a conclusion. |
 
-In the development checkout, a newly enabled probe can succeed while the
+A newly enabled probe can succeed while the
 baseline lacks a comparable measurement for it. The scan then exits 2 and
 reports incomplete comparison. Review the probe scope, then run
 `vibe-sentinel scan --update` when you intend to accept the current complete
@@ -133,8 +133,8 @@ on its own without comparison history. See [gates](gates.md) and [drift](drift.m
 
 Run `vibe-sentinel scan` again after making changes. Use `vibe-sentinel trend`
 to inspect movement across recorded runs. For automation, check the exit code
-and use `--format json` to read structured results. In the development checkout,
-you can also [export recorded results](results.md#export-recorded-evidence) and
+and use `--format json` to read structured results. You can also
+[export recorded results](results.md#export-recorded-evidence) and
 [render an aggregate CI summary](ci-evidence.md).
 
 ## 4. Add an agent hook

@@ -5,10 +5,8 @@ Vibe Sentinel engine used by the CLI. It bundles setup and inspection skills,
 a local MCP connection and a pre-tool hook. It does not replace the configured
 judge with Codex, and it shares the project's configuration and history.
 
-Codex support is a checkout preview. Version 0.5.1 provides CLI status and
-Claude Code and Cursor hooks, including explicit modes and managed installation.
-For Codex, use the engine and plugin from the development checkout. The bundle
-has its own version, `0.1.0`.
+Codex support ships with Vibe Sentinel 0.6.0. The bundle is distributed as
+repository files and installed manually. It has its own version, `0.1.0`.
 
 1. [Install the runtime](#install-the-runtime) and make both executables available to Codex.
 2. [Install the plugin manually](#install-the-plugin-manually), then review and trust its hook.

@@ -1,6 +1,6 @@
 # Local JavaScript and TypeScript security checks
 
-The development checkout provides a separate, opt-in `vibe-sentinel security`
+Vibe Sentinel 0.6.0 provides a separate, opt-in `vibe-sentinel security`
 command. It checks selected inputs and reports findings and coverage for each
 check. It leaves drift history and the baseline untouched.
 
